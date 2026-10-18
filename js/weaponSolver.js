@@ -142,6 +142,8 @@
  *    for totalDamagePerShot and every dmg:<Type>, a Base entry then
  *    one entry per occupied slot in slot order (arcane last), whose
  *    final cumulative equals the reported achieved value (round2).
+ *    Each entry also carries `delta`, its own increase over the
+ *    previous entry (Base's delta is its own value).
  */
 (function () {
   'use strict';
@@ -969,6 +971,17 @@
         entry.rec.name, entry._exilus ? 'exilus' : 'mod');
     }
     if (arcaneName) pushAll(finalAchieved, arcaneName, 'arcane');
+    // v1.2.1: each entry also carries its own increase over the
+    // previous entry (the Base entry's delta is its own value), so
+    // the chain reads "+delta -> running total" per source and the
+    // deltas sum to the final cumulative.
+    statKeys.forEach(function (s) {
+      var prevCum = 0;
+      chains[s].forEach(function (e, i) {
+        e.delta = (i === 0) ? e.cumulative : round2(e.cumulative - prevCum);
+        prevCum = e.cumulative;
+      });
+    });
     return chains;
   }
 
