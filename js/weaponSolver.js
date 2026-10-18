@@ -144,6 +144,24 @@
  *    final cumulative equals the reported achieved value (round2).
  *    Each entry also carries `delta`, its own increase over the
  *    previous entry (Base's delta is its own value).
+ *
+ * v1.4 (engine stage, parity with solver.js):
+ *  - Restricted pieces: pool records carry `restrictedTo` (the
+ *    pipeline turns item-named Types into category records
+ *    restricted to one item). poolFor admits a restricted record
+ *    ONLY for its exact item (weapon.Name match). Weapon FAMILY
+ *    variants (a Sobek mod on a Kuva Sobek) are NOT admitted —
+ *    family membership is not an eligibility rule in the source
+ *    data; noted limitation, not a guess. A lock naming a mod
+ *    restricted to another weapon is a hard Error, the same class
+ *    as a wrong-type lock.
+ *  - Hybrid intent: input.intent 'hybrid' + input.hybridAllowance
+ *    (1 | 2, default 1; input.burstAllowance alias) — upkeep
+ *    discipline with a burst allowance over SOLVER-CHOSEN burst
+ *    pieces, enforced in expand() and the fill acceptance check;
+ *    locked burst pieces do not consume it (Q1). result.hybridBurst
+ *    names the solver-chosen burst pieces; sustained semantics
+ *    unchanged. Window / upkeep / unset byte-identical to v1.3.
  */
 (function () {
   'use strict';
@@ -298,6 +316,14 @@
     return !!(r && r.class === 'burst');
   }
 
+  // v1.4 hybrid allowance (parity with solver.js): input.
+  // hybridAllowance (1 | 2, default 1); input.burstAllowance alias.
+  function burstAllowanceOf(input) {
+    var a = (typeof input.hybridAllowance === 'number') ? input.hybridAllowance
+      : (typeof input.burstAllowance === 'number') ? input.burstAllowance : 1;
+    return a === 2 ? 2 : 1;
+  }
+
   function buildContext(data) {
     var ctx = {};
     // v1.3 conditional-piece classes (Stage 1). Optional bundle
@@ -331,7 +357,8 @@
         baseDrain: m.baseDrain || 0, rarity: m.rarity || null,
         maxRank: m.maxRank || 0,
         incompatible: m.incompatible || [], set: m.set || null,
-        exilus: !!m.exilus, effects: effs
+        exilus: !!m.exilus, restrictedTo: m.restrictedTo || null, // v1.4
+        effects: effs
       });
     });
     ctx.modByName = {};
@@ -470,6 +497,11 @@
     }
     if (!types) return { mods: [], stances: [], types: [], slotSupported: false };
     var mods = ctx.modPool.filter(function (m) {
+      // v1.4: a restricted record belongs to its exact item only
+      // (post-transform its Type is the category, so the type legs
+      // below would otherwise admit it for every weapon in the
+      // category — the Deadly Sequence-on-Braton bug).
+      if (m.restrictedTo && m.restrictedTo !== weapon.Name) return false;
       return types.indexOf(m.type) >= 0 || m.type === weapon.Name ||
              (weapon.Family && m.type === weapon.Family);
     });
@@ -1046,6 +1078,7 @@
       incompatible: raw.incompatible || [],
       set: raw.set || null,
       exilus: !!raw.exilus,
+      restrictedTo: raw.restrictedTo || null, // v1.4
       effects: effs
     };
   }
@@ -1085,6 +1118,23 @@
     // them). Locks override the pruning and are flagged in notes.
     var pruneBurst = routes.conditional && input.intent === 'upkeep';
     function isBurst(name) { return isBurstPiece(ctx, name); }
+    // v1.4 hybrid: burst candidates stay in the pools; expand() and
+    // the fill acceptance check cap SOLVER-CHOSEN burst pieces at
+    // the allowance (locked pieces excluded — Q1, as in solver.js).
+    var hybridW = routes.conditional && input.intent === 'hybrid';
+    var burstAllowanceW = hybridW ? burstAllowanceOf(input) : 0;
+    function solverBurstNamesW(st) {
+      var out = [];
+      st.placed.forEach(function (p) {
+        if (!lockedNameSet[p.rec.name] && isBurst(p.rec.name)) out.push(p.rec.name);
+      });
+      if (st.exilusMod && !lockedNameSet[st.exilusMod.rec.name] &&
+          isBurst(st.exilusMod.rec.name)) out.push(st.exilusMod.rec.name);
+      if (st.arcane && st.arcane !== lockedArcaneName && isBurst(st.arcane)) {
+        out.push(st.arcane);
+      }
+      return out;
+    }
     // v1.1: Maximize targets split off (fill phase raises them after
     // the hard targets solve); the beam sees only the hard targets.
     var split = splitTargets(input.targets);
@@ -1312,6 +1362,13 @@
         ctx.modByName[name] = rec;
         if (rec.set) ctx.setOfMod[name] = rec.set;
       }
+      // v1.4: a mod restricted to another weapon cannot be locked
+      // here (exact item match — the pool branch above can only
+      // contain this weapon's restricted mods, post-poolFor).
+      if (rec.restrictedTo && rec.restrictedTo !== input.weaponName) {
+        throw new Error('Locked mod ' + name + ' is restricted to ' +
+          rec.restrictedTo + ' and cannot go on ' + input.weaponName + '.');
+      }
       lockedNameSet[name] = true;
       lockedModNames.push(name);
       lockedRanksW[name] = (typeof L.rank === 'number')
@@ -1441,6 +1498,12 @@
       if (!state.arcane) {
         cand.arcanes.forEach(function (name) {
           out.push({ placed: state.placed.slice(), exilusMod: state.exilusMod, arcane: name });
+        });
+      }
+      // v1.4 hybrid: cap solver-chosen burst pieces at the allowance.
+      if (hybridW) {
+        return out.filter(function (ns) {
+          return solverBurstNamesW(ns).length <= burstAllowanceW;
         });
       }
       return out;
@@ -1790,6 +1853,9 @@
         var moves = expand(cur.state, FILLW).concat(fillExtraMovesW(cur.state));
         var best = null;
         moves.forEach(function (ns) {
+          // v1.4 hybrid: fillExtraMovesW bypasses expand(), so the
+          // burst allowance is re-checked here for every move.
+          if (hybridW && solverBurstNamesW(ns).length > burstAllowanceW) return;
           var ev = evaluate(ns, null);
           if (!ev.fit.valid) return;
           if (!guardOkW(ev, anchorEv)) return;
@@ -2089,10 +2155,19 @@
       bdOpts, evRes.achieved,
       st.arcane || (fwdOpts.arcaneEffects ? 'Arcane effects' : null));
 
+    // v1.4 hybrid: name the solver-chosen burst pieces + allowance.
+    var hybridBurst = hybridW ? solverBurstNamesW(st) : null;
+    if (hybridW) {
+      notes.push('Hybrid: ' + hybridBurst.length + ' of ' +
+        burstAllowanceW + ' burst pieces used' +
+        (hybridBurst.length ? ' — ' + hybridBurst.join(', ') : '') + '.');
+    }
+
     return {
       achieved: achieved,
       breakdown: breakdown,
       sustained: sustainedForW(st, slots),
+      hybridBurst: hybridBurst,
       crossGearPlan: cgW.plan,
       forward: evRes.fwd,
       arrangement: {
@@ -2164,7 +2239,8 @@
         setBonuses: ch.setBonuses, unmetTargets: ch.unmetTargets,
         totalRankCost: ch.totalRankCost,
         breakdown: ch.breakdown, crossGearPlan: ch.crossGearPlan,
-        sustained: ch.sustained
+        sustained: ch.sustained,
+        hybridBurst: ch.hybridBurst
       };
     }
     return result;
