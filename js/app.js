@@ -25,6 +25,14 @@
  * named mods on named gear and counts them immediately), and
  * per-stat breakdown chains on the achieved table, driven by the
  * solvers'/evaluators' `breakdown` field.
+ *
+ * v1.3 (G3): build intent (Window / Upkeep) inside the conditional
+ * route — state v5 carries `intent`, solve requests pass it always
+ * (the engines consult it only with the conditional route on, using
+ * the shipped data/conditional_classes.json, which the bundle now
+ * also carries). Results gain the sustained-floor lines (Peak vs
+ * burst-down values) and the "How to get the most out of this build"
+ * guide, rendered from the live board's conditional pieces.
  */
 (function () {
   'use strict';
@@ -166,7 +174,8 @@
       warframes: { Warframes: warframes, Necramechs: site.frames.necramechs },
       companions: { Companions: site.frames.companions },
       weapons: site.weapons,
-      legacyHelmets: site.helmets
+      legacyHelmets: site.helmets,
+      conditionalClasses: site.conditionalClasses
     };
   }
   function modularData() {
@@ -193,8 +202,9 @@
     ROUTES_FRAME.forEach(function (r) { routesFrame[r.key] = r.def; });
     ROUTES_WEAPON.forEach(function (r) { routesWeapon[r.key] = r.def; });
     return {
-      version: 4,
+      version: 5,
       category: 'Warframe',
+      intent: 'window',
       selections: {
         Warframe: null, Necramech: null, Companion: null,
         Primary: null, Secondary: null, Melee: null, Archgun: null,
@@ -337,8 +347,11 @@
   function mergeState(base, saved) {
     if (!saved || typeof saved !== 'object') return base;
     try {
-      if (saved.version === 2 || saved.version === 3 || saved.version === 4) {
+      if (saved.version === 2 || saved.version === 3 || saved.version === 4 || saved.version === 5) {
         if (catOf(saved.category).id === saved.category) base.category = saved.category;
+        // v1.3: intent arrived in state v5; v2–v4 saves keep the
+        // default 'window' (the engines' unset behaviour).
+        if (saved.intent === 'window' || saved.intent === 'upkeep') base.intent = saved.intent;
         if (saved.selections) {
           Object.keys(base.selections).forEach(function (k) {
             if (typeof saved.selections[k] === 'string') base.selections[k] = saved.selections[k];
@@ -744,6 +757,19 @@
       if (prio) prio.disabled = store[k].mode !== 'maximize';
     });
   }
+  // v1.3: the two intent selects (frame panel / weapon panel) mirror
+  // the single state.intent; each is enabled only while its panel's
+  // Conditional buffs toggle is on, muted otherwise.
+  function syncIntentControls() {
+    var f = $('sel-intent'), w = $('sel-intent-w');
+    if (f) { f.value = state.intent; f.disabled = !state.routesFrame.conditional; }
+    if (w) { w.value = state.intent; w.disabled = !state.routesWeapon.conditional; }
+    var bf = $('intent-block');
+    if (bf) bf.classList.toggle('intent-off', !state.routesFrame.conditional);
+    var bw = $('intent-block-w');
+    if (bw) bw.classList.toggle('intent-off', !state.routesWeapon.conditional);
+  }
+
   function applyStateToUI() {
     $('sel-category').value = state.category;
     var cat = currentCat();
@@ -838,6 +864,13 @@
       if (cb) state.routesWeapon[r.key] = cb.checked;
     });
     state.ampConditional = $('chk-amp-conditional').checked;
+    // v1.3: intent is read from the select of the panel the user is
+    // looking at (the frame panel serves frame/necramech/companion).
+    var intentSel = isFrameKind(cat.kind) ? $('sel-intent')
+      : isWeaponKind(cat.kind) ? $('sel-intent-w') : null;
+    if (intentSel && (intentSel.value === 'window' || intentSel.value === 'upkeep')) {
+      state.intent = intentSel.value;
+    }
     // Ability locks for the currently selected frame
     if (cat.kind === 'frame') {
       var frame = state.selections.Warframe;
@@ -1184,6 +1217,7 @@
     var cat = currentCat();
     refreshLocksUI();
     renderCrossGearPanel();
+    syncIntentControls();
     var framePanel = isFrameKind(cat.kind);
     $('routes-frame-panel').hidden = !framePanel;
     $('routes-weapon-panel').hidden = !isWeaponKind(cat.kind);
@@ -1365,12 +1399,24 @@
   function isExcludedMod(catId, name) {
     return excludesFor(catId).mods.indexOf(name) >= 0;
   }
-  function fillDatalist(dl, names) {
+  // v1.3: the conditional-class tag for pickers — " · burst 3s",
+  // " · maintainable", " · unknown" (window shown when the class row
+  // carries one). Unclassified pieces get no tag.
+  function classRow(name) {
+    return (SITE && SITE.conditionalClasses && SITE.conditionalClasses[name]) || null;
+  }
+  function classTag(name) {
+    var row = classRow(name);
+    if (!row) return '';
+    return ' · ' + row.class + (row.windowSeconds != null ? ' ' + fmt(row.windowSeconds) + 's' : '');
+  }
+  function fillDatalist(dl, names, tagged) {
     if (!dl) return;
     dl.innerHTML = '';
     names.forEach(function (n) {
       var o = document.createElement('option');
       o.value = n;
+      if (tagged) o.textContent = classTag(n);
       dl.appendChild(o);
     });
   }
@@ -1378,8 +1424,8 @@
     var cat = currentCat();
     $('locks-panel').hidden = cat.kind === 'amp';
     if (cat.kind === 'amp') return;
-    fillDatalist($('lock-mod-list'), pickerModNames(false));
-    fillDatalist($('lock-arcane-list'), arcanePickerNames());
+    fillDatalist($('lock-mod-list'), pickerModNames(false), true);
+    fillDatalist($('lock-arcane-list'), arcanePickerNames(), true);
     renderLockLists();
   }
   function renderLockLists() {
@@ -1873,7 +1919,8 @@
         shardWallet: shardWalletInput(),
         formaBudget: state.forma,
         umbraForma: state.umbraForma,
-        reactor: true
+        reactor: true,
+        intent: state.intent
       };
       var hc = currentHelminthChoice();
       if (hc) finput.helminthChoice = hc;
@@ -1892,7 +1939,8 @@
         targets: collectTargets(state.frameTargets, FRAME_STATS),
         routes: { mods: state.routesFrame.mods, conditional: state.routesFrame.conditional },
         formaBudget: state.forma,
-        umbraForma: state.umbraForma
+        umbraForma: state.umbraForma,
+        intent: state.intent
       };
       applyLocksToInput(minput);
       applyExcludesToInput(minput);
@@ -1913,7 +1961,8 @@
         targets: collectTargets(state.frameTargets, COMPANION_STATS),
         routes: { mods: state.routesFrame.mods, conditional: state.routesFrame.conditional },
         formaBudget: state.forma,
-        umbraForma: state.umbraForma
+        umbraForma: state.umbraForma,
+        intent: state.intent
       };
       if (comp.companionEntry) cinput.companionEntry = comp.companionEntry;
       if (owner) cinput.ownerStats = owner;
@@ -1933,7 +1982,8 @@
           collectTargets(state.dmgTargets, DMG_STATS)),
         routes: wroutes,
         formaBudget: state.forma,
-        umbraForma: state.umbraForma
+        umbraForma: state.umbraForma,
+        intent: state.intent
       };
       if (w.entry.IsLichWeapon) {
         var pct = Math.min(60, Math.max(25, state.progenitor.percent || 60));
@@ -2537,9 +2587,17 @@
 
   function refreshBoardUI() {
     var panel = $('board-panel');
-    if (!boardCur || boardCatId !== state.category) { panel.hidden = true; return; }
+    if (!boardCur || boardCatId !== state.category) {
+      panel.hidden = true;
+      $('guide-panel').hidden = true;
+      return;
+    }
     var ser = serializeBoard();
-    if (!ser || ser.itemKey !== currentItemKey()) { panel.hidden = true; return; }
+    if (!ser || ser.itemKey !== currentItemKey()) {
+      panel.hidden = true;
+      $('guide-panel').hidden = true;
+      return;
+    }
     panel.hidden = false;
     var ev = null, err = null;
     try { ev = evalBoard(); } catch (e) { err = e; }
@@ -2582,6 +2640,7 @@
         computeUnmet(sd.defs, sd.store, ev.achieved), false, ev.breakdown);
       renderDelta(ev);
     }
+    renderGuide();
   }
 
   // ---- board editor actions ---------------------------------------------------
@@ -2620,7 +2679,7 @@
         return banned.indexOf(n) < 0;
       });
     }
-    fillDatalist($('swap-list'), swapPoolNames);
+    fillDatalist($('swap-list'), swapPoolNames, true);
     $('swap-search').value = '';
     $('board-swap').hidden = false;
   }
@@ -2754,6 +2813,8 @@
     $('cheapest-panel').hidden = true;
     $('helminth-card').hidden = true;
     $('crossgear-panel').hidden = true;
+    $('peak-line').hidden = true;
+    $('sustained-line').hidden = true;
     lastKind = b.kind;
     lastPieces = collectBoardPieces();
     refreshBoardUI();
@@ -2907,6 +2968,175 @@
     });
   }
 
+  // ---- v1.3 sustained floor ------------------------------------------
+  // Peak is the achieved table as before; when the solve carries a
+  // sustained floor (intent set + conditional route on), the targeted
+  // stats' burst-down values render as one compact line.
+  function sustainedPairs(stats, store, achieved) {
+    var pairs = [];
+    if (!achieved) return pairs;
+    stats.forEach(function (s) {
+      var t = store[s.key];
+      if (!t || t.mode === 'dontcare') return;
+      var a = achieved[s.key];
+      if (typeof a !== 'number') return;
+      pairs.push(s.label + ' ' + fmt(a));
+    });
+    return pairs;
+  }
+  function resultStatsStore(kind) {
+    if (kind === 'frame') {
+      return {
+        stats: currentCat().kind === 'companion' ? COMPANION_STATS : FRAME_STATS,
+        store: state.frameTargets
+      };
+    }
+    return { stats: WEAPON_STATS.concat(DMG_STATS), store: weaponTargetStore() };
+  }
+  function renderSustained(kind, res) {
+    var peak = $('peak-line'), sus = $('sustained-line');
+    peak.hidden = true; sus.hidden = true; sus.textContent = '';
+    if ((kind !== 'frame' && kind !== 'weapon') || !res.sustained) return;
+    var ss = resultStatsStore(kind);
+    var pairs = sustainedPairs(ss.stats, ss.store, res.sustained.achieved);
+    if (!pairs.length) return;
+    peak.hidden = false;
+    peak.textContent = 'Peak — all conditional effects up (the table below).';
+    sus.hidden = false;
+    sus.textContent = 'Sustained floor (burst effects down): ' + pairs.join(' · ');
+  }
+  function cheapestSustainedLine(kind, res) {
+    if (!res.cheapest || !res.cheapest.sustained) return null;
+    var ss = resultStatsStore(kind);
+    var pairs = sustainedPairs(ss.stats, ss.store, res.cheapest.sustained.achieved);
+    return pairs.length ? 'Sustained floor (burst effects down): ' + pairs.join(' · ') : null;
+  }
+
+  // ---- v1.3 guide: "How to get the most out of this build" ------------
+  // Derived from the CURRENT build's pieces (live board + extras —
+  // the same pieces the breakdown scores) joined to the shipped
+  // conditional-class rows. No per-piece prose is invented; the one
+  // exception is the Growing Power proc note, cited inline below.
+  // Tacusin-confirmed in-game 2026-10-18: Growing Power procs come
+  // from your weapons' status effects (companion weapons and Hunter
+  // Munitions included); allies' status, ability status and
+  // Syndicate radials do not trigger it.
+  var GROWING_POWER_NOTE = "Procs from your weapons' status effects — incl. companion weapons and Hunter Munitions; not from allies, ability status, or Syndicate radials.";
+  function pieceDescription(name) {
+    var rec = null;
+    (SITE.arcanes.arcanes || []).some(function (a) { if (a.name === name) { rec = a; return true; } return false; });
+    if (!rec) (SITE.tomes.mods || []).some(function (a) { if (a.name === name) { rec = a; return true; } return false; });
+    if (!rec) rec = modRecord(name);
+    if (!rec) return null;
+    if (rec.sourceLine) return rec.sourceLine;
+    var effs = rec.effects || [];
+    for (var i = 0; i < effs.length; i++) if (effs[i].sourceLine) return effs[i].sourceLine;
+    return null;
+  }
+  function boardConditionalPieces() {
+    var out = [];
+    if (!boardCur) return out;
+    function push(name) {
+      var row = classRow(name);
+      if (row) out.push({ name: name, row: row });
+    }
+    boardCur.slots.forEach(function (s) { if (s.mod) push(s.mod); });
+    var e = boardCur.extras || {};
+    if (boardKind === 'frame') {
+      (e.arcanes || []).forEach(push);
+      if (e.tome) push(e.tome);
+      if (e.subsume) push(e.subsume.ability);
+    } else if (boardKind === 'weapon') {
+      if (e.arcane) push(e.arcane);
+    }
+    return out;
+  }
+  function isStacker(row) {
+    return (row.maxStacks != null && row.maxStacks > 1) || /stack/i.test(row.trigger || '');
+  }
+  function cap1(s) { return s ? s.charAt(0).toUpperCase() + s.slice(1) : s; }
+  function guideWindowText(row) {
+    if (row.windowSeconds != null) return fmt(row.windowSeconds) + 's window';
+    if (row.trigger && /^while/i.test(row.trigger)) return 'lasts ' + row.trigger.split(';')[0].trim();
+    return 'no fixed window';
+  }
+  function fillWindup(body, pieces) {
+    body.appendChild(el('h3', null, 'Wind-up sequence'));
+    // Stack-builders first (they take the longest to arm), then by
+    // window descending — the tightest window goes off LAST.
+    var sorted = pieces.slice().sort(function (a, b) {
+      var as = isStacker(a.row) ? 0 : 1, bs = isStacker(b.row) ? 0 : 1;
+      if (as !== bs) return as - bs;
+      var aw = a.row.windowSeconds == null ? Infinity : a.row.windowSeconds;
+      var bw = b.row.windowSeconds == null ? Infinity : b.row.windowSeconds;
+      if (aw !== bw) return bw - aw;
+      return a.name < b.name ? -1 : 1;
+    });
+    var ol = el('ol', 'guide-steps');
+    sorted.forEach(function (p) {
+      var bits = [];
+      if (isStacker(p.row) && p.row.maxStacks != null) bits.push('build to ' + p.row.maxStacks + ' stacks');
+      bits.push(guideWindowText(p.row));
+      var li = el('li', 'guide-step',
+        p.name + ' — ' + cap1(p.row.trigger || 'conditional effect') + ' (' + bits.join(', ') + ')');
+      if (p.name === 'Growing Power') li.textContent += ' ' + GROWING_POWER_NOTE;
+      ol.appendChild(li);
+    });
+    ol.appendChild(el('li', 'guide-final', '→ then cast / fire the thing the build is built around.'));
+    body.appendChild(ol);
+  }
+  function fillUpkeepCards(body, pieces) {
+    body.appendChild(el('h3', null, 'Upkeep'));
+    pieces.forEach(function (p) {
+      var card = el('div', 'guide-card');
+      card.appendChild(el('p', null, p.name + ' — ' + p.row.class +
+        (p.row.windowSeconds != null ? ', ' + fmt(p.row.windowSeconds) + 's window' : '')));
+      if (p.row.class === 'burst') {
+        card.appendChild(el('p', 'guide-flag', isLockedName(p.name)
+          ? 'Burst piece kept by lock — needs re-arming every ' + fmt(p.row.windowSeconds) + 's.'
+          : 'Burst piece — needs re-arming every ' + fmt(p.row.windowSeconds) + 's in an upkeep build.'));
+      } else if (p.row.trigger) {
+        card.appendChild(el('p', 'muted', 'Stays up: ' + cap1(p.row.trigger) +
+          (p.row.maxStacks != null && p.row.maxStacks > 1 ? ' — up to ' + p.row.maxStacks + ' stacks.' : '.')));
+      }
+      var desc = pieceDescription(p.name);
+      if (desc) card.appendChild(el('p', 'muted', desc));
+      if (p.name === 'Growing Power') card.appendChild(el('p', 'muted', GROWING_POWER_NOTE));
+      body.appendChild(card);
+    });
+  }
+  function fillGuideBody(body, pieces, condOn) {
+    body.innerHTML = '';
+    if (!condOn || !pieces.length) {
+      body.appendChild(el('p', 'muted', "Nothing conditional in this build — it's always on."));
+      return;
+    }
+    if (state.intent === 'upkeep') fillUpkeepCards(body, pieces);
+    else fillWindup(body, pieces);
+  }
+  function renderGuide() {
+    var panel = $('guide-panel');
+    if (!panel) return;
+    if (!boardCur || boardCatId !== state.category) { panel.hidden = true; return; }
+    var ser = serializeBoard();
+    if (!ser || ser.itemKey !== currentItemKey()) { panel.hidden = true; return; }
+    panel.hidden = false;
+    var condOn = boardKind === 'frame' ? !!state.routesFrame.conditional : !!state.routesWeapon.conditional;
+    fillGuideBody($('guide-body'), boardConditionalPieces(), condOn);
+  }
+  function renderGuideAmp(res) {
+    var panel = $('guide-panel');
+    if (!panel) return;
+    panel.hidden = false;
+    var pieces = [];
+    ((res.arcanes && res.arcanes.amp) || []).concat((res.arcanes && res.arcanes.operator) || [])
+      .forEach(function (n) {
+        var row = classRow(n);
+        if (row) pieces.push({ name: n, row: row });
+      });
+    fillGuideBody($('guide-body'), pieces, !!state.ampConditional);
+  }
+
   function renderResults(kind, res) {
     lastResult = res;
     lastKind = kind;
@@ -2919,6 +3149,7 @@
     renderNotes(res);
     renderHelminthCard(kind, res);
     renderCrossGearResults(kind, res);
+    renderSustained(kind, res);
     var box = $('arrangement');
     box.innerHTML = '';
     var dmg = $('damage-line');
@@ -3015,6 +3246,8 @@
           fmtInt(res.cheapest.totalRankCost.credits) + ' Credits';
       }
       cbox.appendChild(el('p', null, line));
+      var csLine = cheapestSustainedLine(kind, res);
+      if (csLine) cbox.appendChild(el('p', 'muted', csLine));
     } else {
       cp.hidden = true;
     }
@@ -3025,6 +3258,7 @@
       setupBoard(kind, res);
       lastPieces = collectBoardPieces();
     }
+    if (kind === 'amp') renderGuideAmp(res);
     renderAcquisition();
   }
 
@@ -3110,13 +3344,15 @@
       fetchJSON('data/shards.json'), fetchJSON('data/helmets.json'),
       fetchJSON('data/modular.json'), fetchJSON('data/helminth.json'),
       fetchJSON('data/set_bonuses.json'), fetchJSON('data/links.json'),
-      fetchJSON('data/acquisition.json'), fetchJSON('data/modpool.json')
+      fetchJSON('data/acquisition.json'), fetchJSON('data/modpool.json'),
+      fetchJSON('data/conditional_classes.json')
     ]).then(function (parts) {
       SITE = {
         frames: parts[0], weapons: parts[1], mods: parts[2], arcanes: parts[3],
         tomes: parts[4], auras: parts[5], shards: parts[6], helmets: parts[7],
         modular: parts[8], helminth: parts[9], setBonuses: parts[10],
-        links: parts[11], acquisition: parts[12], modpool: parts[13]
+        links: parts[11], acquisition: parts[12], modpool: parts[13],
+        conditionalClasses: parts[14]
       };
       SITE.modpoolByName = {};
       (SITE.modpool.mods || []).forEach(function (m) { SITE.modpoolByName[m.name] = m; });
