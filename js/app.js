@@ -804,7 +804,7 @@
     $('inp-prog-percent').value = state.progenitor.percent;
   }
   function defaultPick(cat) {
-    if (cat.id === 'Warframe') return 'Follie';
+    if (cat.id === 'Warframe') return 'Ash';
     if (cat.id === 'Primary') return 'Braton';
     if (cat.id === 'Melee') return 'Nikana';
     if (cat.id === 'Companion Weapon') return 'Sunika Claws';
@@ -2077,7 +2077,15 @@
         chain.forEach(function (entry) {
           var line = el('div', 'bd-line');
           line.appendChild(el('span', 'bd-kind', entry.kind || ''));
-          line.appendChild(el('span', null, entry.source + ' — ' + fmt(entry.cumulative)));
+          // v1.2.1: non-Base lines show the entry's own increase
+          // before the running total ("+60 → 305"); Base shows just
+          // its value (it IS the starting point).
+          var d = (typeof entry.delta === 'number') ? entry.delta : 0;
+          var seg = entry.kind === 'base'
+            ? entry.source + ' — ' + fmt(entry.cumulative)
+            : entry.source + ' — ' + (d < 0 ? '-' : '+') + fmt(Math.abs(d)) +
+              ' → ' + fmt(entry.cumulative);
+          line.appendChild(el('span', null, seg));
           tdB.appendChild(line);
         });
         bdRow.appendChild(tdB);
