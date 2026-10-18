@@ -35,66 +35,197 @@
         <span>Category</span>
         <select id="sel-category">
           <option value="Warframe" selected>Warframe</option>
-          <option value="Primary" disabled>Primary (later milestone)</option>
-          <option value="Secondary" disabled>Secondary (later milestone)</option>
-          <option value="Melee" disabled>Melee (later milestone)</option>
-          <option value="Archgun" disabled>Archgun (later milestone)</option>
-          <option value="Archmelee" disabled>Archmelee (later milestone)</option>
-          <option value="Companion" disabled>Companion (later milestone)</option>
-          <option value="Amp" disabled>Amp (later milestone)</option>
+          <option value="Primary">Primary</option>
+          <option value="Secondary">Secondary</option>
+          <option value="Melee">Melee</option>
+          <option value="Archgun">Archgun</option>
+          <option value="Archmelee">Archmelee</option>
+          <option value="Companion">Companion</option>
+          <option value="Companion Weapon">Companion Weapon</option>
+          <option value="Necramech">Necramech</option>
+          <option value="Kitgun">Kitgun</option>
+          <option value="Zaw">Zaw</option>
+          <option value="Amp">Amp</option>
         </select>
       </label>
-      <label class="field">
-        <span>Warframe</span>
-        <input id="inp-frame" list="frame-list" placeholder="Start typing a frame name…" autocomplete="off">
-        <datalist id="frame-list"></datalist>
-      </label>
-      <p class="muted" id="frame-hint">Only the Warframe category is functional in this milestone; the others are listed for planning.</p>
+
+      <div id="item-picker-block">
+        <label class="field">
+          <span id="item-picker-label">Warframe</span>
+          <input id="inp-item" list="item-list" placeholder="Start typing a name…" autocomplete="off">
+          <datalist id="item-list"></datalist>
+        </label>
+      </div>
+
+      <div id="parts-kitgun" class="parts" hidden>
+        <label class="field"><span>Grip (decides Primary vs Secondary)</span><select id="sel-kg-grip"></select></label>
+        <label class="field"><span>Chamber</span><select id="sel-kg-chamber"></select></label>
+        <label class="field"><span>Loader</span><select id="sel-kg-loader"></select></label>
+      </div>
+
+      <div id="parts-zaw" class="parts" hidden>
+        <label class="field"><span>Strike</span><select id="sel-zaw-strike"></select></label>
+        <label class="field"><span>Grip</span><select id="sel-zaw-grip"></select></label>
+        <label class="field"><span>Link</span><select id="sel-zaw-link"></select></label>
+      </div>
+
+      <div id="parts-amp" class="parts" hidden>
+        <label class="field"><span>Prism (primary fire)</span><select id="sel-amp-prism"></select></label>
+        <label class="field"><span>Scaffold (alt fire)</span><select id="sel-amp-scaffold"></select></label>
+        <label class="field"><span>Brace</span><select id="sel-amp-brace"></select></label>
+      </div>
+
+      <div id="parts-companion" class="parts" hidden>
+        <div id="moa-parts">
+          <label class="field"><span>MOA Model</span><select id="sel-moa-model"></select></label>
+          <label class="field"><span>MOA Core</span><select id="sel-moa-core"></select></label>
+          <label class="field"><span>MOA Gyro</span><select id="sel-moa-gyro"></select></label>
+          <label class="field"><span>MOA Bracket</span><select id="sel-moa-bracket"></select></label>
+        </div>
+        <div id="hound-parts">
+          <label class="field"><span>Hound Model</span><select id="sel-hound-model"></select></label>
+          <label class="field"><span>Hound Core</span><select id="sel-hound-core"></select></label>
+          <label class="field"><span>Hound Bracket</span><select id="sel-hound-bracket"></select></label>
+          <label class="field"><span>Hound Stabilizer</span><select id="sel-hound-stabilizer"></select></label>
+        </div>
+        <p class="muted">This companion is modular: the wiki store publishes no base stats for it, so its stats are assembled from the parts above.</p>
+      </div>
+
+      <div id="attack-block" hidden>
+        <label class="field">
+          <span>Attack</span>
+          <select id="sel-attack"></select>
+        </label>
+      </div>
+
+      <div id="progenitor-block" hidden>
+        <label class="field">
+          <span>Progenitor element (Lich-family weapon)</span>
+          <select id="sel-prog-element">
+            <option value="Heat">Heat</option>
+            <option value="Cold">Cold</option>
+            <option value="Electric">Electric</option>
+            <option value="Toxin">Toxin</option>
+            <option value="Impact">Impact</option>
+            <option value="Magnetic">Magnetic</option>
+            <option value="Radiation">Radiation</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Progenitor bonus % (your copy, 25–60)</span>
+          <input type="number" id="inp-prog-percent" min="25" max="60" step="1">
+        </label>
+      </div>
+
+      <p class="muted" id="item-hint"></p>
     </div>
-    <div class="panel" id="frame-card">
-      <h2 id="frame-name">No frame selected</h2>
-      <div class="statgrid" id="frame-stats"></div>
-      <h3>Abilities</h3>
-      <ul id="frame-abilities" class="plain"></ul>
+    <div class="panel" id="item-card">
+      <h2 id="item-name">No item selected</h2>
+      <div id="item-viewer"></div>
     </div>
   </section>
 
   <!-- TARGETS -->
   <section id="tab-targets" class="tab">
-    <div class="panel">
+    <div class="panel" id="targets-frame-wrap">
       <h2>Target stats</h2>
       <p class="muted">Ability stats are percentages where 100 is the unmodded base. Health / Shield / Armor / Energy are final pool numbers. Untouched stats default to Don't care.</p>
-      <table class="grid" id="targets-table">
-        <thead><tr><th>Stat</th><th>Mode</th><th>Target</th></tr></thead>
-        <tbody></tbody>
-      </table>
+      <div class="tablewrap">
+        <table class="grid" id="targets-frame-table">
+          <thead><tr><th>Stat</th><th>Mode</th><th>Target</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="panel" id="targets-weapon-wrap" hidden>
+      <h2>Target stats</h2>
+      <p class="muted">Paper stats of the selected attack. Crit chance and status chance are percentages; reload is seconds (lower is better, so “At least” reads as “at most”). Untouched stats default to Don't care.</p>
+      <div class="tablewrap">
+        <table class="grid" id="targets-weapon-table">
+          <thead><tr><th>Stat</th><th>Mode</th><th>Target</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="panel" id="targets-amp-wrap" hidden>
+      <h2>Target stats</h2>
+      <p class="muted">Amps take no mods — Calculate picks Operator/Amp arcanes only. Crit chance and status chance are percentages. Untouched stats default to Don't care.</p>
+      <div class="tablewrap">
+        <table class="grid" id="targets-amp-table">
+          <thead><tr><th>Stat</th><th>Mode</th><th>Target</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
     </div>
   </section>
 
   <!-- ROUTES & RESOURCES -->
   <section id="tab-routes" class="tab">
-    <div class="panel">
+    <div class="panel" id="routes-frame-panel">
       <h2>Routes</h2>
-      <div class="checks" id="route-checks"></div>
+      <div class="checks" id="route-checks-frame"></div>
       <p class="muted">Conditional buffs (procced / stacking sources) count toward stats only when that toggle is on. Legacy Arcane Helmets default to off — they only apply when the selected frame has one.</p>
+      <div id="helminth-block" hidden>
+        <h3>Helminth ability locks</h3>
+        <p class="muted">A locked ability is never replaced by a subsume. Unlocked slots are fair game; the solver picks at most one subsume, at diminished Helminth values.</p>
+        <div class="checks" id="lock-checks"></div>
+      </div>
     </div>
-    <div class="panel">
+    <div class="panel" id="routes-weapon-panel" hidden>
+      <h2>Routes</h2>
+      <div class="checks" id="route-checks-weapon"></div>
+      <p class="muted">Weapon arcanes and conditional (procced / stacking) effects count only under their toggles. The stance slot is capacity-only.</p>
+    </div>
+    <div class="panel" id="routes-amp-panel" hidden>
+      <h2>Routes</h2>
+      <label class="check">
+        <input type="checkbox" id="chk-amp-conditional">
+        <span>Conditional buffs (procced / stacking arcanes count)</span>
+      </label>
+      <p class="muted">Amps have no mods, shards or Forma — Calculate solves Operator/Amp arcanes only.</p>
+    </div>
+    <div class="panel" id="routes-companion-panel" hidden>
+      <h2>Owner stats (for Link mods)</h2>
+      <p class="muted">Link mods scale off your Warframe's stats. Leave blank and Link mods contribute 0 (the result will say so).</p>
+      <label class="field"><span>Owner Health</span><input type="number" id="inp-owner-health" min="0" step="any"></label>
+      <label class="field"><span>Owner Shield</span><input type="number" id="inp-owner-shield" min="0" step="any"></label>
+      <label class="field"><span>Owner Armor</span><input type="number" id="inp-owner-armor" min="0" step="any"></label>
+    </div>
+    <div class="panel" id="sets-panel">
+      <h2>Support set pieces (cross-gear)</h2>
+      <p class="muted">Set mods already built on your OTHER gear count toward this item's set bonuses. Enter how many pieces of each set your support gear carries.</p>
+      <div class="tablewrap">
+        <table class="grid" id="sets-table">
+          <thead><tr><th>Set</th><th>Support pieces</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="panel" id="wallet-panel">
       <h2>Archon Shard wallet</h2>
-      <table class="grid" id="wallet-table">
-        <thead><tr><th>Colour</th><th>Normal on hand</th><th>Tauforged on hand</th><th>Willing to Ascent-fuse (3 normal → 1 Tauforged)</th></tr></thead>
-        <tbody></tbody>
-      </table>
+      <div class="tablewrap">
+        <table class="grid" id="wallet-table">
+          <thead><tr><th>Colour</th><th>Normal on hand</th><th>Tauforged on hand</th><th>Willing to Ascent-fuse (3 normal → 1 Tauforged)</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
       <label class="check">
         <input type="checkbox" id="chk-coalescent">
         <span>Willing to Coalescent-fuse (1 + 1 of two colours → 1 fused shard)</span>
       </label>
     </div>
-    <div class="panel">
+    <div class="panel" id="forma-panel">
       <h2>Forma</h2>
       <label class="field">
         <span>Forma budget (focus item)</span>
         <select id="sel-forma"></select>
       </label>
+      <div id="umbra-block">
+        <label class="field">
+          <span>Umbra Forma available (separate budget, default 0)</span>
+          <input type="number" id="inp-umbra" min="0" step="1">
+        </label>
+      </div>
     </div>
   </section>
 
@@ -107,17 +238,26 @@
     <div id="results-body" hidden>
       <div class="panel">
         <h2>Achieved vs target</h2>
-        <table class="grid" id="achieved-table">
-          <thead><tr><th>Stat</th><th>Target</th><th>Achieved</th><th>Status</th></tr></thead>
-          <tbody></tbody>
-        </table>
+        <div class="tablewrap">
+          <table class="grid" id="achieved-table">
+            <thead><tr><th>Stat</th><th>Target</th><th>Achieved</th><th>Status</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
         <ul id="result-notes" class="notes"></ul>
       </div>
       <div class="panel">
         <h2>Arrangement</h2>
         <div id="arrangement"></div>
+        <div id="damage-line"></div>
         <p id="capacity-line"></p>
+        <p id="cost-line"></p>
         <div id="forma-line"></div>
+      </div>
+      <div class="panel" id="cheapest-panel" hidden>
+        <h2>Cheapest variant</h2>
+        <p class="muted">Meets the same targets with fewer pieces / Forma. Shown only when it differs from the closest build above.</p>
+        <div id="cheapest-body"></div>
       </div>
     </div>
   </section>
@@ -127,10 +267,12 @@
     <div class="panel">
       <h2>Acquisition</h2>
       <p class="muted" id="acq-hint">Run Calculate to see acquisition for a build.</p>
-      <table class="grid" id="acq-table" hidden>
-        <thead><tr><th>Piece</th><th>Kind</th><th>Source</th><th>Wiki</th></tr></thead>
-        <tbody></tbody>
-      </table>
+      <div class="tablewrap">
+        <table class="grid" id="acq-table" hidden>
+          <thead><tr><th>Piece</th><th>Kind</th><th>Source</th><th>Wiki</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
     </div>
   </section>
 </main>
@@ -140,6 +282,8 @@
 </footer>
 
 <script src="js/solver.js"></script>
+<script src="js/weaponSolver.js"></script>
+<script src="js/modular.js"></script>
 <script src="js/app.js"></script>
 </body>
 </html>
