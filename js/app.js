@@ -33,6 +33,15 @@
  * also carries). Results gain the sustained-floor lines (Peak vs
  * burst-down values) and the "How to get the most out of this build"
  * guide, rendered from the live board's conditional pieces.
+ *
+ * v1.4 (site): restricted-pool surfacing — picker lists now honour
+ * the shipped records' `restrictedTo` (a restricted mod appears only
+ * on its own item) and ability augments appear only with the new
+ * Augments route ON and only where the engine's shared
+ * Solver.augmentEligible admits them for the current frame +
+ * Helminth choice (eligibility follows the ability, live). Hybrid
+ * intent joins the intent selects with a burst-allowance select;
+ * state v6 carries routes.augments + hybridAllowance.
  */
 (function () {
   'use strict';
@@ -94,6 +103,7 @@
     { key: 'legacyHelmets', label: 'Legacy Arcane Helmets', def: false },
     { key: 'tome', label: 'Tome cross-gear', def: true },
     { key: 'conditional', label: 'Conditional buffs', def: true },
+    { key: 'augments', label: 'Ability augments', def: false },
     { key: 'helminth', label: 'Helminth subsume', def: false }
   ];
   // Routes that exist on Necramechs / Companions (the solver forces the
@@ -202,9 +212,12 @@
     ROUTES_FRAME.forEach(function (r) { routesFrame[r.key] = r.def; });
     ROUTES_WEAPON.forEach(function (r) { routesWeapon[r.key] = r.def; });
     return {
-      version: 5,
+      version: 6,
       category: 'Warframe',
       intent: 'window',
+      // v1.4: Hybrid burst allowance (1 | 2). routesFrame.augments
+      // (the Augments route) rides with the other route toggles.
+      hybridAllowance: 1,
       selections: {
         Warframe: null, Necramech: null, Companion: null,
         Primary: null, Secondary: null, Melee: null, Archgun: null,
@@ -347,11 +360,16 @@
   function mergeState(base, saved) {
     if (!saved || typeof saved !== 'object') return base;
     try {
-      if (saved.version === 2 || saved.version === 3 || saved.version === 4 || saved.version === 5) {
+      if (saved.version === 2 || saved.version === 3 || saved.version === 4 || saved.version === 5 || saved.version === 6) {
         if (catOf(saved.category).id === saved.category) base.category = saved.category;
         // v1.3: intent arrived in state v5; v2–v4 saves keep the
-        // default 'window' (the engines' unset behaviour).
-        if (saved.intent === 'window' || saved.intent === 'upkeep') base.intent = saved.intent;
+        // default 'window' (the engines' unset behaviour). v1.4:
+        // 'hybrid' joins the legal values with state v6.
+        if (saved.intent === 'window' || saved.intent === 'upkeep' || saved.intent === 'hybrid') base.intent = saved.intent;
+        // v1.4: hybridAllowance arrived in state v6; v5 and older
+        // saves keep the default 1. routes.augments needs no line
+        // here — mergeRoutes below carries it (default off).
+        if (saved.hybridAllowance === 2) base.hybridAllowance = 2;
         if (saved.selections) {
           Object.keys(base.selections).forEach(function (k) {
             if (typeof saved.selections[k] === 'string') base.selections[k] = saved.selections[k];
@@ -649,7 +667,7 @@
       var cb = document.createElement('input');
       cb.type = 'checkbox'; cb.id = prefix + '-' + r.key;
       lab.appendChild(cb);
-      lab.appendChild(el('span', null, r.label + (r.key === 'legacyHelmets' ? ' (default off)' : '') + (r.key === 'helminth' ? ' (default off)' : '')));
+      lab.appendChild(el('span', null, r.label + (r.key === 'legacyHelmets' ? ' (default off)' : '') + (r.key === 'helminth' ? ' (default off)' : '') + (r.key === 'augments' ? ' (default off)' : '')));
       container.appendChild(lab);
     });
   }
@@ -760,10 +778,17 @@
   // v1.3: the two intent selects (frame panel / weapon panel) mirror
   // the single state.intent; each is enabled only while its panel's
   // Conditional buffs toggle is on, muted otherwise.
+  // v1.4: the burst-allowance selects mirror state.hybridAllowance
+  // the same way, and enable only for Hybrid under a live
+  // Conditional toggle.
   function syncIntentControls() {
     var f = $('sel-intent'), w = $('sel-intent-w');
     if (f) { f.value = state.intent; f.disabled = !state.routesFrame.conditional; }
     if (w) { w.value = state.intent; w.disabled = !state.routesWeapon.conditional; }
+    var hybrid = state.intent === 'hybrid';
+    var fa = $('sel-allowance'), wa = $('sel-allowance-w');
+    if (fa) { fa.value = String(state.hybridAllowance); fa.disabled = !state.routesFrame.conditional || !hybrid; }
+    if (wa) { wa.value = String(state.hybridAllowance); wa.disabled = !state.routesWeapon.conditional || !hybrid; }
     var bf = $('intent-block');
     if (bf) bf.classList.toggle('intent-off', !state.routesFrame.conditional);
     var bw = $('intent-block-w');
@@ -866,10 +891,18 @@
     state.ampConditional = $('chk-amp-conditional').checked;
     // v1.3: intent is read from the select of the panel the user is
     // looking at (the frame panel serves frame/necramech/companion).
+    // v1.4: 'hybrid' is a legal value, and the panel's allowance
+    // select is read alongside it.
     var intentSel = isFrameKind(cat.kind) ? $('sel-intent')
       : isWeaponKind(cat.kind) ? $('sel-intent-w') : null;
-    if (intentSel && (intentSel.value === 'window' || intentSel.value === 'upkeep')) {
+    if (intentSel && (intentSel.value === 'window' || intentSel.value === 'upkeep' || intentSel.value === 'hybrid')) {
       state.intent = intentSel.value;
+    }
+    var allowSel = isFrameKind(cat.kind) ? $('sel-allowance')
+      : isWeaponKind(cat.kind) ? $('sel-allowance-w') : null;
+    if (allowSel) {
+      var av = parseInt(allowSel.value, 10);
+      if (av === 1 || av === 2) state.hybridAllowance = av;
     }
     // Ability locks for the currently selected frame
     if (cat.kind === 'frame') {
@@ -1236,6 +1269,10 @@
         var show = cat.kind === 'frame' || SUBSET_KIND_ROUTES.indexOf(r.key) >= 0;
         wrap.style.display = show ? '' : 'none';
       });
+      // v1.4: the augments caption explains a Warframe-only toggle
+      // (hidden for the subset kinds alongside its checkbox wrap).
+      var augCap = $('augments-caption');
+      if (augCap) augCap.style.display = cat.kind === 'frame' ? '' : 'none';
       $('helminth-block').hidden = !(cat.kind === 'frame' && state.routesFrame.helminth);
       if (cat.kind === 'frame' && state.routesFrame.helminth) {
         buildLockChecks();
@@ -1330,9 +1367,58 @@
     }
     return set;
   }
+  // v1.4: the item a restricted record belongs to, in the current
+  // picker context (mirrors the engines' exact-name eligibility).
+  function pickerItemName() {
+    var cat = currentCat();
+    if (cat.kind === 'frame') return state.selections.Warframe;
+    if (cat.kind === 'necramech') return state.selections.Necramech;
+    if (cat.kind === 'companion') {
+      var comp = null;
+      try { comp = currentCompanion(); } catch (e) { comp = null; }
+      return comp ? comp.frameName : state.selections.Companion;
+    }
+    if (isWeaponKind(cat.kind)) {
+      var w = null;
+      try { w = currentWeapon(); } catch (e2) { w = null; }
+      return w ? (w.entry && w.entry.Name) || w.name : null;
+    }
+    return null;
+  }
+  // Frame abilities from the solver bundle — the same data the
+  // engine's augmentEligible reads (assembleBundle already carries
+  // each frame's Abilities).
+  function pickerFrameAbilities(frameName) {
+    var wf = (BUNDLE && BUNDLE.warframes && BUNDLE.warframes.Warframes) || {};
+    var f = wf[frameName];
+    return (f && f.Abilities) || [];
+  }
+  // May this restricted record be offered in the current picker?
+  // Ability augments surface ONLY with the Augments route ON and
+  // only where the engine's shared rule admits them for the current
+  // frame + current Helminth choice (the choice confers eligibility
+  // only in choose-mode with the route on — currentHelminthChoice
+  // applies exactly that gate, like the engine). Every other
+  // restricted record (weapon / companion stat mods) surfaces on its
+  // own item only, never gated by the Augments toggle.
+  function pickerRestrictedOk(m) {
+    if (window.Solver.isAugmentRecord(m)) {
+      if (!state.routesFrame.augments) return false;
+      if (currentCat().kind !== 'frame') return false;
+      var frame = state.selections.Warframe;
+      if (!frame) return false;
+      var choice = currentHelminthChoice() || null;
+      return window.Solver.augmentEligible(m, frame, choice, pickerFrameAbilities(frame));
+    }
+    return !!m.restrictedTo && m.restrictedTo === pickerItemName();
+  }
   // Names offered by the lock / swap-in pickers for the current item.
   // Stance/posture records (negative baseDrain) are slot furniture,
-  // never normal-slot mods, so they are not offered.
+  // never normal-slot mods, so they are not offered. Restricted
+  // records (v1.4) are offered only where pickerRestrictedOk admits
+  // them — before the pipeline fix they matched no type at all; now
+  // their pool type matches broadly, so the restriction itself is
+  // the filter.
   function pickerModNames(exilusOnly) {
     var types = pickerTypeSet();
     var names = [];
@@ -1340,6 +1426,7 @@
       if (!types[m.type]) return;
       if ((m.baseDrain || 0) < 0) return;
       if (exilusOnly && !m.exilus) return;
+      if (m.restrictedTo && !pickerRestrictedOk(m)) return;
       names.push(m.name);
     });
     if (currentCat().kind === 'companion') {
@@ -1379,7 +1466,13 @@
         name: mp.name, type: mp.type, polarity: mp.polarity,
         baseDrain: mp.baseDrain || 0, maxRank: mp.maxRank || 0,
         rarity: mp.rarity, exilus: !!mp.exilus, set: mp.set,
-        incompatible: mp.incompatible || [], effects: []
+        incompatible: mp.incompatible || [],
+        // v1.4: the engines' lock normalisers read these — without
+        // them a locked augment arrives unrecognisable and its
+        // eligibility can never be judged.
+        restrictedTo: mp.restrictedTo || null,
+        augmentsAbility: mp.augmentsAbility || null,
+        effects: []
       };
     });
     return Object.keys(out).length ? out : undefined;
@@ -1410,13 +1503,25 @@
     if (!row) return '';
     return ' · ' + row.class + (row.windowSeconds != null ? ' ' + fmt(row.windowSeconds) + 's' : '');
   }
+  // v1.4: the augment badge for picker rows and board cells —
+  // "augment · <Ability>" when the augment→ability link resolved,
+  // plain "augment" for the unlinked fallback population.
+  function augmentBadge(name) {
+    var mp = modpoolRec(name);
+    if (!mp || !window.Solver.isAugmentRecord(mp)) return '';
+    return 'augment' + (mp.augmentsAbility ? ' · ' + mp.augmentsAbility : '');
+  }
+  function pickerTag(name) {
+    var b = augmentBadge(name);
+    return (b ? ' · ' + b : '') + classTag(name);
+  }
   function fillDatalist(dl, names, tagged) {
     if (!dl) return;
     dl.innerHTML = '';
     names.forEach(function (n) {
       var o = document.createElement('option');
       o.value = n;
-      if (tagged) o.textContent = classTag(n);
+      if (tagged) o.textContent = pickerTag(n);
       dl.appendChild(o);
     });
   }
@@ -1920,7 +2025,8 @@
         formaBudget: state.forma,
         umbraForma: state.umbraForma,
         reactor: true,
-        intent: state.intent
+        intent: state.intent,
+        hybridAllowance: state.hybridAllowance
       };
       var hc = currentHelminthChoice();
       if (hc) finput.helminthChoice = hc;
@@ -1940,7 +2046,8 @@
         routes: { mods: state.routesFrame.mods, conditional: state.routesFrame.conditional },
         formaBudget: state.forma,
         umbraForma: state.umbraForma,
-        intent: state.intent
+        intent: state.intent,
+        hybridAllowance: state.hybridAllowance
       };
       applyLocksToInput(minput);
       applyExcludesToInput(minput);
@@ -1962,7 +2069,8 @@
         routes: { mods: state.routesFrame.mods, conditional: state.routesFrame.conditional },
         formaBudget: state.forma,
         umbraForma: state.umbraForma,
-        intent: state.intent
+        intent: state.intent,
+        hybridAllowance: state.hybridAllowance
       };
       if (comp.companionEntry) cinput.companionEntry = comp.companionEntry;
       if (owner) cinput.ownerStats = owner;
@@ -1983,7 +2091,8 @@
         routes: wroutes,
         formaBudget: state.forma,
         umbraForma: state.umbraForma,
-        intent: state.intent
+        intent: state.intent,
+        hybridAllowance: state.hybridAllowance
       };
       if (w.entry.IsLichWeapon) {
         var pct = Math.min(60, Math.max(25, state.progenitor.percent || 60));
@@ -2363,6 +2472,8 @@
         if (s.origin === 'fill') cell.appendChild(el('span', 'tag-fill', 'fill'));
         if (s.origin === 'edited') cell.appendChild(el('span', 'badge', 'edited'));
         if (isLockedName(s.mod)) cell.appendChild(el('span', 'badge', '📌 locked'));
+        var augBadge = augmentBadge(s.mod);
+        if (augBadge) cell.appendChild(el('span', 'badge', augBadge));
       }
       if (s.kind !== 'stance') {
         cell.addEventListener('click', function () { onCellClick(i); });
@@ -3060,8 +3171,8 @@
     if (row.trigger && /^while/i.test(row.trigger)) return 'lasts ' + row.trigger.split(';')[0].trim();
     return 'no fixed window';
   }
-  function fillWindup(body, pieces) {
-    body.appendChild(el('h3', null, 'Wind-up sequence'));
+  function fillWindup(body, pieces, heading) {
+    body.appendChild(el('h3', null, heading || 'Wind-up sequence'));
     // Stack-builders first (they take the longest to arm), then by
     // window descending — the tightest window goes off LAST.
     var sorted = pieces.slice().sort(function (a, b) {
@@ -3105,14 +3216,31 @@
       body.appendChild(card);
     });
   }
-  function fillGuideBody(body, pieces, condOn) {
+  function fillGuideBody(body, pieces, condOn, hybridBurstNames) {
     body.innerHTML = '';
     if (!condOn || !pieces.length) {
       body.appendChild(el('p', 'muted', "Nothing conditional in this build — it's always on."));
       return;
     }
-    if (state.intent === 'upkeep') fillUpkeepCards(body, pieces);
-    else fillWindup(body, pieces);
+    if (state.intent === 'upkeep') { fillUpkeepCards(body, pieces); return; }
+    if (state.intent === 'hybrid') {
+      // v1.4: upkeep cards for everything that stays up (locked
+      // burst pieces included — fillUpkeepCards flags them "kept by
+      // lock"), plus a short wind-up listing ONLY the allowance
+      // pieces: the solver-chosen burst set (result.hybridBurst on
+      // an unedited board; on an edited board the non-locked burst
+      // pieces are the window part by the same Q1 rule).
+      var windowPieces = [], rest = [];
+      pieces.forEach(function (p) {
+        var isWindow = p.row.class === 'burst' &&
+          (hybridBurstNames ? hybridBurstNames.indexOf(p.name) >= 0 : !isLockedName(p.name));
+        (isWindow ? windowPieces : rest).push(p);
+      });
+      if (rest.length) fillUpkeepCards(body, rest);
+      if (windowPieces.length) fillWindup(body, windowPieces, 'Window pieces (allowance)');
+      return;
+    }
+    fillWindup(body, pieces);
   }
   function renderGuide() {
     var panel = $('guide-panel');
@@ -3122,7 +3250,12 @@
     if (!ser || ser.itemKey !== currentItemKey()) { panel.hidden = true; return; }
     panel.hidden = false;
     var condOn = boardKind === 'frame' ? !!state.routesFrame.conditional : !!state.routesWeapon.conditional;
-    fillGuideBody($('guide-body'), boardConditionalPieces(), condOn);
+    // The engine's solver-chosen burst set names the hybrid window
+    // part — trusted only while the board is the solved board; an
+    // edited board re-derives it from the lock rule instead.
+    var hybridNames = (state.intent === 'hybrid' && lastResult &&
+      lastResult.hybridBurst && !boardDiffers()) ? lastResult.hybridBurst : null;
+    fillGuideBody($('guide-body'), boardConditionalPieces(), condOn, hybridNames);
   }
   function renderGuideAmp(res) {
     var panel = $('guide-panel');

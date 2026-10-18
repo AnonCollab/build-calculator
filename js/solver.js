@@ -137,6 +137,41 @@
  *    entry also carries `delta`, its own increase over the previous
  *    entry (Base's delta is its own value), so deltas sum to the
  *    final cumulative.
+ *
+ * v1.4 (engine stage):
+ *  - Restricted pieces: derived records may carry `restrictedTo`
+ *    (the pipeline turns item-named Types — augments, weapon-
+ *    specific mods — into category records restricted to one item).
+ *    A restricted candidate is eligible ONLY when solving for that
+ *    item: EXACT item-name match. Weapon FAMILY variants (a Sobek
+ *    mod on a Kuva Sobek) are NOT admitted — family membership is
+ *    not in the source data as an eligibility rule, so it is left
+ *    as a noted limitation rather than guessed. Companion pools
+ *    filter by the companion's Name the same way; link mods are
+ *    unrestricted and unaffected.
+ *  - Ability augments (Warframe-type restricted records): locks are
+ *    governed by the Augments route (input.routes.augments, default
+ *    OFF — the Stage 0 measurement found ZERO stat-bearing frame
+ *    augments, so the toggle gates lock honouring only; the engine
+ *    never auto-picks mechanic augments). With the route ON, a
+ *    locked augment is honoured iff augmentEligible() says the
+ *    frame currently HAS the augmented ability: natively, or via
+ *    the current Helminth choice (which also REMOVES eligibility
+ *    for the ability it replaces). Unlinked augments (no extracted
+ *    ability link) fall back to native-frame restriction only.
+ *    Ineligible or route-off augment locks are dropped with a
+ *    result note (warn-never-block), never a hard error.
+ *  - Hybrid intent: input.intent 'hybrid' + input.hybridAllowance
+ *    (1 | 2, default 1; input.burstAllowance accepted as an alias)
+ *    — upkeep discipline with a burst ALLOWANCE: burst candidates
+ *    stay in the pools, but a build may hold at most N SOLVER-
+ *    CHOSEN burst pieces (search and fill both enforce the cap).
+ *    Per Q1's resolution, LOCKED burst pieces (and a forced
+ *    Helminth subsume) do NOT consume the allowance — locks already
+ *    override pruning outright. result.hybridBurst names the
+ *    solver-chosen burst pieces; the sustained floor is unchanged
+ *    (ALL burst pieces stripped, locked included). Window / upkeep
+ *    / unset behaviour is byte-identical to v1.3.
  */
 (function () {
   'use strict';
@@ -244,6 +279,8 @@
       incompatible: m.incompatible || [],
       set: m.set || null,
       exilus: !!m.exilus,
+      restrictedTo: m.restrictedTo || null,       // v1.4
+      augmentsAbility: m.augmentsAbility || null, // v1.4
       effects: effs
     };
   }
@@ -276,6 +313,17 @@
     if (entry.Category === 'Pets') types.Beast = 1;
     ctx._companionTypes = types; // lock validation (v1.1) reads the type set
     var built = poolFromTypes(ctx, ctx.derivedMods, types);
+    // v1.4: companion-restricted records (restrictedTo = a species /
+    // breed Name, e.g. 'Sahasa Kubrow') belong to that companion
+    // only — exact Name match, the same conservative rule as
+    // weapons. Link mods carry no restriction and pass through.
+    if (entry.Name) {
+      built.pool = built.pool.filter(function (rec) {
+        return !rec.restrictedTo || rec.restrictedTo === entry.Name;
+      });
+      built.byName = {};
+      built.pool.forEach(function (rec) { built.byName[rec.name] = rec; });
+    }
     ctx.linkMods.forEach(function (lm) {
       var ownerVal = ownerStats ? (ownerStats[lm.ownerStat] || 0) : 0;
       var rec = {
@@ -300,6 +348,57 @@
   function isBurstPiece(ctx, name) {
     var r = name ? ctx.condClasses[name] : null;
     return !!(r && r.class === 'burst');
+  }
+
+  // ---- v1.4: restricted pieces + ability augments -------------------
+  function baseFrameName(n) { return String(n || '').replace(/ Prime$/, ''); }
+
+  // Is this record an ability augment? In the derived data, augments
+  // are Warframe-type records carrying a restriction (restrictedTo =
+  // the owning frame) and, when the link extraction resolved one, an
+  // augmentsAbility. (Hysterical Fixation — flagged IsAbilityAugment
+  // in the source but typed plain 'Warframe' with no restriction —
+  // is deliberately NOT one here: no restriction is derivable, and
+  // the audit flags it instead of guessing.)
+  function isAugmentRecord(rec) {
+    return !!rec && rec.type === 'Warframe' &&
+      !!(rec.augmentsAbility || rec.restrictedTo);
+  }
+
+  // Tacusin's rule: eligibility follows the ABILITY, not the frame.
+  // A linked augment (augmentsAbility set) is eligible iff that
+  // ability is in the frame's EFFECTIVE ability set: the native
+  // list (frameAbilities), minus the ability the Helminth choice
+  // replaces (helminthChoice.replacesIndex), plus the choice's donor
+  // ability. This subsumes the native case and the subsume case
+  // (Quiver on Cyte-09 => Empowered Quiver eligible there; Ivara
+  // with Quiver replaced => not eligible on Ivara). An UNLINKED
+  // augment falls back to native-frame restriction only — a subsume
+  // never makes it eligible — with Prime variants normalised the
+  // same way the Helminth own-family check normalises them.
+  // Exported (Solver.augmentEligible) so the site shares one rule.
+  function augmentEligible(rec, frameName, helminthChoice, frameAbilities) {
+    if (!rec) return false;
+    var abilities = Array.isArray(frameAbilities) ? frameAbilities : [];
+    if (rec.augmentsAbility) {
+      if (!helminthChoice) return abilities.indexOf(rec.augmentsAbility) >= 0;
+      var eff = abilities.filter(function (_, i) {
+        return i !== helminthChoice.replacesIndex;
+      });
+      if (helminthChoice.donor) eff.push(helminthChoice.donor);
+      return eff.indexOf(rec.augmentsAbility) >= 0;
+    }
+    if (!rec.restrictedTo) return false;
+    return baseFrameName(rec.restrictedTo) === baseFrameName(frameName);
+  }
+
+  // v1.4 hybrid allowance: input.hybridAllowance (1 | 2, default 1);
+  // input.burstAllowance is accepted as an alias (the site state
+  // names it that). Anything that is not exactly 2 means 1.
+  function burstAllowanceOf(input) {
+    var a = (typeof input.hybridAllowance === 'number') ? input.hybridAllowance
+      : (typeof input.burstAllowance === 'number') ? input.burstAllowance : 1;
+    return a === 2 ? 2 : 1;
   }
 
   function buildContext(data) {
@@ -997,6 +1096,8 @@
       incompatible: raw.incompatible || [],
       set: raw.set || null,
       exilus: !!raw.exilus,
+      restrictedTo: raw.restrictedTo || null,       // v1.4
+      augmentsAbility: raw.augmentsAbility || null, // v1.4
       effects: effs
     };
   }
@@ -1248,7 +1349,8 @@
       tome: routesIn.tome !== false,
       conditional: !!routesIn.conditional,
       legacyHelmets: !!routesIn.legacyHelmets, // DEFAULT OFF (Tacusin, 2026-10-18)
-      helminth: !!routesIn.helminth           // DEFAULT OFF, same caution
+      helminth: !!routesIn.helminth,          // DEFAULT OFF, same caution
+      augments: !!routesIn.augments           // v1.4: DEFAULT OFF — gates augment locks only (see header)
     };
     if (kind !== 'warframe') {
       routes.arcanes = false; routes.shards = false; routes.aura = false;
@@ -1266,6 +1368,15 @@
     var intent = routes.conditional ? (input.intent || null) : null;
     var pruneBurst = intent === 'upkeep';
     function isBurst(name) { return isBurstPiece(ctx, name); }
+    // ---- v1.4 hybrid intent ----------------------------------------
+    // 'hybrid' = upkeep discipline with a burst allowance: burst
+    // candidates stay in the pools, but expand()/fillPhase() reject
+    // any state whose SOLVER-CHOSEN burst count exceeds the
+    // allowance. Locked burst pieces and a forced Helminth subsume
+    // do NOT consume the allowance (Q1, resolved in the checklist:
+    // locks override pruning outright, so they sit outside it).
+    var hybrid = intent === 'hybrid';
+    var burstAllowance = hybrid ? burstAllowanceOf(input) : 0;
     // v1.1: Maximize targets split off — the beam solves the hard
     // targets (atleast/closest) exactly as before; Maximize stats are
     // raised afterwards by the fill phase (see fillPhase below).
@@ -1321,6 +1432,39 @@
       if (rec.set) ctx.setOfMod[name] = rec.set;
       return rec;
     }
+    // ---- v1.4 augment lock context ----------------------------------
+    // Eligibility is computed from the frame's native abilities and
+    // the Helminth choice AS PASSED (the forced-choice block below
+    // validates it properly when the helminth route is on; with the
+    // route off the choice is inert — v1.2 contract — and confers
+    // no eligibility). Dropped augment locks collect notes here and
+    // are pushed into result.notes after the build (warn-never-
+    // block — the lock simply does not apply).
+    var frameAbilitiesEarly = (kind === 'warframe' && frame &&
+      Array.isArray(frame.Abilities)) ? frame.Abilities : [];
+    var eligChoice = (routes.helminth && input.helminthChoice)
+      ? { donor: input.helminthChoice.donor,
+          replacesIndex: input.helminthChoice.replacesIndex } : null;
+    var augmentLockNotes = [];
+    function augmentDropNote(rec, name) {
+      var why;
+      if (rec.augmentsAbility) {
+        if (eligChoice &&
+            frameAbilitiesEarly[eligChoice.replacesIndex] === rec.augmentsAbility) {
+          why = 'its ability (' + rec.augmentsAbility +
+            ') is the one the Helminth choice replaces';
+        } else {
+          why = input.frameName + ' does not currently have ' +
+            rec.augmentsAbility + ' (native or subsumed)';
+        }
+      } else {
+        why = 'it has no extracted ability link, so it is restricted ' +
+          'to its native frame (' + rec.restrictedTo + ')';
+      }
+      return 'Locked ' + name + ' is an ability augment that is not ' +
+        'eligible on ' + input.frameName + ': ' + why +
+        '. The lock was not applied.';
+    }
     (Array.isArray(input.lockedMods) ? input.lockedMods : []).forEach(function (L) {
       var name = L && L.name;
       if (!name) throw new Error('lockedMods entries need a name.');
@@ -1329,6 +1473,21 @@
       }
       if (lockedNameSet[name]) throw new Error('Duplicate locked mod: ' + name);
       var rec = resolveLockRecord(name);
+      // v1.4: ability augments — the Augments route gates them, and
+      // eligibility follows the ability (see augmentEligible). A
+      // dropped augment lock never reaches the seed lists below.
+      if (kind === 'warframe' && isAugmentRecord(rec)) {
+        if (!routes.augments) {
+          augmentLockNotes.push('Locked ' + name + ' is an ability ' +
+            'augment, but augments are off — the lock was not applied ' +
+            '(enable the Augments route to include locked augments).');
+          return;
+        }
+        if (!augmentEligible(rec, input.frameName, eligChoice, frameAbilitiesEarly)) {
+          augmentLockNotes.push(augmentDropNote(rec, name));
+          return;
+        }
+      }
       var wantType = kind === 'warframe' ? 'Warframe'
         : kind === 'necramech' ? 'Necramech' : null;
       if (wantType && rec.type && rec.type !== wantType) {
@@ -1339,6 +1498,14 @@
           !ctx._companionTypes[rec.type]) {
         throw new Error('Locked mod ' + name + ' is a ' + rec.type +
           ' mod and cannot be locked onto this companion.');
+      }
+      // v1.4: a restricted piece locked onto the wrong companion is
+      // the same class of error as a wrong-type lock (exact match).
+      if (kind === 'companion' && rec.restrictedTo &&
+          rec.restrictedTo !== input.frameName) {
+        throw new Error('Locked mod ' + name + ' is restricted to ' +
+          rec.restrictedTo + ' and cannot be locked onto ' +
+          input.frameName + '.');
       }
       lockedNameSet[name] = true;
       lockedModNames.push(name);
@@ -1403,7 +1570,8 @@
     // (the hard targets — drives the beam search, exactly the v1.0
     // behaviour) and FILL (the Maximize stats — drives the fill
     // phase; its rank sets add each mod's half-contribution rank).
-    function baseFrameName(n) { return String(n || '').replace(/ Prime$/, ''); }
+    // (baseFrameName is module-level since v1.4 — augmentEligible
+    // shares the same Prime normalisation.)
     var frameAbilities = (kind === 'warframe' && frame && Array.isArray(frame.Abilities))
       ? frame.Abilities : [];
     var abilityLocks = Array.isArray(input.abilityLocks) ? input.abilityLocks : [];
@@ -1468,6 +1636,7 @@
       if (routes.mods) {
         ctx.modPool.forEach(function (mod) {
           if (excludedModSet[mod.name]) return; // v1.2 ban
+          if (mod.restrictedTo && mod.restrictedTo !== input.frameName) return; // v1.4 restricted: its item only
           if (pruneBurst && isBurst(mod.name)) return; // v1.3 upkeep
           var touches = mod.effects.some(function (e) {
             return statSet.indexOf(e.stat) >= 0 && (!e.condition || routes.conditional);
@@ -1521,6 +1690,31 @@
     var FILL = maximizeList.length
       ? buildCandidates(maximizeList.map(function (m) { return m.stat; }), fillRanks, false)
       : null;
+
+    // v1.4 hybrid: the SOLVER-CHOSEN burst pieces in a state — every
+    // burst piece except the ones the player pinned (locked mods,
+    // locked arcanes, a forced Helminth subsume), which sit outside
+    // the allowance per Q1. Helmets/shards are unclassified (v1.3
+    // carried-forward) and never counted.
+    function solverBurstNames(st) {
+      var out = [];
+      Object.keys(st.mods).forEach(function (n) {
+        if (!lockedNameSet[n] && isBurst(n)) out.push(n);
+      });
+      if (st.exilusMod && !lockedNameSet[st.exilusMod.name] &&
+          isBurst(st.exilusMod.name)) out.push(st.exilusMod.name);
+      if (st.aura && isBurst(st.aura)) out.push(st.aura);
+      st.arcanes.forEach(function (n) {
+        if (lockedArcaneNames.indexOf(n) < 0 && isBurst(n)) out.push(n);
+      });
+      if (st.tome && isBurst(st.tome)) out.push(st.tome);
+      if (st.subsume && isBurst(st.subsume.ability) &&
+          !(forcedChoice && st.subsume.ability === forcedChoice.donor)) {
+        out.push(st.subsume.ability);
+      }
+      return out;
+    }
+    function solverBurstCount(st) { return solverBurstNames(st).length; }
 
     function evaluateWith(state, scoreFn) {
       var sums = contributions(ctx, state, routes, input.supportSetPieces);
@@ -1622,6 +1816,14 @@
             });
             out.push(ns);
           });
+        });
+      }
+      // v1.4 hybrid: the burst allowance caps SOLVER-CHOSEN burst
+      // pieces per build (locks ride in the start states and are
+      // excluded from the count — see solverBurstNames).
+      if (hybrid) {
+        return out.filter(function (ns) {
+          return solverBurstCount(ns) <= burstAllowance;
         });
       }
       return out;
@@ -1914,6 +2116,9 @@
         var moves = expand(cur.state, FILL).concat(fillExtraMoves(cur.state));
         var best = null;
         moves.forEach(function (ns) {
+          // v1.4 hybrid: fillExtraMoves bypass expand(), so the
+          // burst allowance is re-checked here for every move.
+          if (hybrid && solverBurstCount(ns) > burstAllowance) return;
           var ev = evaluateWith(ns, scoreState);
           if (!ev.fit.valid) return;
           if (!guardOk(ev, anchorEv)) return;
@@ -2287,10 +2492,20 @@
         replacedAbility: st.subsume.replacedAbility
       } : null);
 
+      // v1.4 hybrid: name the solver-chosen burst pieces (the
+      // window part of the build) and the allowance they used.
+      var hybridBurst = hybrid ? solverBurstNames(st) : null;
+      if (hybrid) {
+        rNotes.push('Hybrid: ' + hybridBurst.length + ' of ' +
+          burstAllowance + ' burst pieces used' +
+          (hybridBurst.length ? ' — ' + hybridBurst.join(', ') : '') + '.');
+      }
+
       return {
         achieved: achieved,
         breakdown: breakdown,
         sustained: sustainedFor(st),
+        hybridBurst: hybridBurst,
         crossGearPlan: cg.plan,
         arrangement: {
           mods: costedMods,
@@ -2325,6 +2540,9 @@
       result.notes.unshift('No arrangement within the Forma budget fits the mod capacity; showing the best-scoring arrangement, which exceeds capacity.');
     }
     trimNotes.forEach(function (n) { result.notes.push(n); });
+    // v1.4: augment locks that were dropped (route off / ineligible)
+    // are reported, never silent.
+    augmentLockNotes.forEach(function (n) { result.notes.push(n); });
     // v1.3: locked (or explicitly chosen) burst pieces kept in an
     // upkeep build are flagged — the lock/choice overrode pruning.
     if (pruneBurst) {
@@ -2388,7 +2606,8 @@
         setBonuses: ch.setBonuses, unmetTargets: ch.unmetTargets,
         totalRankCost: ch.totalRankCost,
         breakdown: ch.breakdown, crossGearPlan: ch.crossGearPlan,
-        sustained: ch.sustained
+        sustained: ch.sustained,
+        hybridBurst: ch.hybridBurst
       };
     }
     return result;
@@ -2527,6 +2746,8 @@
   var Solver = {
     solve: solve,
     evaluateFrame: evaluateFrame,
+    augmentEligible: augmentEligible, // v1.4: shared with the site
+    isAugmentRecord: isAugmentRecord,
     _internal: {
       UT_TO_STAT: UT_TO_STAT,
       SHARD_STAT_MAP: SHARD_STAT_MAP,
