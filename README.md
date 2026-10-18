@@ -4,28 +4,47 @@ An **inverse** build calculator for Warframe: instead of picking mods and seeing
 
 **Live site:** https://anoncollab.github.io/build-calculator/
 
-Static GitHub Pages site. Vanilla HTML/CSS/JS, no build step, no external assets. Your inputs (item, targets, routes, shard wallet, Forma budget) are saved in your browser's localStorage, and builds can be shared via a link that encodes the setup in the URL hash.
+Static GitHub Pages site. Vanilla HTML/CSS/JS, no build step, no external assets. Solves run in a Web Worker (with a main-thread fallback) so big searches never freeze the page. Your inputs (category, item, targets, routes, shard wallet, Forma budgets, part picks, ability locks, progenitor) are saved in your browser's localStorage, and builds can be shared via a link that encodes the whole setup in the URL hash. Layout is responsive — single-column stacking, scrollable tab bar, and ≥44px touch targets on phone screens (≤760px breakpoint).
 
-## What works in v0.1
+## Categories (all 12 solve)
 
-- **Warframe category solver** — all 126 Warframes, max-rank paper (arsenal) stats.
-- **Per-stat target modes:** *Don't care* (side effects land here), *Closest* (minimise distance either direction), *At least* (hard floor — unmet floors are reported honestly, with the best effort and what might unlock more).
-- **Routes the solver may use** (each toggleable): Mods (incl. partial ranks as a fine-tuning dial, Corrupted/Umbral/Archon/set mods), Arcanes, Archon Shards (normal + Tauforged, Ascent and Coalescent Fusion from your wallet), Aura, Exilus slot, Legacy Arcane Helmets (defaults **off**), Tome mods on a support Grimoire (cross-gear), and Conditional buffs (procced/stacking effects count only when on).
-- **Resources are real constraints:** shard wallet counts per colour, Forma budget per item (with a slot-by-slot polarity plan in the result), mod capacity fitting.
-- **Golden case, verified:** Follie with Ability Duration "at least 300" solves to **305% with zero Warframe mods** (Arcane Concentration + Arcane Ice Storm + Ris Invocation + 3× Tauforged Crimson shards).
-- Tabs: Item / Targets / Routes & Resources / Results / Acquisition (every build piece links to its wiki page).
+- **Warframe** — all 126 frames, max-rank paper (arsenal) stats.
+- **Primary / Secondary / Melee / Archgun / Archmelee** — per-type damage breakdown with elemental combining in mod slot order, crit chance/multiplier, status chance, fire rate, multishot, magazine, reload, punch through; multi-attack weapons (incl. Incarnon forms) have an attack selector; melee gets a stance slot, weapons get their Exilus slot.
+- **Companion** — survivability/bond mods; Link mods scale off owner stats you supply; modular MOAs and Hounds assemble from parts.
+- **Companion Weapon** — Beast claws (with Penjaga posture slot), Robotic weapons, Hound melee.
+- **Necramech** — Voidrig and Bonewidow with their own mod pool, 12 slots, capacity 80.
+- **Kitgun / Zaw** — pick the parts; the site assembles the base stats from the parts, then solves mods on the assembled weapon.
+- **Amp** — pick prism/scaffold/brace; amps take no mods, so the solve picks Operator/Amp arcanes only, per the game's build rules.
 
-## Known limitations (v0.1)
+## How solving works
 
-- Only the **Warframe** category solves; Primary/Secondary/Melee/etc. are later milestones.
-- **Set bonuses are not computed** — the wiki's derived set data is prose-only, so there are no numeric set bonuses to solve against yet.
-- The **arcane pool is limited to a small curated layer** (the wiki's arcane store is prose-only; numeric effects are added as a curated, sourced layer — three duration arcanes ship in v0.1).
-- Tome **Canticles** are excluded (their derived data doesn't mark whether the effect targets the player or enemies); stacking Invocations are included.
-- Acquisition shows wiki links for every build piece; drop-source strings will appear if a future dataset keys sources by mod name.
-- Paper stats only — no real-DPS simulation. Conditional effects are labelled and toggle-gated.
+- **Per-stat target modes:** *Don't care* (side effects land here), *Closest* (minimise distance either direction), *At least* (hard floor — unmet floors are reported honestly, with the best effort found and what might unlock more). When the closest solve and the cheapest solve differ, both are returned.
+- **Routes the solver may use** (each toggleable): Mods (incl. partial ranks as a fine-tuning dial, Corrupted/Umbral/Archon/set mods), Arcanes, Archon Shards, Aura/Stance, Exilus slot, Legacy Arcane Helmets (defaults **off** — they're rare legacy items), Tome mods on a support Grimoire (cross-gear), **Helminth subsume** (at most one; abilities you lock are never replaced; donor frames' own family is excluded; Invigorations are excluded as weekly/random), and Conditional buffs (procced/stacking effects count only when on).
+- **Archon Shard wallet:** per-colour normal/Tauforged counts you actually own, plus Ascent Fusion (3 same-colour → 1 Tauforged) and Coalescent Fusion (two colours → a fused shard) when you allow them. Results list exactly what is consumed and created.
+- **Forma budgets are real constraints:** a per-item Forma budget ("Any" = unconstrained), a separate **Umbra Forma** count (default 0, the only thing that can polarity-match Umbra mods), Orokin Catalyst capacity for weapons, over-rank to 40 for Lich-family weapons and Paracesis (+2 capacity ranks per Forma, max 5), and a slot-by-slot polarity plan in the result.
+- **Lich progenitor:** Kuva/Tenet/Coda weapons show a progenitor element + bonus % field (25–60%); the bonus is applied as an innate element, as in game.
+- **Costs are shown:** every chosen mod lists the Endo + Credits to rank it to its solved rank (wiki Fusion-page formula: base × (2^rank − 1)), with a build total.
+- **Set bonuses** are counted across the focus item plus any support-gear set pieces you declare, and reported per set with per-piece values and totals. Bonuses whose effect is a mechanic rather than a paper stat are reported, not stat-applied.
+- **Golden case, verified on the shipped data:** Follie with Ability Duration "at least 300" solves to **305% with zero Warframe mods** (Arcane Concentration + Arcane Ice Storm + Ris Invocation + 3× Tauforged Crimson shards).
 
-## Data
+Tabs: Item / Targets / Routes & Resources / Results / Acquisition. The Acquisition tab lists every build piece (including modular parts) with drop-source strings where the extracted data covers them, and a wiki link for every piece regardless.
 
-The site runs on a **data snapshot** (2026-10-18) extracted from the Warframe wiki — no live API calls. The local project pipeline (not in this repo) pulls the wiki's Lua data stores, derives numeric mod effects from the stores' description text with validator-checked pairing, extracts shard/Tome/aura/helmet tables from wiki pages, and trims everything into the `data/*.json` files served here. To refresh after a game update, the pipeline is re-run and the site files re-published; each release tag pins a site + data snapshot together.
+## Known limitations (honest list)
+
+- **Umbral / Sacrificial set enhancement % is absent from the source data** — the wiki's set descriptions say only "Enhance mods in this set" with no percentage published anywhere in the extracted stores, so the enhancement is documented in results but not numerically applied (the mods themselves solve at their printed values). Nothing was guessed.
+- **31 arcanes are documented but not modelled** — their descriptions carry effects with no constant a paper-stat solver can use (enemy-scaled, conversion-without-a-constant, heals, pure mechanics). Each is listed with its reason in the project's arcane report; arcanes whose text states a usable value are modelled (135 of 166: pattern-parsed, partial, or curated).
+- **Acquisition sources are partial** — the wiki's acquisition store keys drop records by whole item, not by individual mod, and contains no internal item names to join on (verified), so source strings cover a subset of pieces; every piece still gets its wiki link.
+- **Mechanic set bonuses are reported, not stat-applied** — e.g. Augur's energy-to-shields conversion or Gladiator's per-combo-multiplier crit are not paper stats, so the solver counts and reports the pieces without folding them into the stat targets.
+- Tome **Canticles** whose effect targets enemies are excluded from player-stat solving (their data doesn't mark the target); stacking Invocations are included.
+- Paper stats only — no real-DPS simulation, no enemy/armor scaling. Conditional effects are labelled and toggle-gated.
+
+## Data & refreshing
+
+The site runs on a **data snapshot** extracted from the Warframe wiki — no live API calls. The local project pipeline (not in this repo) pulls the wiki's Lua data stores (Warframes, Mods, Arcane, Ability, Modular, Weapons, Companions, and more), derives numeric mod effects from the stores' description text with validator-checked positional pairing, extracts shard/Tome/aura/helmet/Helminth/brace tables from wiki pages and stores, assembles the full arcane pool, and trims everything into the `data/*.json` files served here. The whole chain is re-runnable end-to-end as a refresh drill (pull → validate → transform → extract → build site data → test suites); after a game update, re-run it, re-publish, and cut a new release so each release tag pins a site + data snapshot together.
+
+## Version history
+
+- **v1.0.0** (2026-10-18) — the full site: all 12 categories, Helminth + ability locks, complete arcane pool, modular assembly (Kitguns/Zaws/Amps/MOAs/Hounds), Necramechs and companions, ranking costs, set-bonus reporting, Web Worker solving, mobile layout.
+- **v0.1.0** (2026-10-18) — first public version: Warframe category solver only.
 
 Game data from the [Warframe wiki](https://wiki.warframe.com), CC BY-NC-SA 3.0. Warframe is a registered trademark of Digital Extremes. This is an unofficial fan tool, not affiliated with Digital Extremes.
