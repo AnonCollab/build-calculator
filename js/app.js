@@ -328,7 +328,14 @@
   function itemNames(cat) {
     if (cat.kind === 'frame') return Object.keys(SITE.frames.warframes).sort();
     if (cat.kind === 'necramech') return Object.keys(SITE.frames.necramechs).sort();
-    if (cat.kind === 'companion') return Object.keys(SITE.frames.companions).sort();
+    if (cat.kind === 'companion') {
+      // Named companions with published stats only. The modular MOA/Hound
+      // store entries are NOT listed: the companion dropdown offers the
+      // "Moa"/"Hound" type options instead (see companionOptions).
+      return Object.keys(SITE.frames.companions).filter(function (n) {
+        return typeof SITE.frames.companions[n].Health === 'number';
+      }).sort();
+    }
     if (cat.kind === 'weapon') {
       return Object.keys(SITE.weapons).filter(function (n) {
         return cat.slots.indexOf(SITE.weapons[n].Slot) >= 0;
@@ -369,21 +376,64 @@
     return window.Modular.assembleAmp(modularData(), p.prism, p.scaffold, p.brace);
   }
 
+  // Modular companion types are selected via sentinels, not store names:
+  // the store's individual MOA/Hound model entries are not picker options.
+  var MOA_SENTINEL = '__MOA__';
+  var HOUND_SENTINEL = '__HOUND__';
   function companionStoreEntry() {
     var name = state.selections.Companion;
-    return name ? SITE.frames.companions[name] : null;
+    if (!name || name === MOA_SENTINEL || name === HOUND_SENTINEL) return null;
+    return SITE.frames.companions[name] || null;
   }
-  function companionIsModular() {
-    var e = companionStoreEntry();
-    return !!e && typeof e.Health !== 'number';
+  // 'MOA' | 'Hound' | null — the modular type of the current selection,
+  // whether it came from a type sentinel or a legacy saved store entry.
+  function companionType() {
+    var sel = state.selections.Companion;
+    if (sel === MOA_SENTINEL) return 'MOA';
+    if (sel === HOUND_SENTINEL) return 'Hound';
+    var e = sel && SITE.frames.companions[sel];
+    return e && typeof e.Health !== 'number' ? e.Type : null;
+  }
+  // [value, label] pairs for the companion dropdown: every named companion
+  // with published stats, then the two modular type options.
+  function companionOptions() {
+    var opts = itemNames(catOf('Companion')).map(function (n) { return [n, n]; });
+    opts.push([MOA_SENTINEL, 'Moa']);
+    opts.push([HOUND_SENTINEL, 'Hound']);
+    return opts;
+  }
+  // Older saves selected a modular companion by its store name (e.g.
+  // "Para Moa"); fold those into the matching type sentinel, keeping the
+  // chosen model in the part picker state.
+  function migrateCompanionSelection() {
+    var sel = state.selections.Companion;
+    var e = sel && SITE.frames.companions[sel];
+    if (!e || typeof e.Health === 'number') return;
+    var modelName = sel.replace(/ (Moa|MOA|Hound)$/, '');
+    if (e.Type === 'MOA') {
+      if (SITE.modular.modular.MOA.Model[modelName]) {
+        state.parts.moa.model = modelName;
+        if ($('sel-moa-model')) $('sel-moa-model').value = modelName;
+      }
+      state.selections.Companion = MOA_SENTINEL;
+    } else if (e.Type === 'Hound') {
+      if (SITE.modular.modular.Hound.Model[modelName]) {
+        state.parts.hound.model = modelName;
+        if ($('sel-hound-model')) $('sel-hound-model').value = modelName;
+      }
+      state.selections.Companion = HOUND_SENTINEL;
+    }
   }
   // {frameName, companionEntry|null} for the frame solver.
   function currentCompanion() {
-    var e = companionStoreEntry();
-    if (!e) return null;
-    if (!companionIsModular()) return { frameName: state.selections.Companion, companionEntry: null };
+    var type = companionType();
+    if (!type) {
+      var name = state.selections.Companion;
+      return name && SITE.frames.companions[name]
+        ? { frameName: name, companionEntry: null } : null;
+    }
     var md = modularData();
-    if (e.Type === 'MOA') {
+    if (type === 'MOA') {
       var m = window.Modular.assembleMOA(md, state.parts.moa.model, state.parts.moa.core,
         state.parts.moa.gyro, state.parts.moa.bracket);
       return { frameName: m.Name, companionEntry: m };
@@ -562,7 +612,9 @@
   function applyStateToUI() {
     $('sel-category').value = state.category;
     var cat = currentCat();
-    if (isFrameKind(cat.kind) || cat.kind === 'weapon') {
+    // Companions use their own dropdown; refreshPicker (run right after
+    // this in init) migrates + validates that selection.
+    if ((isFrameKind(cat.kind) || cat.kind === 'weapon') && cat.kind !== 'companion') {
       var names = itemNames(cat);
       var cur = state.selections[cat.id];
       if (!cur || names.indexOf(cur) < 0) {
@@ -634,7 +686,10 @@
     // when the controls were filled; the category select's new value is
     // applied at the end so a category switch doesn't mis-file them.
     var cat = currentCat();
-    if (isFrameKind(cat.kind) || cat.kind === 'weapon') {
+    if (cat.kind === 'companion') {
+      var cv = $('sel-companion').value;
+      if (cv) state.selections.Companion = cv;
+    } else if (isFrameKind(cat.kind) || cat.kind === 'weapon') {
       var v = $('inp-item').value;
       if (itemNames(cat).indexOf(v) >= 0) state.selections[cat.id] = v;
     }
@@ -818,7 +873,7 @@
         var c = currentCompanion();
         var store = companionStoreEntry();
         nameEl.textContent = c ? c.frameName : 'No companion selected';
-        if (!c || !store) return;
+        if (!c) return;
         if (c.companionEntry) {
           var ce = c.companionEntry;
           box.appendChild(statGrid([
@@ -868,30 +923,33 @@
   // ---- category-driven UI refresh ---------------------------------------------------
   function refreshPicker() {
     var cat = currentCat();
-    var namePick = isFrameKind(cat.kind) || cat.kind === 'weapon';
+    var namePick = (isFrameKind(cat.kind) || cat.kind === 'weapon') && cat.kind !== 'companion';
     $('item-picker-block').hidden = !namePick;
+    $('companion-picker-block').hidden = cat.kind !== 'companion';
+    // Part pickers are strictly contextual: each family shows only inside
+    // its own category (companion groups only for their modular type).
     $('parts-kitgun').hidden = cat.kind !== 'kitgun';
     $('parts-zaw').hidden = cat.kind !== 'zaw';
     $('parts-amp').hidden = cat.kind !== 'amp';
-    var compModular = cat.kind === 'companion' && companionIsModular();
-    $('parts-companion').hidden = !compModular;
-    if (compModular) {
-      var e = companionStoreEntry();
-      $('moa-parts').hidden = e.Type !== 'MOA';
-      $('hound-parts').hidden = e.Type !== 'Hound';
-      // The part model follows the selected companion by default.
-      var modelName = state.selections.Companion.replace(/ (Moa|MOA|Hound)$/, '');
-      if (e.Type === 'MOA' && SITE.modular.modular.MOA.Model[modelName] &&
-          state.parts.moa.model !== modelName) {
-        state.parts.moa.model = modelName;
-        $('sel-moa-model').value = modelName;
-      }
-      if (e.Type === 'Hound' && SITE.modular.modular.Hound.Model[modelName] &&
-          state.parts.hound.model !== modelName) {
-        state.parts.hound.model = modelName;
-        $('sel-hound-model').value = modelName;
-      }
+    if (cat.kind === 'companion') {
+      migrateCompanionSelection();
+      var sel = $('sel-companion');
+      var opts = companionOptions();
+      sel.innerHTML = '';
+      opts.forEach(function (pair) {
+        var o = document.createElement('option');
+        o.value = pair[0];
+        o.textContent = pair[1];
+        sel.appendChild(o);
+      });
+      var valid = opts.some(function (pair) { return pair[0] === state.selections.Companion; });
+      if (!valid) state.selections.Companion = defaultPick(cat);
+      sel.value = state.selections.Companion;
     }
+    var ctype = cat.kind === 'companion' ? companionType() : null;
+    $('parts-companion').hidden = !ctype;
+    $('moa-parts').hidden = ctype !== 'MOA';
+    $('hound-parts').hidden = ctype !== 'Hound';
     if (namePick) {
       $('item-picker-label').textContent = cat.id;
       var dl = $('item-list');
