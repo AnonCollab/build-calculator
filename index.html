@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Warframe Build Calculator</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<header>
+  <h1>Warframe Build Calculator</h1>
+  <p class="sub">Pick an item, set target stats, and calculate a build that lands as close as possible. Paper (arsenal) stats; conditional effects count only under their toggle.</p>
+</header>
+
+<nav class="tabs" id="tabbar">
+  <button type="button" data-tab="item" class="active">Item</button>
+  <button type="button" data-tab="targets">Targets</button>
+  <button type="button" data-tab="routes">Routes &amp; Resources</button>
+  <button type="button" data-tab="results">Results</button>
+  <button type="button" data-tab="acquisition">Acquisition</button>
+</nav>
+
+<div class="toolbar">
+  <button type="button" id="btn-calc" class="primary">Calculate</button>
+  <button type="button" id="btn-share">Copy share link</button>
+  <span id="calc-status" class="muted"></span>
+</div>
+
+<main>
+  <!-- ITEM -->
+  <section id="tab-item" class="tab active">
+    <div class="panel">
+      <h2>Item</h2>
+      <label class="field">
+        <span>Category</span>
+        <select id="sel-category">
+          <option value="Warframe" selected>Warframe</option>
+          <option value="Primary" disabled>Primary (later milestone)</option>
+          <option value="Secondary" disabled>Secondary (later milestone)</option>
+          <option value="Melee" disabled>Melee (later milestone)</option>
+          <option value="Archgun" disabled>Archgun (later milestone)</option>
+          <option value="Archmelee" disabled>Archmelee (later milestone)</option>
+          <option value="Companion" disabled>Companion (later milestone)</option>
+          <option value="Amp" disabled>Amp (later milestone)</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>Warframe</span>
+        <input id="inp-frame" list="frame-list" placeholder="Start typing a frame name…" autocomplete="off">
+        <datalist id="frame-list"></datalist>
+      </label>
+      <p class="muted" id="frame-hint">Only the Warframe category is functional in this milestone; the others are listed for planning.</p>
+    </div>
+    <div class="panel" id="frame-card">
+      <h2 id="frame-name">No frame selected</h2>
+      <div class="statgrid" id="frame-stats"></div>
+      <h3>Abilities</h3>
+      <ul id="frame-abilities" class="plain"></ul>
+    </div>
+  </section>
+
+  <!-- TARGETS -->
+  <section id="tab-targets" class="tab">
+    <div class="panel">
+      <h2>Target stats</h2>
+      <p class="muted">Ability stats are percentages where 100 is the unmodded base. Health / Shield / Armor / Energy are final pool numbers. Untouched stats default to Don't care.</p>
+      <table class="grid" id="targets-table">
+        <thead><tr><th>Stat</th><th>Mode</th><th>Target</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ROUTES & RESOURCES -->
+  <section id="tab-routes" class="tab">
+    <div class="panel">
+      <h2>Routes</h2>
+      <div class="checks" id="route-checks"></div>
+      <p class="muted">Conditional buffs (procced / stacking sources) count toward stats only when that toggle is on. Legacy Arcane Helmets default to off — they only apply when the selected frame has one.</p>
+    </div>
+    <div class="panel">
+      <h2>Archon Shard wallet</h2>
+      <table class="grid" id="wallet-table">
+        <thead><tr><th>Colour</th><th>Normal on hand</th><th>Tauforged on hand</th><th>Willing to Ascent-fuse (3 normal → 1 Tauforged)</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <label class="check">
+        <input type="checkbox" id="chk-coalescent">
+        <span>Willing to Coalescent-fuse (1 + 1 of two colours → 1 fused shard)</span>
+      </label>
+    </div>
+    <div class="panel">
+      <h2>Forma</h2>
+      <label class="field">
+        <span>Forma budget (focus item)</span>
+        <select id="sel-forma"></select>
+      </label>
+    </div>
+  </section>
+
+  <!-- RESULTS -->
+  <section id="tab-results" class="tab">
+    <div class="panel" id="results-empty">
+      <h2>Results</h2>
+      <p class="muted">No build calculated yet. Set an item and targets, then press Calculate.</p>
+    </div>
+    <div id="results-body" hidden>
+      <div class="panel">
+        <h2>Achieved vs target</h2>
+        <table class="grid" id="achieved-table">
+          <thead><tr><th>Stat</th><th>Target</th><th>Achieved</th><th>Status</th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <ul id="result-notes" class="notes"></ul>
+      </div>
+      <div class="panel">
+        <h2>Arrangement</h2>
+        <div id="arrangement"></div>
+        <p id="capacity-line"></p>
+        <div id="forma-line"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ACQUISITION -->
+  <section id="tab-acquisition" class="tab">
+    <div class="panel">
+      <h2>Acquisition</h2>
+      <p class="muted" id="acq-hint">Run Calculate to see acquisition for a build.</p>
+      <table class="grid" id="acq-table" hidden>
+        <thead><tr><th>Piece</th><th>Kind</th><th>Source</th><th>Wiki</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<footer class="muted">
+  <p>Fan-made tool. Data snapshots from the Warframe wiki (CC BY-NC-SA 3.0). Warframe is a trademark of Digital Extremes.</p>
+</footer>
+
+<script src="js/solver.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
