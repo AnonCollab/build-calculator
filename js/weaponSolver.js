@@ -128,6 +128,20 @@
  *  - evaluateWeapon(data, weaponName, attackIndex, orderedPieces,
  *    progenitor): forward evaluator for the board editor, sharing
  *    this file's forwardCalc + fitWeapon.
+ *
+ * v1.2 (engine stage F1, parity with solver.js):
+ *  - Excludes: input.excludedMods / input.excludedArcanes ban pieces
+ *    from every candidate pool (search AND fill); a piece that is
+ *    both locked and excluded is a hard Error.
+ *  - Cross-gear planning: with input.crossGear present, the finished
+ *    build gains result.crossGearPlan (specific mods on specific
+ *    support gear completing reachable set bonuses) and planned
+ *    pieces count in setBonuses totals immediately.
+ *    input.supportSetPieces remains accepted (legacy counts).
+ *  - Breakdowns: results and evaluateWeapon return `breakdown` —
+ *    for totalDamagePerShot and every dmg:<Type>, a Base entry then
+ *    one entry per occupied slot in slot order (arcane last), whose
+ *    final cumulative equals the reported achieved value (round2).
  */
 (function () {
   'use strict';
@@ -315,6 +329,13 @@
     // effects happens per entry in arcaneEffectsForEntry.
     ctx.arcanePool = (data.arcaneEffects && data.arcaneEffects.arcanes) || [];
 
+    // name -> {type, set} for every derived mod (v1.2 cross-gear
+    // planning reads member types, incl. mods the pool dropped).
+    ctx.derivedByName = {};
+    mods.forEach(function (m) {
+      ctx.derivedByName[m.name] = { type: m.type || null, set: m.set || null };
+    });
+
     ctx.setBonuses = {};
     var sbData = (data.setBonuses && data.setBonuses.sets) || {};
     Object.keys(sbData).forEach(function (name) {
@@ -322,7 +343,9 @@
       ctx.setBonuses[name] = {
         perPiece: Array.isArray(s.perPiece) ? s.perPiece : null,
         parseStatus: s.parseStatus || 'prose',
-        sourceText: s.sourceText || ''
+        sourceText: s.sourceText || '',
+        numUpgradesInSet: s.numUpgradesInSet || null,
+        members: Array.isArray(s.members) ? s.members.slice() : []
       };
     });
     return ctx;
@@ -432,7 +455,7 @@
       else if (weapon.Class === 'Glaive') types = ['Melee', 'Thrown Melee'];
       else types = ['Rifle', 'Assault Rifle', 'Primary'];
     }
-    if (!types) return { mods: [], stances: [], slotSupported: false };
+    if (!types) return { mods: [], stances: [], types: [], slotSupported: false };
     var mods = ctx.modPool.filter(function (m) {
       return types.indexOf(m.type) >= 0 || m.type === weapon.Name ||
              (weapon.Family && m.type === weapon.Family);
@@ -455,7 +478,7 @@
         return s.polarity === 'Penjaga';
       });
     }
-    return { mods: mods, stances: stances, slotSupported: true };
+    return { mods: mods, stances: stances, types: types, slotSupported: true };
   }
 
   // ---- forward model -------------------------------------------------------
@@ -816,6 +839,139 @@
     return out;
   }
 
+  // ---- v1.2 cross-gear planning (parity with solver.js) -------------
+  // Gear label for a support mod, from its pool Type (the loadout
+  // slot a player would put it on). Melee-class types land on the
+  // final fallback; anything unrecognised keeps the Melee label only
+  // when it is a stance/weapon class type — set members in practice
+  // carry the pool types mapped above.
+  function gearLabelForType(type) {
+    if (!type) return 'Support gear';
+    if (type === 'Warframe') return 'Warframe';
+    if (type === 'Aura') return 'Warframe (Aura slot)';
+    if (type === 'Necramech') return 'Necramech';
+    if (type === 'Archgun') return 'Archgun';
+    if (type === 'Archmelee') return 'Archmelee';
+    if (['Rifle', 'Shotgun', 'Sniper', 'Bow', 'Primary',
+         'Assault Rifle'].indexOf(type) >= 0) return 'Primary';
+    if (type === 'Pistol' || type === 'Tome') return 'Secondary';
+    if (['Companion', 'Beast', 'Claws', 'Robotic', 'Robotic Weapon',
+         'Sentinel', 'Kavat Claws', 'Kubrow Claws'].indexOf(type) >= 0 ||
+        /Kavat|Kubrow|Vulpaphyla|Predasite|Charger/.test(type) ||
+        type === 'MOA' || type === 'Hound') return 'Companion';
+    return 'Melee';
+  }
+  function crossGearModType(ctx, name) {
+    var d = ctx.derivedByName && ctx.derivedByName[name];
+    if (d && d.type) return d.type;
+    var p = ctx.modByName && ctx.modByName[name];
+    return (p && p.type) || null;
+  }
+  // Plan specific cross-gear mods for the FINISHED build (report
+  // layer — never feeds back into the search). Same contract as
+  // solver.js: candidate sets have >= 1 focus piece or an included
+  // piece; selection is includes first, then members (name asc),
+  // capped at the set's largest published size; excluded mods/sets,
+  // focus pieces and focus-pool types are never planned.
+  function crossGearPlan(ctx, o) {
+    var plan = [], plannedBySet = {}, notes = [];
+    if (!o.crossGear) return { plan: plan, plannedBySet: plannedBySet, notes: notes };
+    var excludeSetNames = {}, excludeModNames = {};
+    (Array.isArray(o.crossGear.exclude) ? o.crossGear.exclude : [])
+      .forEach(function (x) {
+        if (typeof x !== 'string') return;
+        if (ctx.setBonuses[x]) excludeSetNames[x] = 1;
+        excludeModNames[x] = 1;
+      });
+    var includeBySet = {};
+    (Array.isArray(o.crossGear.include) ? o.crossGear.include : [])
+      .forEach(function (inc) {
+        var name = inc && inc.mod;
+        if (!name || typeof name !== 'string') return;
+        var set = ctx.setOfMod[name];
+        if (!set) {
+          notes.push('Cross-gear include ' + name + ' skipped: it belongs to no set.');
+          return;
+        }
+        if (excludeSetNames[set] || excludeModNames[name] || o.excludedMods[name]) {
+          notes.push('Cross-gear include ' + name + ' skipped: it is excluded.');
+          return;
+        }
+        if (o.focusNames[name]) return;
+        var t = crossGearModType(ctx, name);
+        if (t && o.focusTypes[t]) return;
+        (includeBySet[set] = includeBySet[set] || []).push(name);
+      });
+    var candidateSets = {};
+    Object.keys(o.focusCounts).forEach(function (set) {
+      if (o.focusCounts[set] > 0) candidateSets[set] = 1;
+    });
+    Object.keys(includeBySet).forEach(function (set) { candidateSets[set] = 1; });
+    Object.keys(candidateSets).sort().forEach(function (set) {
+      if (excludeSetNames[set]) return;
+      var sb = ctx.setBonuses[set];
+      var members = (sb && sb.members) || [];
+      if (!members.length) return;
+      var cap = (sb && sb.numUpgradesInSet) || members.length;
+      var current = (o.focusCounts[set] || 0) +
+        ((o.legacySupport && o.legacySupport[set]) || 0);
+      if (current >= cap) return;
+      var chosen = [];
+      var ordered = (includeBySet[set] || []).slice().sort()
+        .concat(members.slice().sort());
+      ordered.forEach(function (name) {
+        if (current >= cap) return;
+        if (chosen.indexOf(name) >= 0 || o.focusNames[name]) return;
+        if (excludeModNames[name] || o.excludedMods[name]) return;
+        var t = crossGearModType(ctx, name);
+        if (t && o.focusTypes[t]) return;
+        chosen.push(name);
+        current++;
+      });
+      chosen.forEach(function (name) {
+        plan.push({ mod: name, gear: gearLabelForType(crossGearModType(ctx, name)), set: set });
+      });
+      if (chosen.length) plannedBySet[set] = chosen.length;
+    });
+    plan.sort(function (a, b) {
+      return a.set < b.set ? -1 : a.set > b.set ? 1
+        : (a.mod < b.mod ? -1 : a.mod > b.mod ? 1 : 0);
+    });
+    return { plan: plan, plannedBySet: plannedBySet, notes: notes };
+  }
+
+  // ---- v1.2 per-stat breakdown (weapons) ----------------------------
+  // For totalDamagePerShot and every dmg:<Type>: a Base entry (the
+  // unmodded attack, progenitor included — it is a property of the
+  // weapon copy, not a mod), then one entry per occupied slot in
+  // application order via prefix forwardCalc runs, then the arcane
+  // as the final entry when present. cumulative values are round2;
+  // the final entry equals the reported achieved value (the caller
+  // passes the build's own achieved map for the last step).
+  function weaponBreakdown(ctx, weapon, attackIndex, seq, fwdOpts, finalAchieved, arcaneName) {
+    var noArcaneOpts = Object.assign({}, fwdOpts, { arcaneEffects: null });
+    var statKeys = ['totalDamagePerShot'];
+    Object.keys(finalAchieved).forEach(function (k) {
+      if (k.indexOf('dmg:') === 0) statKeys.push(k);
+    });
+    var chains = {};
+    statKeys.forEach(function (s) { chains[s] = []; });
+    function pushAll(ach, source, kind) {
+      statKeys.forEach(function (s) {
+        chains[s].push({ source: source, kind: kind, cumulative: round2(ach[s] || 0) });
+      });
+    }
+    pushAll(achievedOf(forwardCalc(ctx, weapon, attackIndex, [], noArcaneOpts)), 'Base', 'base');
+    for (var k = 1; k <= seq.length; k++) {
+      var prefix = seq.slice(0, k).map(function (p) { return { rec: p.rec, rank: p.rank }; });
+      var entry = seq[k - 1];
+      pushAll(achievedOf(forwardCalc(ctx, weapon, attackIndex, prefix, noArcaneOpts)),
+        entry.rec.name, entry._exilus ? 'exilus' : 'mod');
+    }
+    if (arcaneName) pushAll(finalAchieved, arcaneName, 'arcane');
+    return chains;
+  }
+
   // Split input.targets into hard targets and Maximize entries
   // (same rule as solver.js: mode 'maximize', optional priority,
   // default = order given; Maximize is handled by the fill phase).
@@ -887,6 +1043,16 @@
       stance: routesIn.stance !== false,
       arcanes: routesIn.arcanes !== false
     };
+    // v1.2 excludes: ban pieces from every candidate pool (search
+    // AND fill). A piece that is both locked and excluded is a hard
+    // Error, raised in the lock loops below.
+    var excludedModSet = {}, excludedArcaneSet = {};
+    (Array.isArray(input.excludedMods) ? input.excludedMods : []).forEach(function (n) {
+      if (typeof n === 'string') excludedModSet[n] = 1;
+    });
+    (Array.isArray(input.excludedArcanes) ? input.excludedArcanes : []).forEach(function (n) {
+      if (typeof n === 'string') excludedArcaneSet[n] = 1;
+    });
     // v1.1: Maximize targets split off (fill phase raises them after
     // the hard targets solve); the beam sees only the hard targets.
     var split = splitTargets(input.targets);
@@ -1012,6 +1178,7 @@
       var out = [];
       if (!routes.mods) return out;
       pool.mods.forEach(function (rec) {
+        if (excludedModSet[rec.name]) return; // v1.2 ban
         var touches = rec.effects.some(function (eff) {
           if (eff.conditional && !routes.conditional) return false;
           return statList.some(function (stat) {
@@ -1062,6 +1229,7 @@
         // arcaneByName covers every type-matching entry (locked
         // arcanes and fill arcane swaps read their effects from it).
         if (!arcaneByName[entry.name]) arcaneByName[entry.name] = effs;
+        if (excludedArcaneSet[entry.name]) return; // v1.2 ban
         if (effs.some(function (eff) { return arcaneTouches(eff, statList); })) {
           names.push(entry.name);
         }
@@ -1084,6 +1252,9 @@
     (Array.isArray(input.lockedMods) ? input.lockedMods : []).forEach(function (L) {
       var name = L && L.name;
       if (!name) throw new Error('lockedMods entries need a name.');
+      if (excludedModSet[name]) {
+        throw new Error('Mod ' + name + ' is both locked and excluded.');
+      }
       if (lockedNameSet[name]) throw new Error('Duplicate locked mod: ' + name);
       var rec;
       if (poolNameSet[name]) {
@@ -1123,6 +1294,9 @@
     }
     var lockedArcaneName = null;
     (Array.isArray(input.lockedArcanes) ? input.lockedArcanes : []).forEach(function (name) {
+      if (excludedArcaneSet[name]) {
+        throw new Error('Arcane ' + name + ' is both locked and excluded.');
+      }
       if (lockedArcaneName) {
         throw new Error('At most 1 arcane can be locked (a weapon has 1 arcane slot).');
       }
@@ -1704,13 +1878,36 @@
         if (n > 0) { counts[set] = counts[set] || { focus: 0, support: 0 }; counts[set].support += n; }
       });
     }
+    // v1.2 cross-gear plan for THIS finished build. Planned pieces
+    // count in the set totals immediately (support gear treated as
+    // already built); supportPieces keeps the legacy counts only.
+    var focusNamesW = {}, focusCountsW = {};
+    st.placed.forEach(function (p) { focusNamesW[p.rec.name] = 1; });
+    if (st.exilusMod) focusNamesW[st.exilusMod.rec.name] = 1;
+    Object.keys(counts).forEach(function (set) { focusCountsW[set] = counts[set].focus; });
+    var focusTypesW = {};
+    (pool.types || []).forEach(function (t) { focusTypesW[t] = 1; });
+    if (weapon.Name) focusTypesW[weapon.Name] = 1;
+    if (weapon.Family) focusTypesW[weapon.Family] = 1;
+    var cgW = crossGearPlan(ctx, {
+      crossGear: input.crossGear || null,
+      focusCounts: focusCountsW, focusNames: focusNamesW,
+      legacySupport: input.supportSetPieces || null,
+      focusTypes: focusTypesW, excludedMods: excludedModSet
+    });
+    cgW.notes.forEach(function (n) { notes.push(n); });
+    var bonusSets = {};
+    Object.keys(counts).forEach(function (set) { bonusSets[set] = 1; });
+    Object.keys(cgW.plannedBySet).forEach(function (set) { bonusSets[set] = 1; });
     var setBonuses = [];
-    Object.keys(counts).forEach(function (set) {
+    Object.keys(bonusSets).forEach(function (set) {
       var sb = ctx.setBonuses[set];
-      var pieces = counts[set].focus + counts[set].support;
+      var cc = counts[set] || { focus: 0, support: 0 };
+      var planned = cgW.plannedBySet[set] || 0;
+      var pieces = cc.focus + cc.support + planned;
       setBonuses.push({
-        set: set, pieces: pieces, focusPieces: counts[set].focus,
-        supportPieces: counts[set].support,
+        set: set, pieces: pieces, focusPieces: cc.focus,
+        supportPieces: cc.support, plannedPieces: planned,
         parseStatus: sb ? sb.parseStatus : 'unknown',
         perPiece: sb ? sb.perPiece : null,
         totalValue: (sb && sb.perPiece && sb.perPiece.length === 1 &&
@@ -1814,8 +2011,26 @@
     }
     slots.forEach(function (s, i) { s.index = i; });
 
+    // v1.2 breakdown: prefix forwards down the slot order (placed
+    // mods in physical order, exilus last — evaluate()'s convention).
+    var bdSeq = st.placed.map(function (p) { return { rec: p.rec, rank: p.rank }; });
+    if (st.exilusMod) {
+      bdSeq.push({ rec: st.exilusMod.rec, rank: st.exilusMod.rank, _exilus: true });
+    }
+    var bdOpts = fwdOpts;
+    if (st.arcane) {
+      bdOpts = Object.assign({}, fwdOpts, {
+        arcaneEffects: arcaneByName[st.arcane] || []
+      });
+    }
+    var breakdown = weaponBreakdown(ctx, weapon, input.attackIndex, bdSeq,
+      bdOpts, evRes.achieved,
+      st.arcane || (fwdOpts.arcaneEffects ? 'Arcane effects' : null));
+
     return {
       achieved: achieved,
+      breakdown: breakdown,
+      crossGearPlan: cgW.plan,
       forward: evRes.fwd,
       arrangement: {
         mods: costedMods,
@@ -1872,7 +2087,8 @@
       result.cheapest = {
         achieved: ch.achieved, arrangement: ch.arrangement,
         setBonuses: ch.setBonuses, unmetTargets: ch.unmetTargets,
-        totalRankCost: ch.totalRankCost
+        totalRankCost: ch.totalRankCost,
+        breakdown: ch.breakdown, crossGearPlan: ch.crossGearPlan
       };
     }
     return result;
@@ -1978,8 +2194,20 @@
       var v = achievedRaw[k];
       achieved[k] = (typeof v === 'number') ? round2(v) : v;
     });
+    // v1.2 breakdown: prefix forwards down the board's own sequence
+    // (the same seq the forward run used; the exilus entry flagged).
+    var bdSeqEv = seq.map(function (p) {
+      return { rec: p.rec, rank: p.rank, _exilus: p === exilusEntry };
+    });
+    var breakdown = weaponBreakdown(ctx, weapon, attackIndex, bdSeqEv, {
+      conditional: !!orderedPieces.conditional,
+      progenitor: progenitor || null,
+      arcaneEffects: arcaneEffects
+    }, achievedRaw,
+      orderedPieces.arcane || (arcaneEffects ? 'Arcane effects' : null));
     return {
       achieved: achieved,
+      breakdown: breakdown,
       forward: fwd,
       capacityUsed: fit.capacityUsed,
       capacityMax: fit.capacityMax,
