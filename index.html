@@ -139,7 +139,7 @@
       <p class="muted">Ability stats are percentages where 100 is the unmodded base. Health / Shield / Armor / Energy are final pool numbers. Untouched stats default to Don't care.</p>
       <div class="tablewrap">
         <table class="grid" id="targets-frame-table">
-          <thead><tr><th>Stat</th><th>Mode</th><th>Target</th></tr></thead>
+          <thead><tr><th>Stat</th><th>Mode</th><th>Target</th><th>Priority</th></tr></thead>
           <tbody></tbody>
         </table>
       </div>
@@ -149,7 +149,17 @@
       <p class="muted">Paper stats of the selected attack. Crit chance and status chance are percentages; reload is seconds (lower is better, so “At least” reads as “at most”). Untouched stats default to Don't care.</p>
       <div class="tablewrap">
         <table class="grid" id="targets-weapon-table">
-          <thead><tr><th>Stat</th><th>Mode</th><th>Target</th></tr></thead>
+          <thead><tr><th>Stat</th><th>Mode</th><th>Target</th><th>Priority</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="panel" id="targets-damage-wrap" hidden>
+      <h2>Damage type targets</h2>
+      <p class="muted">Final per-shot amount of each damage type (per-pellet × multishot), after elemental combining in slot order. Combined types consume their components — targeting a big Viral number and a big Heat number at once can be genuinely contradictory, and the solver will say so. Untouched rows stay Don't care.</p>
+      <div class="tablewrap">
+        <table class="grid" id="targets-damage-table">
+          <thead><tr><th>Damage type</th><th>Mode</th><th>Target</th><th>Priority</th></tr></thead>
           <tbody></tbody>
         </table>
       </div>
@@ -198,6 +208,24 @@
       <label class="field"><span>Owner Shield</span><input type="number" id="inp-owner-shield" min="0" step="any"></label>
       <label class="field"><span>Owner Armor</span><input type="number" id="inp-owner-armor" min="0" step="any"></label>
     </div>
+    <div class="panel" id="locks-panel" hidden>
+      <h2>Locked pieces</h2>
+      <p class="muted">A locked mod must appear in the build — the solver chooses its slot and may only trim its rank to fit capacity (it will say so). Locks are how you force in mods the stat model doesn't score, like Primed Sure Footed. The search covers the full pool for this category, including stat-less mods.</p>
+      <label class="field">
+        <span>Lock a mod</span>
+        <input id="lock-mod-search" list="lock-mod-list" placeholder="Start typing a mod name…" autocomplete="off">
+        <datalist id="lock-mod-list"></datalist>
+      </label>
+      <button type="button" id="btn-lock-mod">Lock mod</button>
+      <ul class="plain" id="locked-mods-list"></ul>
+      <label class="field">
+        <span>Lock an arcane</span>
+        <input id="lock-arcane-search" list="lock-arcane-list" placeholder="Start typing an arcane name…" autocomplete="off">
+        <datalist id="lock-arcane-list"></datalist>
+      </label>
+      <button type="button" id="btn-lock-arcane">Lock arcane</button>
+      <ul class="plain" id="locked-arcanes-list"></ul>
+    </div>
     <div class="panel" id="sets-panel">
       <h2>Support set pieces (cross-gear)</h2>
       <p class="muted">Set mods already built on your OTHER gear count toward this item's set bonuses. Enter how many pieces of each set your support gear carries.</p>
@@ -243,6 +271,36 @@
       <p class="muted">No build calculated yet. Set an item and targets, then press Calculate.</p>
     </div>
     <div id="results-body" hidden>
+      <div class="panel" id="board-panel" hidden>
+        <h2>Build board</h2>
+        <p class="muted">The solved build in slot order. Click a slot to select it, click a second slot to swap them (or drag), step its rank, remove it, or swap in another mod — every edit re-evaluates live and is compared against the solved build. Edits warn, never block.</p>
+        <div id="board"></div>
+        <p id="board-capacity"></p>
+        <p id="board-seq" class="muted"></p>
+        <div id="board-actions" hidden>
+          <span id="board-sel-label"></span>
+          <button type="button" id="btn-rank-down">Rank −</button>
+          <button type="button" id="btn-rank-up">Rank +</button>
+          <button type="button" id="btn-cell-remove">Remove</button>
+          <button type="button" id="btn-cell-swap">Swap in…</button>
+          <button type="button" id="btn-cell-pin">📌 Pin as lock</button>
+        </div>
+        <div id="board-swap" hidden>
+          <label class="field">
+            <span>Swap in (this slot's legal pool)</span>
+            <input id="swap-search" list="swap-list" placeholder="Start typing a mod name…" autocomplete="off">
+            <datalist id="swap-list"></datalist>
+          </label>
+          <button type="button" id="btn-swap-apply">Swap in</button>
+          <button type="button" id="btn-swap-cancel">Cancel</button>
+        </div>
+        <div id="board-delta" hidden>
+          <h3>Changes vs the solved build</h3>
+          <div id="board-delta-body"></div>
+        </div>
+        <ul id="board-warnings" class="notes"></ul>
+        <button type="button" id="btn-board-reset">Reset to solved build</button>
+      </div>
       <div class="panel">
         <h2>Achieved vs target</h2>
         <div class="tablewrap">
