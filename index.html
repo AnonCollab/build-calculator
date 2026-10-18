@@ -181,6 +181,16 @@
     <div class="panel" id="routes-frame-panel">
       <h2>Routes</h2>
       <div class="checks" id="route-checks-frame"></div>
+      <div id="intent-block">
+        <label class="field">
+          <span>Build intent (applies when Conditional buffs is on)</span>
+          <select id="sel-intent">
+            <option value="window">Window — stack for one big moment</option>
+            <option value="upkeep">Upkeep — nothing falls off</option>
+          </select>
+        </label>
+        <p class="muted">Upkeep excludes event-triggered effects with windows ≤ 6s (locks override).</p>
+      </div>
       <p class="muted">Conditional buffs (procced / stacking sources) count toward stats only when that toggle is on. Legacy Arcane Helmets default to off — they only apply when the selected frame has one.</p>
       <div id="helminth-block" hidden>
         <h3>Helminth subsume choice</h3>
@@ -214,6 +224,16 @@
     <div class="panel" id="routes-weapon-panel" hidden>
       <h2>Routes</h2>
       <div class="checks" id="route-checks-weapon"></div>
+      <div id="intent-block-w">
+        <label class="field">
+          <span>Build intent (applies when Conditional buffs is on)</span>
+          <select id="sel-intent-w">
+            <option value="window">Window — stack for one big moment</option>
+            <option value="upkeep">Upkeep — nothing falls off</option>
+          </select>
+        </label>
+        <p class="muted">Upkeep excludes event-triggered effects with windows ≤ 6s (locks override).</p>
+      </div>
       <p class="muted">Weapon arcanes and conditional (procced / stacking) effects count only under their toggles. The stance slot is capacity-only.</p>
     </div>
     <div class="panel" id="routes-amp-panel" hidden>
@@ -344,13 +364,19 @@
       </div>
       <div class="panel">
         <h2>Achieved vs target</h2>
+        <p id="peak-line" hidden></p>
         <div class="tablewrap">
           <table class="grid" id="achieved-table">
             <thead><tr><th>Stat</th><th>Target</th><th>Achieved</th><th>Status</th><th></th></tr></thead>
             <tbody></tbody>
           </table>
         </div>
+        <p id="sustained-line" hidden></p>
         <ul id="result-notes" class="notes"></ul>
+      </div>
+      <div class="panel" id="guide-panel" hidden>
+        <h2>How to get the most out of this build</h2>
+        <div id="guide-body"></div>
       </div>
       <div class="panel">
         <h2>Arrangement</h2>
