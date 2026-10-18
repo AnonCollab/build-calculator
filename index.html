@@ -181,15 +181,24 @@
     <div class="panel" id="routes-frame-panel">
       <h2>Routes</h2>
       <div class="checks" id="route-checks-frame"></div>
+      <p class="muted" id="augments-caption">Augments are mechanic mods — the solver won't pick them for stats; turn on Ability augments to lock the ones your build uses. An augment appears in the pickers only for a frame that has its ability (natively, or subsumed in via Helminth).</p>
       <div id="intent-block">
         <label class="field">
           <span>Build intent (applies when Conditional buffs is on)</span>
           <select id="sel-intent">
             <option value="window">Window — stack for one big moment</option>
             <option value="upkeep">Upkeep — nothing falls off</option>
+            <option value="hybrid">Hybrid — upkeep, plus a small burst allowance</option>
           </select>
         </label>
-        <p class="muted">Upkeep excludes event-triggered effects with windows ≤ 6s (locks override).</p>
+        <label class="field">
+          <span>Burst allowance (Hybrid only)</span>
+          <select id="sel-allowance">
+            <option value="1">1 burst piece</option>
+            <option value="2">2 burst pieces</option>
+          </select>
+        </label>
+        <p class="muted">Upkeep excludes event-triggered effects with windows ≤ 6s (locks override). Hybrid keeps that discipline but lets the solver spend the allowance on the highest-value burst pieces (locked burst pieces never consume it).</p>
       </div>
       <p class="muted">Conditional buffs (procced / stacking sources) count toward stats only when that toggle is on. Legacy Arcane Helmets default to off — they only apply when the selected frame has one.</p>
       <div id="helminth-block" hidden>
@@ -230,9 +239,17 @@
           <select id="sel-intent-w">
             <option value="window">Window — stack for one big moment</option>
             <option value="upkeep">Upkeep — nothing falls off</option>
+            <option value="hybrid">Hybrid — upkeep, plus a small burst allowance</option>
           </select>
         </label>
-        <p class="muted">Upkeep excludes event-triggered effects with windows ≤ 6s (locks override).</p>
+        <label class="field">
+          <span>Burst allowance (Hybrid only)</span>
+          <select id="sel-allowance-w">
+            <option value="1">1 burst piece</option>
+            <option value="2">2 burst pieces</option>
+          </select>
+        </label>
+        <p class="muted">Upkeep excludes event-triggered effects with windows ≤ 6s (locks override). Hybrid keeps that discipline but lets the solver spend the allowance on the highest-value burst pieces (locked burst pieces never consume it).</p>
       </div>
       <p class="muted">Weapon arcanes and conditional (procced / stacking) effects count only under their toggles. The stance slot is capacity-only.</p>
     </div>
