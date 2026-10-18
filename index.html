@@ -183,6 +183,29 @@
       <div class="checks" id="route-checks-frame"></div>
       <p class="muted">Conditional buffs (procced / stacking sources) count toward stats only when that toggle is on. Legacy Arcane Helmets default to off — they only apply when the selected frame has one.</p>
       <div id="helminth-block" hidden>
+        <h3>Helminth subsume choice</h3>
+        <p class="muted">Let the solver pick the subsume, or pin the exact donor ability and the ability it replaces. A non-modelled donor (most of them) rides as a build instruction with its diminished text — it never moves paper stats.</p>
+        <div class="checks">
+          <label class="check">
+            <input type="radio" name="helm-mode" id="helm-mode-auto" checked>
+            <span>Solver chooses</span>
+          </label>
+          <label class="check">
+            <input type="radio" name="helm-mode" id="helm-mode-choose">
+            <span>I'll choose</span>
+          </label>
+        </div>
+        <div id="helminth-choose" hidden>
+          <label class="field">
+            <span>Donor ability (subsumable)</span>
+            <select id="sel-helm-donor"></select>
+          </label>
+          <label class="field">
+            <span>Replaces ability</span>
+            <select id="sel-helm-replace"></select>
+          </label>
+          <p class="muted" id="helm-note"></p>
+        </div>
         <h3>Helminth ability locks</h3>
         <p class="muted">A locked ability is never replaced by a subsume. Unlocked slots are fair game; the solver picks at most one subsume, at diminished Helminth values.</p>
         <div class="checks" id="lock-checks"></div>
@@ -209,31 +232,48 @@
       <label class="field"><span>Owner Armor</span><input type="number" id="inp-owner-armor" min="0" step="any"></label>
     </div>
     <div class="panel" id="locks-panel" hidden>
-      <h2>Locked pieces</h2>
-      <p class="muted">A locked mod must appear in the build — the solver chooses its slot and may only trim its rank to fit capacity (it will say so). Locks are how you force in mods the stat model doesn't score, like Primed Sure Footed. The search covers the full pool for this category, including stat-less mods.</p>
+      <h2>Included &amp; excluded pieces</h2>
+      <p class="muted">A locked (included) mod must appear in the build — the solver chooses its slot and may only trim its rank to fit capacity (it will say so). Locks are how you force in mods the stat model doesn't score, like Primed Sure Footed. An excluded (banned) mod or arcane is never used, by the search or the fill phase. The search covers the full pool for this category, including stat-less mods. A piece cannot be both locked and excluded.</p>
       <label class="field">
-        <span>Lock a mod</span>
+        <span>Include / exclude a mod</span>
         <input id="lock-mod-search" list="lock-mod-list" placeholder="Start typing a mod name…" autocomplete="off">
         <datalist id="lock-mod-list"></datalist>
       </label>
       <button type="button" id="btn-lock-mod">Lock mod</button>
+      <button type="button" id="btn-ban-mod">Exclude mod</button>
       <ul class="plain" id="locked-mods-list"></ul>
+      <ul class="plain" id="excluded-mods-list"></ul>
       <label class="field">
-        <span>Lock an arcane</span>
+        <span>Include / exclude an arcane</span>
         <input id="lock-arcane-search" list="lock-arcane-list" placeholder="Start typing an arcane name…" autocomplete="off">
         <datalist id="lock-arcane-list"></datalist>
       </label>
       <button type="button" id="btn-lock-arcane">Lock arcane</button>
+      <button type="button" id="btn-ban-arcane">Exclude arcane</button>
       <ul class="plain" id="locked-arcanes-list"></ul>
+      <ul class="plain" id="excluded-arcanes-list"></ul>
     </div>
     <div class="panel" id="sets-panel">
-      <h2>Support set pieces (cross-gear)</h2>
-      <p class="muted">Set mods already built on your OTHER gear count toward this item's set bonuses. Enter how many pieces of each set your support gear carries.</p>
-      <div class="tablewrap">
-        <table class="grid" id="sets-table">
-          <thead><tr><th>Set</th><th>Support pieces</th></tr></thead>
-          <tbody></tbody>
-        </table>
+      <h2>Cross-gear plan (set bonuses on support gear)</h2>
+      <label class="check">
+        <input type="checkbox" id="chk-crossgear">
+        <span>Plan cross-gear set pieces — the solver names specific mods on specific support gear to complete reachable set bonuses, and planned pieces count in the set totals immediately (support gear is treated as already built).</span>
+      </label>
+      <div id="crossgear-controls">
+        <label class="field">
+          <span>Force-include a cross-gear mod (gear shown from its type)</span>
+          <input id="cg-include-search" list="cg-include-list" placeholder="Start typing a mod name…" autocomplete="off">
+          <datalist id="cg-include-list"></datalist>
+        </label>
+        <button type="button" id="btn-cg-include">Include</button>
+        <ul class="plain" id="cg-includes"></ul>
+        <label class="field">
+          <span>Exclude a set or a mod from the plan</span>
+          <input id="cg-exclude-search" list="cg-exclude-list" placeholder="Start typing a set or mod name…" autocomplete="off">
+          <datalist id="cg-exclude-list"></datalist>
+        </label>
+        <button type="button" id="btn-cg-exclude">Exclude</button>
+        <ul class="plain" id="cg-excludes"></ul>
       </div>
     </div>
     <div class="panel" id="wallet-panel">
@@ -284,6 +324,7 @@
           <button type="button" id="btn-cell-remove">Remove</button>
           <button type="button" id="btn-cell-swap">Swap in…</button>
           <button type="button" id="btn-cell-pin">📌 Pin as lock</button>
+          <button type="button" id="btn-cell-ban">Ban this mod</button>
         </div>
         <div id="board-swap" hidden>
           <label class="field">
@@ -305,7 +346,7 @@
         <h2>Achieved vs target</h2>
         <div class="tablewrap">
           <table class="grid" id="achieved-table">
-            <thead><tr><th>Stat</th><th>Target</th><th>Achieved</th><th>Status</th></tr></thead>
+            <thead><tr><th>Stat</th><th>Target</th><th>Achieved</th><th>Status</th><th></th></tr></thead>
             <tbody></tbody>
           </table>
         </div>
@@ -318,6 +359,15 @@
         <p id="capacity-line"></p>
         <p id="cost-line"></p>
         <div id="forma-line"></div>
+      </div>
+      <div class="panel" id="helminth-card" hidden>
+        <h2>Helminth instruction</h2>
+        <div id="helminth-card-body"></div>
+      </div>
+      <div class="panel" id="crossgear-panel" hidden>
+        <h2>Cross-gear plan</h2>
+        <p class="muted">Specific mods to build on your support gear so this build's set bonuses complete. Planned pieces already count in the set totals above.</p>
+        <div id="crossgear-body"></div>
       </div>
       <div class="panel" id="cheapest-panel" hidden>
         <h2>Cheapest variant</h2>
