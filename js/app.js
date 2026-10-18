@@ -16,6 +16,15 @@
  * slot-ordered rendering of arrangement.slots whose every edit is
  * re-scored by the solvers' own forward evaluators
  * (Solver.evaluateFrame / WeaponSolver.evaluateWeapon).
+ *
+ * v1.2 (F2): Helminth forced choice (donor + replaced ability, with
+ * a Results instruction card for non-modelled donors), per-category
+ * mod/arcane EXCLUDES beside the locks (bans bind the solve; the
+ * board gains "Ban this mod"), prescriptive cross-gear planning
+ * (the support set-piece count inputs are gone — the solver plans
+ * named mods on named gear and counts them immediately), and
+ * per-stat breakdown chains on the achieved table, driven by the
+ * solvers'/evaluators' `breakdown` field.
  */
 (function () {
   'use strict';
@@ -184,7 +193,7 @@
     ROUTES_FRAME.forEach(function (r) { routesFrame[r.key] = r.def; });
     ROUTES_WEAPON.forEach(function (r) { routesWeapon[r.key] = r.def; });
     return {
-      version: 3,
+      version: 4,
       category: 'Warframe',
       selections: {
         Warframe: null, Necramech: null, Companion: null,
@@ -206,6 +215,18 @@
       // v1.1: per-category locks {catId: {mods: [{name, rank}],
       // arcanes: [name]}} and the current board (see serializeBoard).
       locks: {},
+      // v1.2: per-category excludes {catId: {mods: [name],
+      // arcanes: [name]}} — the ban half of piece control.
+      excludes: {},
+      // v1.2: Helminth forced choice (frame category): mode
+      // 'auto' (solver chooses) | 'choose' (player pins the donor).
+      helminthMode: 'auto',
+      helminthChoice: { donor: '', replacesIndex: 0 },
+      // v1.2: prescriptive cross-gear planning. on = the route
+      // toggle; include = [{mod}] forced into the plan; exclude =
+      // [setOrModName] kept out of it. (The v1.0–v1.1 support
+      // set-piece counts are gone; old saves drop them.)
+      crossGear: { on: true, include: [], exclude: [] },
       board: null,
       routesFrame: routesFrame,
       routesWeapon: routesWeapon,
@@ -215,7 +236,6 @@
       canFuseCoalescent: false,
       forma: 'any',
       umbraForma: 0,
-      supportSetPieces: {},
       ownerStats: { health: '', shield: '', armor: '' },
       progenitor: { element: 'Heat', percent: 60 }
     };
@@ -252,6 +272,37 @@
       if (entry.mods.length || entry.arcanes.length) base[catId] = entry;
     });
   }
+  // v1.2 saved excludes: {catId: {mods: [name], arcanes: [name]}} —
+  // same per-category shape discipline as the locks.
+  function mergeExcludes(base, saved) {
+    if (!saved || typeof saved !== 'object') return;
+    Object.keys(saved).forEach(function (catId) {
+      var X = saved[catId];
+      if (!X || typeof X !== 'object') return;
+      var entry = { mods: [], arcanes: [] };
+      (Array.isArray(X.mods) ? X.mods : []).forEach(function (n) {
+        if (typeof n === 'string' && entry.mods.indexOf(n) < 0) entry.mods.push(n);
+      });
+      (Array.isArray(X.arcanes) ? X.arcanes : []).forEach(function (n) {
+        if (typeof n === 'string' && entry.arcanes.indexOf(n) < 0) entry.arcanes.push(n);
+      });
+      if (entry.mods.length || entry.arcanes.length) base[catId] = entry;
+    });
+  }
+  // v1.2 saved cross-gear: {on, include: [{mod}], exclude: [name]}.
+  function mergeCrossGear(base, saved) {
+    if (!saved || typeof saved !== 'object') return;
+    if (typeof saved.on === 'boolean') base.on = saved.on;
+    (Array.isArray(saved.include) ? saved.include : []).forEach(function (e) {
+      var name = e && typeof e.mod === 'string' ? e.mod : null;
+      if (name && !base.include.some(function (x) { return x.mod === name; })) {
+        base.include.push({ mod: name });
+      }
+    });
+    (Array.isArray(saved.exclude) ? saved.exclude : []).forEach(function (n) {
+      if (typeof n === 'string' && base.exclude.indexOf(n) < 0) base.exclude.push(n);
+    });
+  }
   // v1.1 saved board: {kind, catId, itemKey, slots: [{kind, mod, rank}],
   // extras} — kept only when every slot is shape-valid.
   function mergeBoard(saved) {
@@ -286,7 +337,7 @@
   function mergeState(base, saved) {
     if (!saved || typeof saved !== 'object') return base;
     try {
-      if (saved.version === 2 || saved.version === 3) {
+      if (saved.version === 2 || saved.version === 3 || saved.version === 4) {
         if (catOf(saved.category).id === saved.category) base.category = saved.category;
         if (saved.selections) {
           Object.keys(base.selections).forEach(function (k) {
@@ -314,6 +365,20 @@
         mergeTargets(base.dmgTargets, saved.dmgTargets);
         mergeTargets(base.ampTargets, saved.ampTargets);
         mergeLocks(base.locks, saved.locks);
+        mergeExcludes(base.excludes, saved.excludes);
+        if (saved.helminthMode === 'choose' || saved.helminthMode === 'auto') {
+          base.helminthMode = saved.helminthMode;
+        }
+        if (saved.helminthChoice && typeof saved.helminthChoice === 'object') {
+          if (typeof saved.helminthChoice.donor === 'string') {
+            base.helminthChoice.donor = saved.helminthChoice.donor;
+          }
+          var hri = parseInt(saved.helminthChoice.replacesIndex, 10);
+          if (Number.isInteger(hri) && hri >= 0 && hri <= 3) {
+            base.helminthChoice.replacesIndex = hri;
+          }
+        }
+        mergeCrossGear(base.crossGear, saved.crossGear);
         base.board = mergeBoard(saved.board);
         mergeRoutes(base.routesFrame, saved.routesFrame);
         mergeRoutes(base.routesWeapon, saved.routesWeapon);
@@ -324,12 +389,9 @@
             if (Array.isArray(a)) base.abilityLocks[f] = a.map(function (x) { return !!x; });
           });
         }
-        if (saved.supportSetPieces && typeof saved.supportSetPieces === 'object') {
-          Object.keys(saved.supportSetPieces).forEach(function (s) {
-            var n = parseInt(saved.supportSetPieces[s], 10);
-            if (Number.isInteger(n) && n > 0) base.supportSetPieces[s] = n;
-          });
-        }
+        // v1.0–v1.1 support set-piece counts are deliberately NOT
+        // migrated: v1.2 replaces declared counts with the solver's
+        // cross-gear plan. Old counts are dropped here.
         if (saved.ownerStats) {
           ['health', 'shield', 'armor'].forEach(function (k) {
             if (saved.ownerStats[k] != null) base.ownerStats[k] = saved.ownerStats[k];
@@ -615,19 +677,6 @@
       o.value = String(i); o.textContent = String(i);
       fs.appendChild(o);
     }
-    // Support set piece rows
-    var sb = $('sets-table').querySelector('tbody');
-    Object.keys(SITE.setBonuses.sets).sort().forEach(function (setName) {
-      var tr = el('tr');
-      tr.appendChild(el('td', null, setName));
-      var td = el('td');
-      var inp = document.createElement('input');
-      inp.type = 'number'; inp.min = '0'; inp.step = '1'; inp.className = 'sets-count';
-      inp.id = 'setcount-' + setName;
-      td.appendChild(inp);
-      tr.appendChild(td);
-      sb.appendChild(tr);
-    });
     // Part selects
     var mod = SITE.modular.modular;
     var grips = {};
@@ -730,10 +779,6 @@
     $('chk-coalescent').checked = !!state.canFuseCoalescent;
     $('sel-forma').value = state.forma === 'any' ? 'any' : String(state.forma);
     $('inp-umbra').value = state.umbraForma;
-    Object.keys(SITE.setBonuses.sets).forEach(function (s) {
-      var inp = $('setcount-' + s);
-      if (inp) inp.value = state.supportSetPieces[s] || '';
-    });
     $('inp-owner-health').value = state.ownerStats.health;
     $('inp-owner-shield').value = state.ownerStats.shield;
     $('inp-owner-armor').value = state.ownerStats.armor;
@@ -814,13 +859,21 @@
     var fv = $('sel-forma').value;
     state.forma = fv === 'any' ? 'any' : parseInt(fv, 10);
     state.umbraForma = Math.max(0, parseInt($('inp-umbra').value, 10) || 0);
-    Object.keys(SITE.setBonuses.sets).forEach(function (s) {
-      var inp = $('setcount-' + s);
-      if (!inp) return;
-      var n = parseInt(inp.value, 10);
-      if (Number.isInteger(n) && n > 0) state.supportSetPieces[s] = n;
-      else delete state.supportSetPieces[s];
-    });
+    // v1.2 cross-gear toggle (the include/exclude lists are edited
+    // through their own buttons and saved at edit time).
+    var cgCb = $('chk-crossgear');
+    if (cgCb) state.crossGear.on = cgCb.checked;
+    // v1.2 Helminth forced choice controls (built for the frame
+    // category; values are read whenever the controls exist).
+    var hmChoose = $('helm-mode-choose');
+    if (hmChoose) state.helminthMode = hmChoose.checked ? 'choose' : 'auto';
+    var hDonor = $('sel-helm-donor');
+    if (hDonor && hDonor.options.length) state.helminthChoice.donor = hDonor.value || '';
+    var hRep = $('sel-helm-replace');
+    if (hRep && hRep.options.length) {
+      var hri2 = parseInt(hRep.value, 10);
+      if (Number.isInteger(hri2)) state.helminthChoice.replacesIndex = hri2;
+    }
     state.ownerStats.health = $('inp-owner-health').value;
     state.ownerStats.shield = $('inp-owner-shield').value;
     state.ownerStats.armor = $('inp-owner-armor').value;
@@ -1130,12 +1183,16 @@
   function refreshRoutes() {
     var cat = currentCat();
     refreshLocksUI();
+    renderCrossGearPanel();
     var framePanel = isFrameKind(cat.kind);
     $('routes-frame-panel').hidden = !framePanel;
     $('routes-weapon-panel').hidden = !isWeaponKind(cat.kind);
     $('routes-amp-panel').hidden = cat.kind !== 'amp';
     $('routes-companion-panel').hidden = cat.kind !== 'companion';
-    $('sets-panel').hidden = cat.kind !== 'frame';
+    // The cross-gear plan exists for Warframes and weapons (the two
+    // solvers' set accounting); Necramech/companion routes are the
+    // subset kinds, and Amps have no set plan at all.
+    $('sets-panel').hidden = !(cat.kind === 'frame' || isWeaponKind(cat.kind));
     $('wallet-panel').hidden = cat.kind !== 'frame';
     $('forma-panel').hidden = cat.kind === 'amp';
     if (framePanel) {
@@ -1146,7 +1203,10 @@
         wrap.style.display = show ? '' : 'none';
       });
       $('helminth-block').hidden = !(cat.kind === 'frame' && state.routesFrame.helminth);
-      if (cat.kind === 'frame' && state.routesFrame.helminth) buildLockChecks();
+      if (cat.kind === 'frame' && state.routesFrame.helminth) {
+        buildLockChecks();
+        buildHelminthChooser();
+      }
     }
   }
 
@@ -1297,6 +1357,14 @@
   function isLockedMod(name) {
     return locksFor(state.category).mods.some(function (L) { return L.name === name; });
   }
+  // v1.2 excludes (bans): the mirror image of the locks, per category.
+  function excludesFor(catId) {
+    if (!state.excludes[catId]) state.excludes[catId] = { mods: [], arcanes: [] };
+    return state.excludes[catId];
+  }
+  function isExcludedMod(catId, name) {
+    return excludesFor(catId).mods.indexOf(name) >= 0;
+  }
   function fillDatalist(dl, names) {
     if (!dl) return;
     dl.innerHTML = '';
@@ -1351,10 +1419,45 @@
       al.appendChild(li);
     });
     if (!lk.arcanes.length) al.appendChild(el('li', 'muted', 'No locked arcanes.'));
+    renderExcludeLists();
+  }
+  // The excluded (banned) half of piece control: name lists with a
+  // remove ✕ each. Kept beside the lock lists so the two halves of a
+  // piece's state are visible at a glance.
+  function renderExcludeLists() {
+    var ex = excludesFor(state.category);
+    var ml = $('excluded-mods-list');
+    if (!ml) return;
+    ml.innerHTML = '';
+    ex.mods.forEach(function (name, i) {
+      var li = el('li', 'lock-row excl-row');
+      li.appendChild(el('span', null, '🚫 ' + name + ' (excluded)'));
+      var rm = el('button', null, '✕'); rm.type = 'button';
+      rm.title = 'Remove exclusion';
+      rm.addEventListener('click', function () {
+        ex.mods.splice(i, 1); renderLockLists(); saveState(); refreshBoardUI();
+      });
+      li.appendChild(rm);
+      ml.appendChild(li);
+    });
+    var al = $('excluded-arcanes-list');
+    al.innerHTML = '';
+    ex.arcanes.forEach(function (name, i) {
+      var li = el('li', 'lock-row excl-row');
+      li.appendChild(el('span', null, '🚫 ' + name + ' (excluded)'));
+      var rm = el('button', null, '✕'); rm.type = 'button';
+      rm.title = 'Remove exclusion';
+      rm.addEventListener('click', function () {
+        ex.arcanes.splice(i, 1); renderLockLists(); saveState();
+      });
+      li.appendChild(rm);
+      al.appendChild(li);
+    });
   }
   function addLockFromSearch(kind) {
     var cat = currentCat();
     var lk = locksFor(cat.id);
+    var ex = excludesFor(cat.id);
     if (kind === 'mod') {
       var name = $('lock-mod-search').value.trim();
       if (pickerModNames(false).indexOf(name) < 0) {
@@ -1363,6 +1466,10 @@
       }
       if (lk.mods.some(function (L) { return L.name === name; })) {
         $('calc-status').textContent = name + ' is already locked.';
+        return;
+      }
+      if (ex.mods.indexOf(name) >= 0) {
+        $('calc-status').textContent = name + ' is excluded — remove the exclusion before locking it.';
         return;
       }
       var mp = modpoolRec(name);
@@ -1378,12 +1485,61 @@
         $('calc-status').textContent = an + ' is already locked.';
         return;
       }
+      if (ex.arcanes.indexOf(an) >= 0) {
+        $('calc-status').textContent = an + ' is excluded — remove the exclusion before locking it.';
+        return;
+      }
       lk.arcanes.push(an);
       $('lock-arcane-search').value = '';
     }
     $('calc-status').textContent = '';
     renderLockLists();
     saveState();
+  }
+  // The Exclude buttons beside the Lock buttons: same searches, the
+  // ban half of piece control. A locked piece cannot be banned (the
+  // engine treats lock∩ban as a hard error; the UI refuses first).
+  function addExcludeFromSearch(kind) {
+    var cat = currentCat();
+    var lk = locksFor(cat.id);
+    var ex = excludesFor(cat.id);
+    if (kind === 'mod') {
+      var name = $('lock-mod-search').value.trim();
+      if (pickerModNames(false).indexOf(name) < 0) {
+        $('calc-status').textContent = '"' + name + '" is not an excludable mod for this category.';
+        return;
+      }
+      if (lk.mods.some(function (L) { return L.name === name; })) {
+        $('calc-status').textContent = name + ' is locked — remove the lock before excluding it.';
+        return;
+      }
+      if (ex.mods.indexOf(name) >= 0) {
+        $('calc-status').textContent = name + ' is already excluded.';
+        return;
+      }
+      ex.mods.push(name);
+      $('lock-mod-search').value = '';
+    } else {
+      var an = $('lock-arcane-search').value.trim();
+      if (arcanePickerNames().indexOf(an) < 0) {
+        $('calc-status').textContent = '"' + an + '" is not an excludable arcane for this category.';
+        return;
+      }
+      if (lk.arcanes.indexOf(an) >= 0) {
+        $('calc-status').textContent = an + ' is locked — remove the lock before excluding it.';
+        return;
+      }
+      if (ex.arcanes.indexOf(an) >= 0) {
+        $('calc-status').textContent = an + ' is already excluded.';
+        return;
+      }
+      ex.arcanes.push(an);
+      $('lock-arcane-search').value = '';
+    }
+    $('calc-status').textContent = '';
+    renderLockLists();
+    saveState();
+    refreshBoardUI();
   }
   // Attach the category's locks (if any) to a solve input.
   function applyLocksToInput(input) {
@@ -1394,6 +1550,211 @@
       if (ex) input.extraModRecords = ex;
     }
     if (lk.arcanes.length) input.lockedArcanes = lk.arcanes.slice();
+  }
+  // Attach the category's excludes (if any) to a solve input.
+  function applyExcludesToInput(input) {
+    var ex = excludesFor(state.category);
+    if (ex.mods.length) input.excludedMods = ex.mods.slice();
+    if (ex.arcanes.length) input.excludedArcanes = ex.arcanes.slice();
+  }
+
+  // ---- Helminth forced choice (v1.2) ------------------------------------------
+  // Donor options for the current frame: every subsumable ability
+  // (deduped by name), labelled "<Ability> (<Donor Frame>)", minus
+  // the frame's own family — mirroring the engine's rule (a frame
+  // cannot subsume its own ability; Prime counts as the same family).
+  function helminthDonorOptions(frameName) {
+    var base = String(frameName || '').replace(/ Prime$/, '');
+    var seen = {}, out = [];
+    ((SITE.helminth && SITE.helminth.subsumes) || []).forEach(function (s) {
+      if (seen[s.ability]) return;
+      seen[s.ability] = 1;
+      if (String(s.frame).replace(/ Prime$/, '') === base) return;
+      out.push({ ability: s.ability, frame: s.frame, modelled: !!s.effects });
+    });
+    out.sort(function (a, b) { return a.ability < b.ability ? -1 : 1; });
+    return out;
+  }
+  function buildHelminthChooser() {
+    var donorSel = $('sel-helm-donor'), repSel = $('sel-helm-replace');
+    if (!donorSel || !repSel) return;
+    var frame = state.selections.Warframe;
+    $('helm-mode-auto').checked = state.helminthMode !== 'choose';
+    $('helm-mode-choose').checked = state.helminthMode === 'choose';
+    $('helminth-choose').hidden = state.helminthMode !== 'choose';
+    // Donor select
+    var opts = helminthDonorOptions(frame);
+    donorSel.innerHTML = '';
+    var ph = document.createElement('option');
+    ph.value = ''; ph.textContent = '— pick a donor ability —';
+    donorSel.appendChild(ph);
+    opts.forEach(function (o) {
+      var op = document.createElement('option');
+      op.value = o.ability;
+      op.textContent = o.ability + ' (' + o.frame + ')' + (o.modelled ? '' : ' — not stat-modelled');
+      donorSel.appendChild(op);
+    });
+    var donorOk = opts.some(function (o) { return o.ability === state.helminthChoice.donor; });
+    donorSel.value = donorOk ? state.helminthChoice.donor : '';
+    // Replace select: the frame's four abilities; locked ones are
+    // disabled (a locked ability can never be replaced).
+    var abilities = (SITE.frames.warframes[frame] || {}).abilities || [];
+    var locks = state.abilityLocks[frame] || [];
+    repSel.innerHTML = '';
+    abilities.forEach(function (a, i) {
+      var op = document.createElement('option');
+      op.value = String(i);
+      op.textContent = a + (locks[i] ? ' (locked)' : '');
+      op.disabled = !!locks[i];
+      repSel.appendChild(op);
+    });
+    var ri = state.helminthChoice.replacesIndex;
+    if (!(ri >= 0 && ri < abilities.length) || locks[ri]) {
+      ri = 0;
+      while (ri < abilities.length && locks[ri]) ri++;
+    }
+    repSel.value = abilities.length ? String(Math.min(ri, abilities.length - 1)) : '';
+    var note = '';
+    if (state.helminthMode === 'choose') {
+      var donor = opts.filter(function (o) { return o.ability === donorSel.value; })[0];
+      if (donor && !donor.modelled) {
+        note = donor.ability + ' is not stat-modelled: it will ride as a build instruction with its diminished text and will not change the solved stats.';
+      }
+      if (abilities.length && locks[state.helminthChoice.replacesIndex]) {
+        note = (note ? note + ' ' : '') + 'The ability you picked to replace is locked — unlock it or pick another.';
+      }
+    }
+    $('helm-note').textContent = note;
+  }
+  // The forced choice to pass on a solve, or undefined: only in
+  // "I'll choose" mode with the route on and a donor that is legal
+  // for the CURRENT frame (a stale own-family pick is dropped, not
+  // sent to the engine to throw on).
+  function currentHelminthChoice() {
+    if (state.helminthMode !== 'choose' || !state.routesFrame.helminth) return undefined;
+    var donor = state.helminthChoice.donor;
+    if (!donor) return undefined;
+    var legal = helminthDonorOptions(state.selections.Warframe)
+      .some(function (o) { return o.ability === donor; });
+    if (!legal) return undefined;
+    return { donor: donor, replacesIndex: state.helminthChoice.replacesIndex | 0 };
+  }
+
+  // ---- cross-gear planning UI (v1.2) -------------------------------------------
+  // Gear label for a support mod from its pool Type — mirrors the
+  // engine's gearLabelForType (solver.js / weaponSolver.js) so the
+  // include list shows the same gear the plan will name.
+  function gearLabelForType(type) {
+    if (!type) return 'Support gear';
+    if (type === 'Warframe') return 'Warframe';
+    if (type === 'Aura') return 'Warframe (Aura slot)';
+    if (type === 'Necramech') return 'Necramech';
+    if (type === 'Archgun') return 'Archgun';
+    if (type === 'Archmelee') return 'Archmelee';
+    if (['Rifle', 'Shotgun', 'Sniper', 'Bow', 'Primary',
+         'Assault Rifle'].indexOf(type) >= 0) return 'Primary';
+    if (type === 'Pistol' || type === 'Tome') return 'Secondary';
+    if (['Companion', 'Beast', 'Claws', 'Robotic', 'Robotic Weapon',
+         'Sentinel', 'Kavat Claws', 'Kubrow Claws'].indexOf(type) >= 0 ||
+        /Kavat|Kubrow|Vulpaphyla|Predasite|Charger/.test(type) ||
+        type === 'MOA' || type === 'Hound') return 'Companion';
+    return 'Melee';
+  }
+  // Mods that can be cross-gear for the current item: in the full
+  // pool but NOT in the focus category's own pool (those belong to
+  // the focus solve). Stance/posture furniture (negative drain) is
+  // never offered, same as the lock/swap pickers.
+  function crossGearCandidateNames() {
+    var types = pickerTypeSet();
+    var names = [];
+    ((SITE.modpool && SITE.modpool.mods) || []).forEach(function (m) {
+      if (types[m.type]) return;
+      if ((m.baseDrain || 0) < 0) return;
+      names.push(m.name);
+    });
+    return names.sort();
+  }
+  function renderCrossGearPanel() {
+    if (!$('chk-crossgear')) return;
+    var cg = state.crossGear;
+    $('chk-crossgear').checked = !!cg.on;
+    var names = crossGearCandidateNames();
+    fillDatalist($('cg-include-list'), names);
+    var exNames = Object.keys(SITE.setBonuses.sets).sort().concat(names);
+    fillDatalist($('cg-exclude-list'), exNames);
+    var ul = $('cg-includes');
+    ul.innerHTML = '';
+    cg.include.forEach(function (e, i) {
+      var mp = modpoolRec(e.mod);
+      var li = el('li', 'lock-row');
+      li.appendChild(el('span', null, '➕ ' + e.mod + ' → ' + gearLabelForType(mp ? mp.type : null)));
+      var rm = el('button', null, '✕'); rm.type = 'button';
+      rm.title = 'Remove include';
+      rm.addEventListener('click', function () {
+        cg.include.splice(i, 1); renderCrossGearPanel(); saveState();
+      });
+      li.appendChild(rm);
+      ul.appendChild(li);
+    });
+    if (!cg.include.length) ul.appendChild(el('li', 'muted', 'No forced cross-gear includes.'));
+    var xl = $('cg-excludes');
+    xl.innerHTML = '';
+    cg.exclude.forEach(function (name, i) {
+      var li = el('li', 'lock-row excl-row');
+      li.appendChild(el('span', null, '🚫 ' + name + ' (excluded from the plan)'));
+      var rm = el('button', null, '✕'); rm.type = 'button';
+      rm.title = 'Remove exclusion';
+      rm.addEventListener('click', function () {
+        cg.exclude.splice(i, 1); renderCrossGearPanel(); saveState();
+      });
+      li.appendChild(rm);
+      xl.appendChild(li);
+    });
+    if (!cg.exclude.length) xl.appendChild(el('li', 'muted', 'No cross-gear exclusions.'));
+  }
+  function addCrossGearInclude() {
+    var name = $('cg-include-search').value.trim();
+    if (crossGearCandidateNames().indexOf(name) < 0) {
+      $('calc-status').textContent = '"' + name + '" is not a cross-gear mod for this category (it must live on other gear).';
+      return;
+    }
+    if (state.crossGear.include.some(function (e) { return e.mod === name; })) {
+      $('calc-status').textContent = name + ' is already force-included.';
+      return;
+    }
+    state.crossGear.include.push({ mod: name });
+    $('cg-include-search').value = '';
+    $('calc-status').textContent = '';
+    renderCrossGearPanel();
+    saveState();
+  }
+  function addCrossGearExclude() {
+    var name = $('cg-exclude-search').value.trim();
+    var isSet = !!SITE.setBonuses.sets[name];
+    if (!isSet && crossGearCandidateNames().indexOf(name) < 0) {
+      $('calc-status').textContent = '"' + name + '" is neither a set name nor a cross-gear mod for this category.';
+      return;
+    }
+    if (state.crossGear.exclude.indexOf(name) >= 0) {
+      $('calc-status').textContent = name + ' is already excluded from the plan.';
+      return;
+    }
+    state.crossGear.exclude.push(name);
+    $('cg-exclude-search').value = '';
+    $('calc-status').textContent = '';
+    renderCrossGearPanel();
+    saveState();
+  }
+  // The crossGear input for a solve: presence IS the engine's route
+  // gate, so it is sent (possibly empty) exactly when the toggle is on.
+  function crossGearInput() {
+    if (!state.crossGear.on) return undefined;
+    var out = {};
+    if (state.crossGear.include.length) {
+      out.include = state.crossGear.include.map(function (e) { return { mod: e.mod }; });
+    }
+    if (state.crossGear.exclude.length) out.exclude = state.crossGear.exclude.slice();
+    return out;
   }
 
   // ---- solve plumbing ---------------------------------------------------------------
@@ -1497,14 +1858,6 @@
     });
     return wallet;
   }
-  function supportSetsInput() {
-    var out = {};
-    Object.keys(state.supportSetPieces).forEach(function (s) {
-      if (state.supportSetPieces[s] > 0) out[s] = state.supportSetPieces[s];
-    });
-    return Object.keys(out).length ? out : undefined;
-  }
-
   function buildSolveRequest() {
     var cat = currentCat();
     if (cat.kind === 'frame') {
@@ -1520,10 +1873,14 @@
         shardWallet: shardWalletInput(),
         formaBudget: state.forma,
         umbraForma: state.umbraForma,
-        supportSetPieces: supportSetsInput(),
         reactor: true
       };
+      var hc = currentHelminthChoice();
+      if (hc) finput.helminthChoice = hc;
+      var fcg = crossGearInput();
+      if (fcg) finput.crossGear = fcg;
       applyLocksToInput(finput);
+      applyExcludesToInput(finput);
       return { kind: 'frame', input: finput, bundle: BUNDLE };
     }
     if (cat.kind === 'necramech') {
@@ -1538,6 +1895,7 @@
         umbraForma: state.umbraForma
       };
       applyLocksToInput(minput);
+      applyExcludesToInput(minput);
       return { kind: 'frame', input: minput, bundle: BUNDLE };
     }
     if (cat.kind === 'companion') {
@@ -1560,6 +1918,7 @@
       if (comp.companionEntry) cinput.companionEntry = comp.companionEntry;
       if (owner) cinput.ownerStats = owner;
       applyLocksToInput(cinput);
+      applyExcludesToInput(cinput);
       return { kind: 'frame', input: cinput, bundle: BUNDLE };
     }
     if (isWeaponKind(cat.kind)) {
@@ -1580,7 +1939,10 @@
         var pct = Math.min(60, Math.max(25, state.progenitor.percent || 60));
         winput.progenitor = { element: state.progenitor.element, percent: pct };
       }
+      var wcg = crossGearInput();
+      if (wcg) winput.crossGear = wcg;
       applyLocksToInput(winput);
+      applyExcludesToInput(winput);
       return { kind: 'weapon', input: winput, bundle: evalBundle() };
     }
     if (cat.kind === 'amp') {
@@ -1642,8 +2004,11 @@
   }
   function setBonusLines(setBonuses) {
     return (setBonuses || []).map(function (sb) {
+      var parts = [sb.focusPieces + ' on this item'];
+      if (sb.supportPieces) parts.push(sb.supportPieces + ' support');
+      if (sb.plannedPieces) parts.push(sb.plannedPieces + ' planned cross-gear');
       var line = sb.set + ' — ' + sb.pieces + ' piece' + (sb.pieces === 1 ? '' : 's') +
-        ' (' + sb.focusPieces + ' on this item + ' + sb.supportPieces + ' support)';
+        ' (' + parts.join(' + ') + ')';
       if (sb.perPiece && sb.perPiece.length === 1 && typeof sb.perPiece[0].value === 'number') {
         line += ': ' + fmt(sb.perPiece[0].value) + (sb.perPiece[0].unit === 'percent' ? '%' : '') +
           ' per piece' + (sb.totalValue != null ? ' → ' + fmt(sb.totalValue) + ' total' : '');
@@ -1653,7 +2018,11 @@
       return line;
     });
   }
-  function achievedTable(stats, store, achieved, unmetTargets, fracStats) {
+  // v1.2: which stats' breakdown chains are currently expanded.
+  // Kept across re-renders so a board edit refreshes the open chain
+  // in place instead of collapsing it.
+  var expandedBd = {};
+  function achievedTable(stats, store, achieved, unmetTargets, fracStats, breakdown) {
     var tb = $('achieved-table').querySelector('tbody');
     tb.innerHTML = '';
     var unmet = {};
@@ -1686,7 +2055,42 @@
         cls = d < 1e-9 ? 'status-met' : '';
       }
       tr.appendChild(el('td', cls, status));
+      // v1.2 breakdown toggle (last column): only when the current
+      // evaluation carries a contributor chain for this stat.
+      var chain = breakdown ? breakdown[s.key] : null;
+      var tdT = el('td');
+      var bdRow = null, bdBtn = null;
+      if (chain && chain.length) {
+        bdBtn = el('button', 'bd-toggle', expandedBd[s.key] ? '▾' : '▸');
+        bdBtn.type = 'button';
+        bdBtn.title = 'What is influencing ' + s.label;
+        bdBtn.setAttribute('aria-expanded', expandedBd[s.key] ? 'true' : 'false');
+        tdT.appendChild(bdBtn);
+      }
+      tr.appendChild(tdT);
       tb.appendChild(tr);
+      if (chain && chain.length) {
+        bdRow = el('tr', 'bd-row');
+        bdRow.hidden = !expandedBd[s.key];
+        var tdB = el('td');
+        tdB.colSpan = 5;
+        chain.forEach(function (entry) {
+          var line = el('div', 'bd-line');
+          line.appendChild(el('span', 'bd-kind', entry.kind || ''));
+          line.appendChild(el('span', null, entry.source + ' — ' + fmt(entry.cumulative)));
+          tdB.appendChild(line);
+        });
+        bdRow.appendChild(tdB);
+        tb.appendChild(bdRow);
+        (function (btn, row, key) {
+          btn.addEventListener('click', function () {
+            expandedBd[key] = !expandedBd[key];
+            row.hidden = !expandedBd[key];
+            btn.textContent = expandedBd[key] ? '▾' : '▸';
+            btn.setAttribute('aria-expanded', expandedBd[key] ? 'true' : 'false');
+          });
+        })(bdBtn, bdRow, s.key);
+      }
     });
   }
   // ---- build board + editor (v1.1) --------------------------------------------
@@ -1976,6 +2380,9 @@
     $('btn-cell-remove').disabled = !s.mod;
     $('btn-cell-pin').disabled = !s.mod;
     $('btn-cell-pin').textContent = s.mod && isLockedName(s.mod) ? '📌 Unpin lock' : '📌 Pin as lock';
+    $('btn-cell-ban').disabled = !s.mod || s.kind === 'aura';
+    $('btn-cell-ban').textContent = s.mod && isExcludedMod(boardCatId || state.category, s.mod)
+      ? 'Banned' : 'Ban this mod';
   }
 
   function afterBoardEdit() {
@@ -2164,7 +2571,7 @@
     if (ev) {
       var sd = boardStatDefs();
       achievedTable(sd.defs, sd.store, ev.achieved,
-        computeUnmet(sd.defs, sd.store, ev.achieved), false);
+        computeUnmet(sd.defs, sd.store, ev.achieved), false, ev.breakdown);
       renderDelta(ev);
     }
   }
@@ -2199,7 +2606,11 @@
     if (s.kind === 'aura') {
       swapPoolNames = (SITE.auras.mods || []).map(function (m) { return m.name; }).sort();
     } else {
-      swapPoolNames = pickerModNames(s.kind === 'exilus');
+      // v1.2: banned mods are never offered for swap-in.
+      var banned = excludesFor(boardCatId || state.category).mods;
+      swapPoolNames = pickerModNames(s.kind === 'exilus').filter(function (n) {
+        return banned.indexOf(n) < 0;
+      });
     }
     fillDatalist($('swap-list'), swapPoolNames);
     $('swap-search').value = '';
@@ -2231,6 +2642,30 @@
     renderLockLists();
     saveState();
     refreshBoardUI();
+  }
+  // v1.2 "Ban this mod": add the selected cell's mod to the
+  // category's excludes and take it off the board (re-evaluating
+  // through the normal edit path). A locked mod must be unpinned
+  // first — lock∩ban is a hard error in the engine.
+  function boardBanSelected() {
+    var s = selectedSlot();
+    if (!s || !s.mod || s.kind === 'aura' || s.kind === 'stance') return;
+    var name = s.mod;
+    var catId = boardCatId || state.category;
+    if (isLockedName(name)) {
+      $('calc-status').textContent = name + ' is pinned as a lock — unpin it before banning.';
+      return;
+    }
+    var ex = excludesFor(catId);
+    if (ex.mods.indexOf(name) < 0) ex.mods.push(name);
+    $('calc-status').textContent = '';
+    s.mod = null;
+    s.rank = null;
+    s.origin = 'target';
+    $('board-swap').hidden = true;
+    renderLockLists();
+    saveState();
+    afterBoardEdit();
   }
   function boardReset() {
     if (!boardSolved) return;
@@ -2309,6 +2744,8 @@
     $('cost-line').textContent = '';
     $('forma-line').innerHTML = '';
     $('cheapest-panel').hidden = true;
+    $('helminth-card').hidden = true;
+    $('crossgear-panel').hidden = true;
     lastKind = b.kind;
     lastPieces = collectBoardPieces();
     refreshBoardUI();
@@ -2372,10 +2809,11 @@
     if (arr.tome) groupInto(box, 'Tome mod (cross-gear, support item treated as already built)', [arr.tome]);
     if (arr.subsume) {
       groupInto(box, 'Helminth subsume', [
-        arr.subsume.ability + ' (from ' + arr.subsume.fromFrame + ') replaces ' + arr.subsume.replacedAbility
+        arr.subsume.ability + ' (from ' + arr.subsume.fromFrame + ') replaces ' +
+          (arr.subsumeReplaces || arr.subsume.replacedAbility)
       ]);
     }
-    groupInto(box, 'Set bonuses (focus + support pieces)', setBonusLines(res.setBonuses));
+    groupInto(box, 'Set bonuses (focus + support + planned cross-gear)', setBonusLines(res.setBonuses));
     if (collect) {
       normal.forEach(function (m) { collect.push({ name: m.name, kind: 'Mod' }); });
       exilus.forEach(function (m) { collect.push({ name: m.name, kind: 'Exilus mod' }); });
@@ -2398,7 +2836,7 @@
     groupInto(box, 'Exilus', exilus.map(modLine));
     if (arr.stance) groupInto(box, 'Stance / posture', [arr.stance]);
     if (arr.arcane) groupInto(box, 'Arcane', [arr.arcane]);
-    groupInto(box, 'Set bonuses (focus + support pieces)', setBonusLines(res.setBonuses));
+    groupInto(box, 'Set bonuses (focus + support + planned cross-gear)', setBonusLines(res.setBonuses));
     if (collect) {
       normal.forEach(function (m) { collect.push({ name: m.name, kind: 'Mod' }); });
       exilus.forEach(function (m) { collect.push({ name: m.name, kind: 'Exilus mod' }); });
@@ -2415,6 +2853,52 @@
     }).join('; ');
   }
 
+  // v1.2: a forced NON-modelled Helminth donor rides as a build
+  // instruction card — it never moved the solved stats, and the card
+  // says so next to its diminished text.
+  function renderHelminthCard(kind, res) {
+    var card = $('helminth-card');
+    var si = kind === 'frame' && res.arrangement ? res.arrangement.subsumeInstruction : null;
+    if (!si) { card.hidden = true; return; }
+    card.hidden = false;
+    var body = $('helminth-card-body');
+    body.innerHTML = '';
+    body.appendChild(el('p', null,
+      'Helminth: ' + si.donor + ' (' + si.donorFrame + ') replaces ' + si.replacesAbility +
+      ' — not stat-modelled'));
+    body.appendChild(el('p', 'muted', si.diminishedText || ''));
+    body.appendChild(el('p', 'muted',
+      'This subsume is in the build because you chose it; the paper stats above do not include it.'));
+  }
+  // v1.2: the prescriptive cross-gear plan — named mods on named
+  // support gear, with the per-set totals the plan produces (planned
+  // pieces already count in the set bonus lines above).
+  function renderCrossGearResults(kind, res) {
+    var panel = $('crossgear-panel');
+    var cgOn = !!lastInput && !!lastInput.crossGear;
+    if ((kind !== 'frame' && kind !== 'weapon') || !cgOn) { panel.hidden = true; return; }
+    panel.hidden = false;
+    var body = $('crossgear-body');
+    body.innerHTML = '';
+    var plan = res.crossGearPlan || [];
+    if (!plan.length) {
+      body.appendChild(el('p', 'muted', 'No reachable set completion from this build.'));
+      return;
+    }
+    var ul = el('ul', 'plain');
+    plan.forEach(function (p) {
+      ul.appendChild(el('li', null, p.mod + ' → ' + p.gear + ' (' + p.set + ')'));
+    });
+    body.appendChild(ul);
+    (res.setBonuses || []).forEach(function (sb) {
+      if (!sb.plannedPieces) return;
+      body.appendChild(el('p', 'muted',
+        sb.set + ': ' + sb.pieces + ' pieces total (' + sb.focusPieces +
+        ' on this item + ' + sb.plannedPieces + ' planned cross-gear' +
+        (sb.supportPieces ? ' + ' + sb.supportPieces + ' legacy support' : '') + ').'));
+    });
+  }
+
   function renderResults(kind, res) {
     lastResult = res;
     lastKind = kind;
@@ -2425,13 +2909,15 @@
     var arr = res.arrangement || {};
     if (kind === 'amp') $('board-panel').hidden = true;
     renderNotes(res);
+    renderHelminthCard(kind, res);
+    renderCrossGearResults(kind, res);
     var box = $('arrangement');
     box.innerHTML = '';
     var dmg = $('damage-line');
     dmg.innerHTML = '';
     if (kind === 'frame') {
       var stats = cat.kind === 'companion' ? COMPANION_STATS : FRAME_STATS;
-      achievedTable(stats, state.frameTargets, res.achieved, res.unmetTargets, false);
+      achievedTable(stats, state.frameTargets, res.achieved, res.unmetTargets, false, res.breakdown);
       renderFrameArrangement(box, res, false, lastPieces);
       $('capacity-line').textContent =
         'Mod capacity: ' + arr.capacityUsed + ' / ' + arr.capacityMax +
@@ -2445,7 +2931,7 @@
       var fp = formaPlanText(arr, false);
       if (fp) $('forma-line').appendChild(el('p', null, fp));
     } else if (kind === 'weapon') {
-      achievedTable(WEAPON_STATS.concat(DMG_STATS), weaponTargetStore(), res.achieved, res.unmetTargets, false);
+      achievedTable(WEAPON_STATS.concat(DMG_STATS), weaponTargetStore(), res.achieved, res.unmetTargets, false, res.breakdown);
       // Modular parts are build pieces too.
       if (cat.kind === 'kitgun') {
         lastPieces.push({ name: state.parts.kitgun.chamber, kind: 'Part (Chamber)' });
@@ -2641,6 +3127,10 @@
       $('btn-calc').addEventListener('click', calculate);
       $('btn-lock-mod').addEventListener('click', function () { addLockFromSearch('mod'); });
       $('btn-lock-arcane').addEventListener('click', function () { addLockFromSearch('arcane'); });
+      $('btn-ban-mod').addEventListener('click', function () { addExcludeFromSearch('mod'); });
+      $('btn-ban-arcane').addEventListener('click', function () { addExcludeFromSearch('arcane'); });
+      $('btn-cg-include').addEventListener('click', addCrossGearInclude);
+      $('btn-cg-exclude').addEventListener('click', addCrossGearExclude);
       $('btn-rank-down').addEventListener('click', function () { boardRankStep(-1); });
       $('btn-rank-up').addEventListener('click', function () { boardRankStep(1); });
       $('btn-cell-remove').addEventListener('click', boardRemoveSelected);
@@ -2648,6 +3138,7 @@
       $('btn-swap-apply').addEventListener('click', boardApplySwap);
       $('btn-swap-cancel').addEventListener('click', function () { $('board-swap').hidden = true; });
       $('btn-cell-pin').addEventListener('click', boardTogglePin);
+      $('btn-cell-ban').addEventListener('click', boardBanSelected);
       $('btn-board-reset').addEventListener('click', boardReset);
       $('btn-share').addEventListener('click', function () {
         readUIFromControls();
