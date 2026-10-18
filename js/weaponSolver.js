@@ -105,8 +105,29 @@
  * arcaneEffectsForEntry converts one pool entry to forward-ready
  * effect objects (absolute max-rank values; multiplier units become
  * (x-1)*100 percent for damage/crit kinds).
- * Cheapest-variant output is frame-solver only (separate
- * implementation, not shared code).
+ *
+ * v1.1 (engine stage E1):
+ *  - Maximize mode + fill phase (same discipline as solver.js):
+ *    hard targets solve first; leftover slots/capacity/Forma then
+ *    raise Maximize stats lexicographically by priority without
+ *    worsening any target outcome. result.cheapest is REDEFINED as
+ *    the no-fill solve when the fill changed the build (the S3
+ *    cost-dominant re-run semantic is gone).
+ *  - Damage-type targets: dmg:<Type> for the 13 damage types + Void,
+ *    all four modes; achieved reports every type's per-shot amount.
+ *  - Ordered slot list: arrangement.slots derives from the fit's
+ *    assignment; the final build is re-expressed in physical slot
+ *    order and the elemental mods' relative order is optimised over
+ *    the elemental-occupied slots (cap 120 permutations) against
+ *    the full target set — that order drives combining.
+ *  - Locks: input.lockedMods / input.lockedArcanes (stat-less mods
+ *    via input.extraModRecords), seeded before the search; the only
+ *    permitted change is the reported capacity rank trim.
+ *  - Deficit lanes: up to 2 extra beam states per at-least stat
+ *    (6 per round), the closest-from-below states for that stat.
+ *  - evaluateWeapon(data, weaponName, attackIndex, orderedPieces,
+ *    progenitor): forward evaluator for the board editor, sharing
+ *    this file's forwardCalc + fitWeapon.
  */
 (function () {
   'use strict';
@@ -655,8 +676,12 @@
       all.push(exilusEntry);
     }
     // Greedy assignment: largest drain first, prefer polarity match;
-    // the exilus entry is pinned to the exilus slot.
-    var order = all.slice().sort(function (a, b) { return drainAt(b.rec, b.rank) - drainAt(a.rec, a.rank); });
+    // the exilus entry is pinned to the exilus slot. (Name tiebreak
+    // keeps the assignment deterministic.)
+    var order = all.slice().sort(function (a, b) {
+      return drainAt(b.rec, b.rank) - drainAt(a.rec, a.rank) ||
+             (a.rec.name < b.rec.name ? -1 : 1);
+    });
     var free = slotPols.map(function (_, i) { return i; });
     if (exilusEntry) free.splice(free.indexOf(exSlotIndex), 1);
     var assign = {};
@@ -730,7 +755,11 @@
         overRankForma: over, capacityMax: capMax, capacityUsed: cost,
         formaUsed: regularUsed, umbraFormaUsed: umbraUsedCount,
         formaPlan: plan, valid: cost <= capMax,
-        totalForma: over + regularUsed + umbraUsedCount
+        totalForma: over + regularUsed + umbraUsedCount,
+        // v1.1: the slot assignment + final polarities ride along —
+        // the ordered slot list and the elemental-order pass derive
+        // from them (single source of truth for placement).
+        assign: assign, pols: pols
       });
       if (rankCap >= maxRankCap) break;
     }
@@ -752,8 +781,19 @@
   }
 
   // ---- solver ------------------------------------------------------------------
+  // Damage types addressable as targets (v1.1): dmg:<Type> is the
+  // type's final per-shot amount (per-pellet amount x multishot),
+  // 0 when the type is absent from the final distribution.
+  var DMG_TYPES = ['Impact', 'Puncture', 'Slash', 'Heat', 'Cold', 'Electric',
+    'Toxin', 'Blast', 'Corrosive', 'Gas', 'Magnetic', 'Radiation', 'Viral', 'Void'];
+  var COMBO_COMPONENTS = {
+    Blast: ['Heat', 'Cold'], Radiation: ['Heat', 'Electric'],
+    Gas: ['Heat', 'Toxin'], Magnetic: ['Cold', 'Electric'],
+    Viral: ['Cold', 'Toxin'], Corrosive: ['Electric', 'Toxin']
+  };
+
   function achievedOf(fwd) {
-    return {
+    var out = {
       totalDamagePerShot: fwd.damagePerShot,
       totalDamage: fwd.totalDamage,
       critChance: fwd.critChance,
@@ -766,6 +806,67 @@
       punchThrough: fwd.punchThrough,
       factionMultiplier: fwd.factionMultiplier,
       factionAdjustedDamage: fwd.factionAdjustedDamage
+    };
+    DMG_TYPES.forEach(function (t) {
+      out['dmg:' + t] = (fwd.damageByType[t] || 0) * fwd.multishot;
+    });
+    Object.keys(fwd.damageByType).forEach(function (t) {
+      if (DMG_TYPES.indexOf(t) < 0) out['dmg:' + t] = fwd.damageByType[t] * fwd.multishot;
+    });
+    return out;
+  }
+
+  // Split input.targets into hard targets and Maximize entries
+  // (same rule as solver.js: mode 'maximize', optional priority,
+  // default = order given; Maximize is handled by the fill phase).
+  function splitTargets(raw) {
+    var hard = {}, max = [];
+    Object.keys(raw || {}).forEach(function (stat, i) {
+      var t = raw[stat] || {};
+      if (t.mode === 'maximize') {
+        max.push({
+          stat: stat,
+          priority: (typeof t.priority === 'number') ? t.priority : i,
+          order: i
+        });
+      } else {
+        hard[stat] = t;
+      }
+    });
+    max.sort(function (a, b) {
+      return (a.priority - b.priority) || (a.order - b.order);
+    });
+    return { hard: hard, maximize: max };
+  }
+
+  // Normalise a caller-supplied mod record (derived shape, or an
+  // already-classified record) into a weapon pool record. Unlike
+  // buildContext this ALLOWS zero classified effects — a locked mod
+  // with no modelled stats still occupies its slot (v1.1 locks).
+  function weaponLockRecordNormalize(raw, nameHint) {
+    if (!raw) return null;
+    var maxRank = raw.maxRank || 0;
+    var effs = [];
+    (raw.effects || []).forEach(function (e) {
+      if (!e) return;
+      if (e.upgradeType) {
+        var c = classifyEffect(e, maxRank);
+        if (c) effs.push(c);
+      } else if (e.kind) {
+        effs.push(e);
+      }
+    });
+    return {
+      name: raw.name || nameHint,
+      type: raw.type || null,
+      polarity: raw.polarity || null,
+      baseDrain: raw.baseDrain || 0,
+      rarity: raw.rarity || null,
+      maxRank: maxRank,
+      incompatible: raw.incompatible || [],
+      set: raw.set || null,
+      exilus: !!raw.exilus,
+      effects: effs
     };
   }
 
@@ -786,7 +887,12 @@
       stance: routesIn.stance !== false,
       arcanes: routesIn.arcanes !== false
     };
-    var targets = input.targets || {};
+    // v1.1: Maximize targets split off (fill phase raises them after
+    // the hard targets solve); the beam sees only the hard targets.
+    var split = splitTargets(input.targets);
+    var targets = split.hard;
+    var maximizeList = split.maximize;
+    var maxStats = maximizeList.map(function (m) { return m.stat; });
     var targetedStats = Object.keys(targets).filter(function (s) {
       return targets[s] && targets[s].mode !== 'dontcare' && typeof targets[s].value === 'number';
     });
@@ -817,6 +923,35 @@
     }
     function effectDelta(eff, rank, stat) {
       var cv = eff.valuePerRank * (rank + 1);
+      // Damage-type targets (v1.1): candidacy/bracketing estimates.
+      // +damage% and multishot scale every type; an elemental add
+      // feeds its own type and any combined type it is a component
+      // of (whether it actually survives combining depends on the
+      // final order — the elemental-order pass settles that).
+      if (stat.indexOf('dmg:') === 0) {
+        var type = stat.slice(4);
+        var perType = baseFwd.damageByType[type] || 0;
+        switch (eff.kind) {
+          case 'damagePct':
+            return perType * baseAch.multishot * cv / 100;
+          case 'multishotPct':
+            return perType * baseAch.multishot * cv / 100;
+          case 'faction':
+            return perType * baseAch.multishot *
+              ((1 + (eff.maxValue - 1) * (rank + 1) / ((eff.maxRank || 0) + 1)) - 1);
+          case 'typedAdd': {
+            var amt = (IPS.indexOf(eff.element) >= 0 ? ipsBase[eff.element] : effBaseTotal) *
+              cv / 100 * baseAch.multishot;
+            if (eff.element === type) return amt;
+            var comps = COMBO_COMPONENTS[type];
+            return (comps && comps.indexOf(eff.element) >= 0) ? amt : 0;
+          }
+          case 'convert':
+            return eff.element === type
+              ? effBaseTotal * cv / 100 * baseAch.multishot * 0.5 : 0;
+          default: return 0;
+        }
+      }
       switch (eff.kind) {
         case 'damagePct':
           return stat === 'totalDamagePerShot' ? baseAch.totalDamage * baseAch.multishot * cv / 100 : 0;
@@ -846,13 +981,17 @@
         default: return 0;
       }
     }
-    function candidateRanks(rec) {
+    function candidateRanks(rec, statList) {
       var set = {};
       set[rec.maxRank] = true;
       rec.effects.forEach(function (eff) {
         if (eff.conditional && !routes.conditional) return;
-        targetedStats.forEach(function (stat) {
-          var gap = targets[stat].value - (baseAch[stat] || 0);
+        statList.forEach(function (stat) {
+          // Maximize stats have no value to bracket against; use the
+          // base value as the gap scale (aim to roughly double it).
+          var gap = (targets[stat] && typeof targets[stat].value === 'number')
+            ? targets[stat].value - (baseAch[stat] || 0)
+            : Math.max(1, Math.abs(baseAch[stat] || 0));
           if (!gap) return;
           for (var r = 0; r <= rec.maxRank; r++) {
             var d = effectDelta(eff, r, stat);
@@ -869,18 +1008,21 @@
       return Object.keys(set).map(Number).sort(function (a, b) { return a - b; });
     }
 
-    var candMods = [];
-    if (routes.mods) {
+    function buildCandMods(statList) {
+      var out = [];
+      if (!routes.mods) return out;
       pool.mods.forEach(function (rec) {
         var touches = rec.effects.some(function (eff) {
           if (eff.conditional && !routes.conditional) return false;
-          return targetedStats.some(function (stat) {
+          return statList.some(function (stat) {
             return Math.abs(effectDelta(eff, rec.maxRank, stat)) > 1e-12;
           });
         });
-        if (touches) candMods.push({ rec: rec, ranks: candidateRanks(rec) });
+        if (touches) out.push({ rec: rec, ranks: candidateRanks(rec, statList) });
       });
+      return out;
     }
+    var candMods = buildCandMods(targetedStats);
 
     // Arcane candidates (one slot): pool entries whose Type fits this
     // weapon, converted to forward effects, kept when a usable effect
@@ -895,24 +1037,116 @@
       magPct: ['magazine'], magFlat: ['magazine'],
       reloadPct: ['reload'], punchFlat: ['punchThrough']
     };
-    var candArcanes = [];
     var arcaneByName = {};
-    if (routes.arcanes && !input.arcaneEffects) {
+    function arcaneTouches(eff, statList) {
+      if (eff.conditional && !routes.conditional) return false;
+      return statList.some(function (stat) {
+        if (stat.indexOf('dmg:') === 0) {
+          if (eff.kind === 'damagePct' || eff.kind === 'multishotPct') return true;
+          if (eff.kind === 'typedAdd') {
+            var ty = stat.slice(4);
+            return eff.element === ty ||
+              (COMBO_COMPONENTS[ty] || []).indexOf(eff.element) >= 0;
+          }
+          return false;
+        }
+        return (KIND_STATS[eff.kind] || []).indexOf(stat) >= 0;
+      });
+    }
+    function buildCandArcanes(statList) {
+      var names = [];
+      if (!routes.arcanes || input.arcaneEffects) return names;
       ctx.arcanePool.forEach(function (entry) {
         if (!arcaneTypeMatches(entry, weapon)) return;
         var effs = arcaneEffectsForEntry(entry);
-        var touches = effs.some(function (eff) {
-          if (eff.conditional && !routes.conditional) return false;
-          return (KIND_STATS[eff.kind] || []).some(function (s) {
-            return targetedStats.indexOf(s) >= 0;
-          });
-        });
-        if (touches) {
-          candArcanes.push(entry.name);
-          arcaneByName[entry.name] = effs;
+        // arcaneByName covers every type-matching entry (locked
+        // arcanes and fill arcane swaps read their effects from it).
+        if (!arcaneByName[entry.name]) arcaneByName[entry.name] = effs;
+        if (effs.some(function (eff) { return arcaneTouches(eff, statList); })) {
+          names.push(entry.name);
         }
       });
+      return names;
     }
+    var candArcanes = buildCandArcanes(targetedStats);
+
+    // ---- v1.1 locks ------------------------------------------------------
+    // Same contract as solver.js: lockedMods [{name, rank}] are
+    // seeded before the search and never dropped or re-ranked by it
+    // (capacity trim excepted, and reported); lockedArcanes (at most
+    // 1 — a weapon has one arcane slot) occupy the arcane slot.
+    var lockedModNames = [], lockedNameSet = {}, lockedRanksW = {};
+    var poolNameSet = {}, poolTypeSet = {};
+    pool.mods.forEach(function (m) {
+      poolNameSet[m.name] = true;
+      if (m.type) poolTypeSet[m.type] = true;
+    });
+    (Array.isArray(input.lockedMods) ? input.lockedMods : []).forEach(function (L) {
+      var name = L && L.name;
+      if (!name) throw new Error('lockedMods entries need a name.');
+      if (lockedNameSet[name]) throw new Error('Duplicate locked mod: ' + name);
+      var rec;
+      if (poolNameSet[name]) {
+        rec = ctx.modByName[name];
+      } else {
+        var raw = null;
+        ((data.modsEffects && data.modsEffects.mods) || []).forEach(function (m) {
+          if (m.name === name) raw = m;
+        });
+        if (!raw && input.extraModRecords) raw = input.extraModRecords[name];
+        if (!raw) {
+          throw new Error('Unknown locked mod: ' + name +
+            ' (not in the weapon mod pool; pass its record via extraModRecords)');
+        }
+        rec = weaponLockRecordNormalize(raw, name);
+        if (!poolTypeSet[rec.type] && rec.type !== weapon.Name &&
+            rec.type !== weapon.Family) {
+          throw new Error('Locked mod ' + name + ' (' + (rec.type || 'untyped') +
+            ') cannot go on ' + input.weaponName + '.');
+        }
+        ctx.modByName[name] = rec;
+        if (rec.set) ctx.setOfMod[name] = rec.set;
+      }
+      lockedNameSet[name] = true;
+      lockedModNames.push(name);
+      lockedRanksW[name] = (typeof L.rank === 'number')
+        ? Math.max(0, Math.min(rec.maxRank, Math.round(L.rank))) : rec.maxRank;
+    });
+    for (var li = 0; li < lockedModNames.length; li++) {
+      for (var lj = li + 1; lj < lockedModNames.length; lj++) {
+        var ra = ctx.modByName[lockedModNames[li]], rb = ctx.modByName[lockedModNames[lj]];
+        if ((ra.incompatible || []).indexOf(rb.name) >= 0 ||
+            (rb.incompatible || []).indexOf(ra.name) >= 0) {
+          throw new Error('Locked mods ' + ra.name + ' and ' + rb.name + ' are incompatible.');
+        }
+      }
+    }
+    var lockedArcaneName = null;
+    (Array.isArray(input.lockedArcanes) ? input.lockedArcanes : []).forEach(function (name) {
+      if (lockedArcaneName) {
+        throw new Error('At most 1 arcane can be locked (a weapon has 1 arcane slot).');
+      }
+      if (input.arcaneEffects) {
+        throw new Error('lockedArcanes cannot be combined with injected arcaneEffects.');
+      }
+      var entry = null;
+      ctx.arcanePool.forEach(function (a) { if (a.name === name) entry = a; });
+      if (!entry) throw new Error('Unknown locked arcane: ' + name);
+      if (!arcaneTypeMatches(entry, weapon)) {
+        throw new Error('Locked arcane ' + name + ' (' + entry.type +
+          ') does not fit ' + input.weaponName + '.');
+      }
+      arcaneByName[name] = arcaneEffectsForEntry(entry);
+      lockedArcaneName = name;
+    });
+
+    var HARDW = { mods: candMods, arcanes: candArcanes };
+    var FILLW = maximizeList.length ? {
+      mods: buildCandMods(targetedStats.concat(maxStats)),
+      arcanes: buildCandArcanes(maxStats)
+    } : null;
+    var fillModByNameW = {};
+    if (FILLW) FILLW.mods.forEach(function (c) { fillModByNameW[c.rec.name] = c; });
 
     function scoreState(ach, fit, state) {
       var shortfall = 0, closestDist = 0;
@@ -973,10 +1207,10 @@
       return { state: state, fwd: fwd, achieved: ach, fit: fit, score: sc.score,
                shortfall: sc.shortfall, closestDist: sc.closestDist || 0 };
     }
-    function expand(state) {
+    function expand(state, cand) {
       var out = [];
       if (state.placed.length < 8) {
-        candMods.forEach(function (c) {
+        cand.mods.forEach(function (c) {
           if (!canPlace(state, c.rec)) return;
           c.ranks.forEach(function (r) {
             var ns = { placed: state.placed.slice(), exilusMod: state.exilusMod, arcane: state.arcane };
@@ -986,7 +1220,7 @@
         });
       }
       if (routes.exilus && !state.exilusMod) {
-        candMods.forEach(function (c) {
+        cand.mods.forEach(function (c) {
           if (!c.rec.exilus) return;
           if (!canPlace(state, c.rec)) return;
           c.ranks.forEach(function (r) {
@@ -997,7 +1231,7 @@
       }
       // Arcane slot: one pick from the type-matched pool candidates.
       if (!state.arcane) {
-        candArcanes.forEach(function (name) {
+        cand.arcanes.forEach(function (name) {
           out.push({ placed: state.placed.slice(), exilusMod: state.exilusMod, arcane: name });
         });
       }
@@ -1023,24 +1257,47 @@
         var sig2 = signature(sorted[i].state);
         if (!picked[sig2]) { picked[sig2] = true; out.push(sorted[i]); }
       }
+      // Deficit lanes (v1.1, bound as in solver.js: at most 2 extra
+      // states per at-least stat, 6 per round): states below a floor
+      // holding the best achieved value for that floor's stat — the
+      // closest-from-below states most likely to complete with one
+      // more piece.
+      var extraBudget = 6;
+      for (var si = 0; si < targetedStats.length && extraBudget > 0; si++) {
+        var stat = targetedStats[si];
+        var t = targets[stat];
+        if (!t || t.mode !== 'atleast') continue;
+        var lb = lowerBetter(stat);
+        var below = sorted.filter(function (ev) {
+          if (picked[signature(ev.state)]) return false;
+          var a = ev.achieved[stat];
+          if (a == null) return false;
+          return lb ? a > t.value + 1e-9 : a < t.value - 1e-9;
+        });
+        below.sort(function (a, b) {
+          return lb ? a.achieved[stat] - b.achieved[stat]
+                    : b.achieved[stat] - a.achieved[stat];
+        });
+        below.slice(0, Math.min(2, extraBudget)).forEach(function (ev) {
+          var sig = signature(ev.state);
+          if (!picked[sig]) { picked[sig] = true; out.push(ev); extraBudget--; }
+        });
+      }
       return out.sort(function (a, b) { return a.score - b.score; });
     }
 
-    // Beam search, parameterised by scoring function so the cheapest
-    // pass (Stage S3, parity with solver.js) can rerun it with
-    // cost-dominant weights. acceptFn (optional) restricts which valid
-    // states may be returned as the run's best.
-    function runSearch(scoreFn, acceptFn) {
-      var beam = [evaluate(emptyState(), scoreFn)];
+    // Beam search over the lock-seeded start states.
+    function runSearch(scoreFn, startStates) {
+      var beam = startStates.map(function (s) { return evaluate(s, scoreFn); });
       var bestValidEver = null;
       beam.forEach(function (ev) {
-        if (ev.fit.valid && (!acceptFn || acceptFn(ev))) bestValidEver = ev;
+        if (ev.fit.valid) bestValidEver = ev;
       });
       for (var round = 0; round < 18; round++) {
         var seen = {}, next = [], newCount = 0;
         beam.forEach(function (ev) { seen[signature(ev.state)] = true; next.push(ev); });
         beam.forEach(function (ev) {
-          expand(ev.state).forEach(function (ns) {
+          expand(ev.state, HARDW).forEach(function (ns) {
             var sig = signature(ns);
             if (seen[sig]) return;
             seen[sig] = true;
@@ -1049,8 +1306,9 @@
           });
         });
         next.forEach(function (ev) {
-          if (ev.fit.valid && (!acceptFn || acceptFn(ev)) &&
-              (!bestValidEver || ev.score < bestValidEver.score)) bestValidEver = ev;
+          if (ev.fit.valid && (!bestValidEver || ev.score < bestValidEver.score)) {
+            bestValidEver = ev;
+          }
         });
         beam = selectBeam(next);
         if (newCount === 0) break;
@@ -1060,39 +1318,339 @@
       return { ev: finals[0], fellBack: true };
     }
 
-    var mainRun = runSearch(null, null);
+    // Lock-seeded start states (exilus variants first — same tie
+    // preference as the frame solver).
+    function lockedStartStatesW() {
+      function seeded(exilusLockName) {
+        var st = emptyState();
+        lockedModNames.forEach(function (n) {
+          var rec = ctx.modByName[n];
+          if (n === exilusLockName) st.exilusMod = { rec: rec, rank: lockedRanksW[n] };
+          else st.placed.push({ rec: rec, rank: lockedRanksW[n] });
+        });
+        if (lockedArcaneName) st.arcane = lockedArcaneName;
+        return st;
+      }
+      var starts = [];
+      if (routes.exilus) {
+        lockedModNames.forEach(function (n) {
+          var rec = ctx.modByName[n];
+          if (rec && rec.exilus && lockedModNames.length - 1 <= 8) starts.push(seeded(n));
+        });
+      }
+      if (lockedModNames.length <= 8) starts.push(seeded(null));
+      if (!starts.length) {
+        throw new Error('Too many locked mods: ' + lockedModNames.length + ' locks for 8 slots.');
+      }
+      return starts;
+    }
+
+    var mainRun = runSearch(null, lockedStartStatesW());
     var chosenEv = mainRun.ev;
 
-    // Cheapest variant: same search, cost weights dominant (fewest
-    // mods, then fewest Forma including over-rank Forma), restricted
-    // to states meeting the main result (shortfall no worse, Closest
-    // within 0.05). Null when identical to the main result.
-    var cheapestEv = null;
-    if (targetedStats.length) {
-      var cheapScore = function (ach, fit, state) {
-        var base = scoreState(ach, fit, state);
-        var cost = modCountOf(state) * 10000 +
-          (fit.formaUsed + fit.overRankForma) * 100 +
-          (fit.umbraFormaUsed || 0) * 100 + (state.arcane ? 1 : 0);
+    // ---- v1.1 lock capacity trim (same rule as solver.js) -----------
+    var trimNotes = [];
+    if (lockedModNames.length && !chosenEv.fit.valid) {
+      var rankInW = function (st, n) {
+        for (var i = 0; i < st.placed.length; i++) {
+          if (st.placed[i].rec.name === n) return st.placed[i].rank;
+        }
+        if (st.exilusMod && st.exilusMod.rec.name === n) return st.exilusMod.rank;
+        return null;
+      };
+      var setRankInW = function (st, n, r) {
+        for (var i = 0; i < st.placed.length; i++) {
+          if (st.placed[i].rec.name === n) { st.placed[i].rank = r; return; }
+        }
+        if (st.exilusMod && st.exilusMod.rec.name === n) st.exilusMod.rank = r;
+      };
+      var cloneStateW = function (st) {
         return {
-          score: base.shortfall * 1e9 + base.closestDist * 1e5 + cost +
-                 (fit.valid ? 0 : 1e10),
-          shortfall: base.shortfall, closestDist: base.closestDist
+          placed: st.placed.map(function (p) { return { rec: p.rec, rank: p.rank }; }),
+          exilusMod: st.exilusMod ? { rec: st.exilusMod.rec, rank: st.exilusMod.rank } : null,
+          arcane: st.arcane
         };
       };
-      var mainShortfall = chosenEv.shortfall;
-      var mainClosest = chosenEv.closestDist || 0;
-      var cheapRun = runSearch(cheapScore, function (ev) {
-        return ev.shortfall <= mainShortfall + 1e-9 &&
-               ev.closestDist <= mainClosest + 0.05;
+      var tst = cloneStateW(chosenEv.state);
+      var beforeRanks = {};
+      lockedModNames.forEach(function (n) { beforeRanks[n] = rankInW(tst, n); });
+      var tev = chosenEv, trimGuard = 0;
+      while (!tev.fit.valid && trimGuard++ < 500) {
+        var pickName = null, pickDrain = -1;
+        lockedModNames.forEach(function (n) {
+          var r = rankInW(tst, n);
+          if (r == null || r <= 0) return;
+          var d = drainAt(ctx.modByName[n], r);
+          if (d > pickDrain) { pickDrain = d; pickName = n; }
+        });
+        if (!pickName) break;
+        setRankInW(tst, pickName, rankInW(tst, pickName) - 1);
+        tev = evaluate(tst, null);
+      }
+      lockedModNames.forEach(function (n) {
+        var after = rankInW(tst, n);
+        if (after != null && beforeRanks[n] != null && after < beforeRanks[n]) {
+          trimNotes.push('Locked ' + n + ' rank reduced ' + beforeRanks[n] +
+            '→' + after + ' to fit capacity');
+        }
       });
-      if (!cheapRun.fellBack &&
-          signature(cheapRun.ev.state) !== signature(chosenEv.state)) {
-        cheapestEv = cheapRun.ev;
+      if (trimNotes.length) chosenEv = tev;
+    }
+
+    // ---- v1.1 elemental order / physical slot order ------------------
+    // The board presents mods in physical slot order (the fit's
+    // assignment), and the forward model must match the board — so
+    // the final arrangement is re-expressed in slot order, and the
+    // elemental mods' relative order (which drives combining) is
+    // optimised over the elemental-occupied slots. Placement rule:
+    // non-elemental mods keep their fit-assigned slots; only the
+    // elemental mods permute among the slots elemental mods already
+    // occupy (cap 120 permutations), the exilus position may only
+    // receive an exilus-flagged mod, and a permutation is legal only
+    // if the build still fits with the same polarity plan.
+    function isElementalRec(rec) {
+      return rec.effects.some(function (e) {
+        return e.kind === 'typedAdd' && isElem(e.element) &&
+               (!e.conditional || routes.conditional);
+      });
+    }
+    function uniquePermutations(entries, cap) {
+      var out = [];
+      (function rec(prefix, rest) {
+        if (out.length >= cap) return;
+        if (!rest.length) { out.push(prefix); return; }
+        for (var i = 0; i < rest.length; i++) {
+          rec(prefix.concat([rest[i]]), rest.slice(0, i).concat(rest.slice(i + 1)));
+          if (out.length >= cap) return;
+        }
+      })([], entries);
+      return out;
+    }
+    function maximizeVectorW(ach) {
+      return maximizeList.map(function (m) { return ach[m.stat]; });
+    }
+    function vecGreaterW(a, b) {
+      for (var i = 0; i < a.length; i++) {
+        if (a[i] > b[i] + 1e-9) return true;
+        if (a[i] < b[i] - 1e-9) return false;
+      }
+      return false;
+    }
+    function finalizeOrder(evRes) {
+      var st = evRes.state;
+      var fit = evRes.fit;
+      if (!fit.assign || !fit.pols) return evRes;
+      var normals = st.placed.slice().sort(function (a, b) {
+        return fit.assign[a.rec.name] - fit.assign[b.rec.name];
+      });
+      var seqAll = normals.slice();
+      if (st.exilusMod) {
+        seqAll.push({ rec: st.exilusMod.rec, rank: st.exilusMod.rank, _exilus: true });
+      }
+      var physSlot = seqAll.map(function (p) { return fit.assign[p.rec.name]; });
+      var elemPos = [];
+      seqAll.forEach(function (p, i) { if (isElementalRec(p.rec)) elemPos.push(i); });
+      var hasProg = !!(fwdOpts.progenitor && weapon.IsLichWeapon);
+      if (elemPos.length < 2 && !(elemPos.length >= 1 && hasProg)) {
+        var nst = { placed: normals, exilusMod: st.exilusMod, arcane: st.arcane };
+        return evaluate(nst, null);
+      }
+      var elemEntries = elemPos.map(function (i) { return seqAll[i]; });
+      var exIdx = -1;
+      seqAll.forEach(function (p, i) { if (p._exilus) exIdx = i; });
+      function tryPerm(perm) {
+        var cand = seqAll.slice();
+        elemPos.forEach(function (pos, k) { cand[pos] = perm[k]; });
+        if (exIdx >= 0 && !cand[exIdx].rec.exilus) return null;
+        var cost = 0;
+        cand.forEach(function (p, i) {
+          var d = drainAt(p.rec, p.rank);
+          cost += polMatches(fit.pols[physSlot[i]], p.rec.polarity)
+            ? Math.ceil(d / 2) : d;
+        });
+        if (cost > fit.capacityMax) return null;
+        var opts = fwdOpts;
+        if (st.arcane) {
+          opts = Object.assign({}, fwdOpts, {
+            arcaneEffects: arcaneByName[st.arcane] || []
+          });
+        }
+        var fwd = forwardCalc(ctx, weapon, input.attackIndex,
+          cand.map(function (p) { return { rec: p.rec, rank: p.rank }; }), opts);
+        var ach = achievedOf(fwd);
+        var sc = scoreState(ach, fit, st);
+        return { cand: cand, cost: cost, fwd: fwd, ach: ach, score: sc.score };
+      }
+      var best = null;
+      uniquePermutations(elemEntries, 120).forEach(function (perm) {
+        var r = tryPerm(perm);
+        if (!r) return;
+        if (!best || r.score < best.score - 1e-9 ||
+            (Math.abs(r.score - best.score) <= 1e-9 &&
+             (vecGreaterW(maximizeVectorW(r.ach), maximizeVectorW(best.ach)) ||
+              (!vecGreaterW(maximizeVectorW(best.ach), maximizeVectorW(r.ach)) &&
+               r.cost < best.cost)))) {
+          best = r;
+        }
+      });
+      if (!best) {
+        var nst0 = { placed: normals, exilusMod: st.exilusMod, arcane: st.arcane };
+        return evaluate(nst0, null);
+      }
+      var newPlaced = [], newExilus = null, newAssign = {};
+      best.cand.forEach(function (p, i) {
+        newAssign[p.rec.name] = physSlot[i];
+        var entry = { rec: p.rec, rank: p.rank };
+        if (st.exilusMod && i === best.cand.length - 1) newExilus = entry;
+        else newPlaced.push(entry);
+      });
+      var newState = { placed: newPlaced, exilusMod: newExilus, arcane: st.arcane };
+      var newFit = Object.assign({}, fit, {
+        capacityUsed: best.cost, assign: newAssign,
+        valid: best.cost <= fit.capacityMax
+      });
+      var scf = scoreState(best.ach, newFit, newState);
+      return { state: newState, fwd: best.fwd, achieved: best.ach, fit: newFit,
+               score: scf.score, shortfall: scf.shortfall, closestDist: scf.closestDist };
+    }
+
+    // ---- v1.1 fill phase (same discipline as solver.js) -------------
+    function guardOkW(evNew, anchor) {
+      for (var i = 0; i < targetedStats.length; i++) {
+        var stat = targetedStats[i], t = targets[stat];
+        var aNew = evNew.achieved[stat], aOld = anchor.achieved[stat];
+        if (aNew == null || aOld == null) { if (aNew !== aOld) return false; continue; }
+        if (t.mode === 'atleast') {
+          if (lowerBetter(stat)) {
+            if (aOld <= t.value + 1e-9) { if (aNew > t.value + 1e-9) return false; }
+            else if (aNew > aOld + 1e-9) return false;
+          } else {
+            if (aOld >= t.value - 1e-9) { if (aNew < t.value - 1e-9) return false; }
+            else if (aNew < aOld - 1e-9) return false;
+          }
+        } else if (t.mode === 'closest') {
+          if (Math.abs(aNew - t.value) > Math.abs(aOld - t.value) + 1e-9) return false;
+        }
+      }
+      return true;
+    }
+    function fillExtraMovesW(state) {
+      var out = [];
+      state.placed.forEach(function (p, idx) {
+        if (lockedNameSet[p.rec.name]) return;
+        var c = fillModByNameW[p.rec.name];
+        if (c) c.ranks.forEach(function (r) {
+          if (r > p.rank) {
+            var ns = { placed: state.placed.slice(), exilusMod: state.exilusMod, arcane: state.arcane };
+            ns.placed[idx] = { rec: p.rec, rank: r };
+            out.push(ns);
+          }
+        });
+        FILLW.mods.forEach(function (cc) {
+          if (cc.rec.name === p.rec.name) return;
+          if (!canPlace({ placed: state.placed.filter(function (_, j) { return j !== idx; }),
+                          exilusMod: state.exilusMod, arcane: state.arcane }, cc.rec)) return;
+          cc.ranks.forEach(function (r) {
+            var ns = { placed: state.placed.slice(), exilusMod: state.exilusMod, arcane: state.arcane };
+            ns.placed[idx] = { rec: cc.rec, rank: r };
+            out.push(ns);
+          });
+        });
+      });
+      if (state.exilusMod && !lockedNameSet[state.exilusMod.rec.name]) {
+        var ce = fillModByNameW[state.exilusMod.rec.name];
+        if (ce) ce.ranks.forEach(function (r) {
+          if (r > state.exilusMod.rank) {
+            out.push({ placed: state.placed.slice(),
+                       exilusMod: { rec: state.exilusMod.rec, rank: r }, arcane: state.arcane });
+          }
+        });
+      }
+      // Arcane swaps (setting an empty slot is expand's job).
+      if (state.arcane && state.arcane !== lockedArcaneName) {
+        FILLW.arcanes.forEach(function (name) {
+          if (name === state.arcane) return;
+          out.push({ placed: state.placed.slice(), exilusMod: state.exilusMod, arcane: name });
+        });
+      }
+      return out;
+    }
+    function fillPhaseW(anchorEv) {
+      var cur = anchorEv;
+      var changed = false;
+      for (var iter = 0; iter < 40; iter++) {
+        var moves = expand(cur.state, FILLW).concat(fillExtraMovesW(cur.state));
+        var best = null;
+        moves.forEach(function (ns) {
+          var ev = evaluate(ns, null);
+          if (!ev.fit.valid) return;
+          if (!guardOkW(ev, anchorEv)) return;
+          if (!vecGreaterW(maximizeVectorW(ev.achieved), maximizeVectorW(cur.achieved))) return;
+          var cand = {
+            ev: ev,
+            slotsDelta: modCountOf(ns) - modCountOf(cur.state),
+            drainDelta: ev.fit.capacityUsed - cur.fit.capacityUsed
+          };
+          if (!best) { best = cand; return; }
+          var va = maximizeVectorW(cand.ev.achieved), vb = maximizeVectorW(best.ev.achieved);
+          var cmp = 0;
+          for (var i = 0; i < va.length; i++) {
+            if (va[i] > vb[i] + 1e-9) { cmp = 1; break; }
+            if (va[i] < vb[i] - 1e-9) { cmp = -1; break; }
+          }
+          if (cmp > 0 ||
+              (cmp === 0 && (cand.slotsDelta < best.slotsDelta ||
+                (cand.slotsDelta === best.slotsDelta &&
+                 cand.drainDelta < best.drainDelta - 1e-9)))) {
+            best = cand;
+          }
+        });
+        if (!best) break;
+        cur = best.ev;
+        changed = true;
+      }
+      return { ev: cur, changed: changed };
+    }
+
+    chosenEv = finalizeOrder(chosenEv);
+    var anchorEv = chosenEv;
+    var fillChanged = false;
+    if (maximizeList.length && FILLW && anchorEv.fit.valid) {
+      var fillRes = fillPhaseW(anchorEv);
+      if (fillRes.changed &&
+          signature(fillRes.ev.state) !== signature(anchorEv.state)) {
+        chosenEv = finalizeOrder(fillRes.ev);
+        fillChanged = true;
       }
     }
 
-    function buildResult(evRes) {
+    // Piece origins (v1.1): 'target' vs 'fill', as in solver.js.
+    function computeOriginsW(anchorState, finalState) {
+      var modOrigin = {};
+      function rankOf(st, n) {
+        for (var i = 0; i < st.placed.length; i++) {
+          if (st.placed[i].rec.name === n) return st.placed[i].rank;
+        }
+        if (st.exilusMod && st.exilusMod.rec.name === n) return st.exilusMod.rank;
+        return null;
+      }
+      finalState.placed.forEach(function (p) {
+        modOrigin[p.rec.name] = (rankOf(anchorState, p.rec.name) === p.rank) ? 'target' : 'fill';
+      });
+      if (finalState.exilusMod) {
+        modOrigin[finalState.exilusMod.rec.name] =
+          (rankOf(anchorState, finalState.exilusMod.rec.name) === finalState.exilusMod.rank)
+          ? 'target' : 'fill';
+      }
+      return {
+        mods: modOrigin,
+        arcane: finalState.arcane
+          ? (finalState.arcane === anchorState.arcane ? 'target' : 'fill') : null
+      };
+    }
+    var originsW = fillChanged ? computeOriginsW(anchorEv.state, chosenEv.state) : null;
+
+    function buildResult(evRes, org) {
     var st = evRes.state;
     var notes = [];
     notes.push('Capacity assumes an Orokin Catalyst is installed (rank cap x 2).');
@@ -1183,7 +1741,8 @@
       } else {
         unknownCost.push(p.rec.name);
       }
-      return { name: p.rec.name, rank: p.rank, slot: slot, rankCost: rc };
+      return { name: p.rec.name, rank: p.rank, slot: slot, rankCost: rc,
+               origin: (org && org.mods && org.mods[p.rec.name]) || 'target' };
     }
     var costedMods = st.placed.map(function (p) { return costedMod(p, 'normal'); })
       .concat(st.exilusMod ? [costedMod(st.exilusMod, 'exilus')] : []);
@@ -1197,11 +1756,71 @@
         'at full stacks — paper stats).');
     }
 
+    // Ordered slot list (v1.1): stance first (kind 'stance'), then
+    // the 8 normal slots in physical slot order (empty slots
+    // included), then the exilus slot when the route is on or a mod
+    // sits in it. Placement/polarity/drain derive from the fit's
+    // assignment — the single source of truth.
+    var slots = [];
+    if (pool.stances.length) {
+      var stanceRec = null;
+      pool.stances.forEach(function (s) { if (s.name === evRes.fit.stance) stanceRec = s; });
+      slots.push({
+        kind: 'stance', fitSlot: null, mod: evRes.fit.stance || null,
+        rank: stanceRec ? stanceRec.maxRank : null,
+        slotPolarity: weapon.StancePolarity || null,
+        innatePolarity: weapon.StancePolarity || null,
+        formaApplied: false, umbraFormaApplied: false,
+        effectiveDrain: evRes.fit.stance ? -(evRes.fit.stanceBonus || 0) : 0,
+        origin: 'target'
+      });
+    }
+    var nameAtSlot = {}, recAt = {};
+    Object.keys(evRes.fit.assign || {}).forEach(function (n) {
+      nameAtSlot[evRes.fit.assign[n]] = n;
+    });
+    st.placed.forEach(function (p) { recAt[p.rec.name] = p; });
+    if (st.exilusMod) recAt[st.exilusMod.rec.name] = st.exilusMod;
+    function slotEntry(kind, fitSlot, name, innate) {
+      var pp = name ? recAt[name] : null;
+      var planE = null;
+      (evRes.fit.formaPlan || []).forEach(function (fp) {
+        if (fp.slot === fitSlot) planE = fp;
+      });
+      var pol = evRes.fit.pols ? evRes.fit.pols[fitSlot] : null;
+      var drain = 0;
+      if (pp) {
+        var d = drainAt(pp.rec, pp.rank);
+        drain = polMatches(pol, pp.rec.polarity) ? Math.ceil(d / 2) : d;
+      }
+      return {
+        kind: kind, fitSlot: fitSlot, mod: name || null,
+        rank: pp ? pp.rank : null,
+        slotPolarity: pol, innatePolarity: innate,
+        formaApplied: !!planE, umbraFormaApplied: !!(planE && planE.umbra),
+        effectiveDrain: drain,
+        origin: name ? ((org && org.mods && org.mods[name]) || 'target') : 'target'
+      };
+    }
+    for (var si2 = 0; si2 < 8; si2++) {
+      slots.push(slotEntry('normal', si2, nameAtSlot[si2] || null,
+        (weapon.Polarities || [])[si2] || null));
+    }
+    if (st.exilusMod || routes.exilus) {
+      var exPolW = weapon.ExilusPolarity;
+      if (exPolW === 'None' || exPolW === '') exPolW = null;
+      slots.push(slotEntry('exilus', 8,
+        st.exilusMod ? st.exilusMod.rec.name : null, exPolW));
+    }
+    slots.forEach(function (s, i) { s.index = i; });
+
     return {
       achieved: achieved,
       forward: evRes.fwd,
       arrangement: {
         mods: costedMods,
+        slots: slots,
+        origins: org || null,
         arcane: st.arcane || null,
         stance: evRes.fit.stance,
         formaUsed: evRes.fit.formaUsed,
@@ -1218,13 +1837,38 @@
     };
     }
 
-    var result = buildResult(chosenEv);
+    var result = buildResult(chosenEv, originsW);
     if (mainRun.fellBack) {
       result.notes.unshift('No arrangement within the Forma budget fits the mod capacity; showing the best-scoring arrangement, which exceeds capacity.');
     }
+    trimNotes.forEach(function (n) { result.notes.push(n); });
+    if (lockedModNames.length || lockedArcaneName) {
+      var lockNames = lockedModNames.concat(lockedArcaneName ? [lockedArcaneName] : []);
+      result.unmetTargets.forEach(function (u) {
+        result.notes.push('Locked piece(s) ' + lockNames.join(', ') +
+          ' are fixed in this build; with them, ' + u.stat +
+          ' tops out at ' + u.achieved + ' (target ' + u.target + ').');
+      });
+    }
+    result.fillPieces = [];
+    if (originsW) {
+      Object.keys(originsW.mods).forEach(function (n) {
+        if (originsW.mods[n] === 'fill') result.fillPieces.push({ kind: 'mod', name: n });
+      });
+      if (originsW.arcane === 'fill' && chosenEv.state.arcane) {
+        result.fillPieces.push({ kind: 'arcane', name: chosenEv.state.arcane });
+      }
+      result.notes.push('Fill phase (Maximize: ' +
+        maximizeList.map(function (m) { return m.stat; }).join(', ') +
+        ') spent leftover slots/capacity/Forma on ' + result.fillPieces.length +
+        ' piece(s): ' + result.fillPieces.map(function (p) { return p.name; }).join(', ') +
+        '. The pre-fill build is reported as the cheapest variant.');
+    }
+    // Cheapest (v1.1 redefinition, parity with solver.js): the
+    // no-fill solve when the fill phase changed the build; else null.
     result.cheapest = null;
-    if (cheapestEv) {
-      var ch = buildResult(cheapestEv);
+    if (fillChanged) {
+      var ch = buildResult(anchorEv, null);
       result.cheapest = {
         achieved: ch.achieved, arrangement: ch.arrangement,
         setBonuses: ch.setBonuses, unmetTargets: ch.unmetTargets,
@@ -1234,9 +1878,123 @@
     return result;
   }
 
+  // ---- forward evaluator (v1.1, for the board editor) ------------------
+  // evaluateWeapon(data, weaponName, attackIndex, orderedPieces,
+  // progenitor) scores ONE given arrangement with the solver's own
+  // forward model + fitting (forwardCalc + fitWeapon — no second
+  // implementation). orderedPieces = {
+  //   slots: [{kind: 'stance'|'normal'|'exilus', mod, rank}] in board
+  //     order (the elemental sequence follows this order exactly),
+  //   arcane: name | null, arcaneEffects: [...] (optional override),
+  //   conditional, formaBudget, umbraForma, stance: false to disable,
+  //   supportSetPieces (unused here — set bonuses don't move weapon
+  //     paper stats), extraModRecords: {name: record}
+  // } -> {achieved (incl. dmg:<Type>), forward, capacityUsed,
+  //       capacityMax, formaUsed, overRankForma, umbraFormaUsed,
+  //       valid, warnings}
+  function evaluateWeapon(data, weaponName, attackIndex, orderedPieces, progenitor) {
+    orderedPieces = orderedPieces || {};
+    var ctx = buildContext(data);
+    var weapon = ctx.weapons[weaponName];
+    if (!weapon) throw new Error('Unknown weapon: ' + weaponName);
+    var pool = poolFor(ctx, weapon);
+    if (!pool.slotSupported) {
+      throw new Error('Weapon slot not supported by the weapon solver: ' + weapon.Slot +
+                       ' (' + weaponName + ')');
+    }
+    Object.keys(orderedPieces.extraModRecords || {}).forEach(function (name) {
+      if (!ctx.modByName[name]) {
+        var rec = weaponLockRecordNormalize(orderedPieces.extraModRecords[name], name);
+        if (rec) {
+          ctx.modByName[name] = rec;
+          if (rec.set) ctx.setOfMod[name] = rec.set;
+        }
+      }
+    });
+    var warnings = [];
+    var normals = [], exilusEntry = null, seq = [];
+    var seenNames = {};
+    (orderedPieces.slots || []).forEach(function (s) {
+      if (!s || !s.mod || s.kind === 'stance') return;
+      var rec = ctx.modByName[s.mod];
+      if (!rec) {
+        warnings.push('Unknown mod "' + s.mod + '" ignored — not in the ' +
+          'solver pool (pass its record via extraModRecords to include it).');
+        return;
+      }
+      if (seenNames[s.mod]) {
+        warnings.push('Duplicate mod "' + s.mod + '" counted once.');
+        return;
+      }
+      seenNames[s.mod] = true;
+      var rank = (typeof s.rank === 'number')
+        ? Math.max(0, Math.min(rec.maxRank, Math.round(s.rank))) : rec.maxRank;
+      var entry = { rec: rec, rank: rank };
+      seq.push(entry); // sequence position = board position
+      if (s.kind === 'exilus') {
+        if (exilusEntry) {
+          warnings.push('Two mods in the exilus slot; "' + s.mod + '" ignored.');
+          return;
+        }
+        if (!rec.exilus) {
+          warnings.push('"' + s.mod + '" is not exilus-flagged but sits in the exilus slot.');
+        }
+        exilusEntry = entry;
+      } else {
+        normals.push(entry);
+      }
+    });
+    var arcaneEffects = orderedPieces.arcaneEffects || null;
+    if (!arcaneEffects && orderedPieces.arcane) {
+      var entry2 = null;
+      ctx.arcanePool.forEach(function (a) { if (a.name === orderedPieces.arcane) entry2 = a; });
+      if (!entry2) {
+        warnings.push('Unknown arcane "' + orderedPieces.arcane + '"; it occupies the slot only.');
+        arcaneEffects = [];
+      } else if (!arcaneTypeMatches(entry2, weapon)) {
+        warnings.push('Arcane "' + orderedPieces.arcane + '" does not fit this ' +
+          'weapon type; it occupies the slot only.');
+        arcaneEffects = [];
+      } else {
+        arcaneEffects = arcaneEffectsForEntry(entry2);
+      }
+    }
+    var fwd = forwardCalc(ctx, weapon, attackIndex, seq, {
+      conditional: !!orderedPieces.conditional,
+      progenitor: progenitor || null,
+      arcaneEffects: arcaneEffects
+    });
+    var fit = fitWeapon(ctx, weapon, normals, exilusEntry,
+      orderedPieces.stance === false ? [] : pool.stances,
+      orderedPieces.formaBudget != null ? orderedPieces.formaBudget : 'any',
+      orderedPieces.umbraForma || 0);
+    if (!fit.valid) {
+      warnings.push('Capacity exceeded: ' + fit.capacityUsed +
+        ' used / ' + fit.capacityMax + ' max.');
+    }
+    var achievedRaw = achievedOf(fwd);
+    var achieved = {};
+    Object.keys(achievedRaw).forEach(function (k) {
+      var v = achievedRaw[k];
+      achieved[k] = (typeof v === 'number') ? round2(v) : v;
+    });
+    return {
+      achieved: achieved,
+      forward: fwd,
+      capacityUsed: fit.capacityUsed,
+      capacityMax: fit.capacityMax,
+      formaUsed: fit.formaUsed,
+      overRankForma: fit.overRankForma,
+      umbraFormaUsed: fit.umbraFormaUsed || 0,
+      valid: fit.valid,
+      warnings: warnings
+    };
+  }
+
   var WeaponSolver = {
     solve: solve,
     forward: forward,
+    evaluateWeapon: evaluateWeapon,
     _internal: {
       buildContext: buildContext,
       poolFor: poolFor,

@@ -117,6 +117,37 @@ a { color: var(--accent); }
 .sets-count { width: 70px; min-width: 70px; }
 input[type="checkbox"] { width: 18px; height: 18px; flex: 0 0 auto; }
 
+/* ---- v1.1: build board + editor + locks ------------------------------ */
+#board {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 8px; margin: 10px 0;
+}
+.slot {
+  background: var(--panel2); border: 1px solid var(--border);
+  border-radius: 6px; padding: 8px 10px; cursor: pointer; min-height: 86px;
+}
+.slot.fixed { cursor: default; }
+.slot.selected { outline: 2px solid var(--accent); outline-offset: -1px; }
+.slot.dragover { outline: 2px dashed var(--accent); outline-offset: -1px; }
+.slot .slot-kind { display: block; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+.slot .slot-mod { display: block; font-weight: 600; margin: 2px 0; overflow-wrap: break-word; }
+.slot.empty .slot-mod { color: var(--muted); font-weight: 400; }
+.slot .slot-meta { display: block; color: var(--muted); font-size: 12px; }
+.badge, .tag-fill {
+  display: inline-block; border: 1px solid var(--border); border-radius: 4px;
+  padding: 0 5px; margin: 2px 2px 0 0; font-size: 11px; color: var(--accent);
+}
+.tag-fill { color: var(--good); border-color: var(--good); }
+.matched-drain { color: var(--good); }
+.cap-over { color: var(--bad); font-weight: 600; }
+#board-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 10px 0; }
+#board-actions span { margin-right: 4px; }
+#board-delta table { width: auto; }
+.prio-input { width: 64px !important; min-width: 64px !important; }
+.lock-row { display: flex; gap: 8px; align-items: center; padding: 3px 0; flex-wrap: wrap; }
+.lock-row button { padding: 2px 10px; }
+.delta-arrow { font-weight: 600; }
+
 /* ---- Mobile layout (<=760px): single column, scrollable tab bar,
    tables scroll inside their wrappers (never the page), >=44px touch
    targets, >=16px input text (prevents iOS focus zoom). Desktop rules
@@ -148,6 +179,8 @@ input[type="checkbox"] { width: 18px; height: 18px; flex: 0 0 auto; }
   label.check input { margin-top: 0; }
   input[type="checkbox"] { width: 22px; height: 22px; }
   .statgrid { grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)); }
+  #board { grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)); }
+  .slot { min-height: 96px; }
   table.grid th, table.grid td { padding: 6px 6px; font-size: 14px; }
   table.grid input[type="number"] { width: 84px; }
   table.grid select { min-width: 118px; }

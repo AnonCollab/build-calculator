@@ -90,11 +90,30 @@
  *    slots holding Umbra-polarity mods may be converted to Umbra with
  *    that separate budget. arrangement.umbraFormaUsed reports the spend
  *    and formaPlan entries for it carry umbra: true.
- *  - Cheapest variant: solve() re-runs the search with cost-dominant
- *    weights (fewest mods, then Forma, then shards), restricted to
- *    states meeting every At-least target the main result met and within
- *    0.05 of its Closest distance. result.cheapest is null when the
- *    cheapest arrangement is the main one.
+ *  - Cheapest variant: v1.0 re-ran the search with cost-dominant
+ *    weights; v1.1 REDEFINES result.cheapest as the no-fill solve
+ *    (targets only) when the Maximize fill phase changed the build,
+ *    and null when it did not (see the v1.1 notes below).
+ *
+ * v1.1 (engine stage E1):
+ *  - Maximize mode: target entries may use mode 'maximize' with an
+ *    optional priority. The beam solves the hard targets (at-least
+ *    floors, then Closest distance) exactly as before; a fill phase
+ *    then spends ONLY leftover resources to raise the Maximize stats
+ *    lexicographically by priority, never worsening any target
+ *    outcome. Pieces carry origin 'target' | 'fill'; result.fillPieces
+ *    lists what the fill added.
+ *  - Ordered slot list: arrangement.slots derives from the fit's
+ *    slotInfo (single source of truth for placement/polarity/drain).
+ *  - Locks: input.lockedMods / input.lockedArcanes pin pieces the
+ *    search must include at the player's rank (stat-less mods via
+ *    input.extraModRecords); the only permitted change is the
+ *    reported capacity rank trim.
+ *  - Deficit lanes: the beam also keeps up to 2 states per at-least
+ *    stat (6 per round max) that are below the floor but hold the
+ *    highest gross positive contribution toward it.
+ *  - evaluateFrame(data, frameName, orderedPieces): forward
+ *    evaluator for the board editor, sharing this file's math.
  */
 (function () {
   'use strict';
@@ -232,6 +251,7 @@
     if (entry.Type === 'MOA') { types.MOA = 1; types.Robotic = 1; }
     if (entry.Type === 'Hound') { types.Hound = 1; types.Robotic = 1; }
     if (entry.Category === 'Pets') types.Beast = 1;
+    ctx._companionTypes = types; // lock validation (v1.1) reads the type set
     var built = poolFromTypes(ctx, ctx.derivedMods, types);
     ctx.linkMods.forEach(function (lm) {
       var ownerVal = ownerStats ? (ownerStats[lm.ownerStat] || 0) : 0;
@@ -284,6 +304,10 @@
     ctx.setOfMod = {};
     mods.forEach(function (m) { if (m.set) ctx.setOfMod[m.name] = m.set; });
 
+    // Every arcane name in the bundle (v1.1 locks may occupy a slot
+    // with an arcane the stat model cannot use).
+    ctx.arcaneNames = ((data.arcaneEffects && data.arcaneEffects.arcanes) || [])
+      .map(function (a) { return a.name; });
     // Arcanes: effects already use solver stat keys. Non-numeric
     // values (unbounded per-stack parses from the full pool) are
     // dropped — the solver cannot count what the text cannot bound.
@@ -511,14 +535,21 @@
     return counts;
   }
 
-  // Sum a state's contributions: {stat: {percent, flat}}.
+  // Sum a state's contributions: {stat: {percent, flat}}. The walker
+  // optionally reports every individual contribution to `collect`
+  // (stat, unit, v) — the deficit-lane metric (v1.1) uses it to total
+  // only the POSITIVE contributions toward one stat.
   function contributions(ctx, state, routes, supportSetPieces) {
+    return walkContributions(ctx, state, routes, supportSetPieces, null);
+  }
+  function walkContributions(ctx, state, routes, supportSetPieces, collect) {
     var sums = {};
     ALL_STATS.forEach(function (k) { sums[k] = { percent: 0, flat: 0 }; });
     var counts = setPieceCounts(ctx, state, supportSetPieces);
     function add(stat, unit, v) {
       if (!sums[stat]) return;
       if (unit === 'flat') sums[stat].flat += v; else sums[stat].percent += v;
+      if (collect) collect(stat, unit, v);
     }
     function addModEffects(mod, rank) {
       if (!mod) return;
@@ -614,6 +645,88 @@
     return sums;
   }
 
+  // Gross POSITIVE contribution toward one stat (percent/flat parts,
+  // negatives ignored) — the deficit-lane metric: a state deep below a
+  // floor but holding a large positive contribution (e.g. a corrupted
+  // mod's upside) is worth keeping in the beam.
+  function grossPositive(ctx, state, routes, supportSetPieces, stat) {
+    var acc = { percent: 0, flat: 0 };
+    walkContributions(ctx, state, routes, supportSetPieces, function (s, unit, v) {
+      if (s !== stat || !(v > 0)) return;
+      if (unit === 'flat') acc.flat += v; else acc.percent += v;
+    });
+    return acc;
+  }
+
+  // Split input.targets into hard targets (atleast/closest/dontcare,
+  // solved by the beam search exactly as before) and Maximize entries
+  // (v1.1: mode 'maximize', optional numeric `priority`; default
+  // priority is the order the stats were given). Maximize stats are
+  // raised afterwards by the fill phase, lexicographically by
+  // priority — they never enter the beam's scoring.
+  function splitTargets(raw) {
+    var hard = {}, max = [];
+    Object.keys(raw || {}).forEach(function (stat, i) {
+      var t = raw[stat] || {};
+      if (t.mode === 'maximize') {
+        max.push({
+          stat: stat,
+          priority: (typeof t.priority === 'number') ? t.priority : i,
+          order: i
+        });
+      } else {
+        hard[stat] = t;
+      }
+    });
+    max.sort(function (a, b) {
+      return (a.priority - b.priority) || (a.order - b.order);
+    });
+    return { hard: hard, maximize: max };
+  }
+
+  // Normalise a caller-supplied mod record (derived mods_effects
+  // shape, or an already solver-shaped record) into a pool record.
+  // Unlike modRecord() this ALLOWS zero mapped effects — a locked mod
+  // with no solver stats (e.g. Primed Sure Footed) still occupies its
+  // slot and drains capacity (v1.1 locks).
+  function lockRecordNormalize(raw, nameHint) {
+    if (!raw) return null;
+    var maxRank = raw.maxRank || 0;
+    var effs = [];
+    (raw.effects || []).forEach(function (e) {
+      if (!e) return;
+      if (e.upgradeType) {
+        var stat = UT_TO_STAT[e.upgradeType];
+        if (!stat || (e.unit !== 'percent' && e.unit !== 'flat')) return;
+        effs.push({
+          stat: stat, unit: e.unit,
+          valuePerRank: (typeof e.valuePerRank === 'number')
+            ? e.valuePerRank : (e.value || 0) / (maxRank + 1),
+          condition: e.condition || null
+        });
+      } else if (e.stat) {
+        effs.push({
+          stat: e.stat, unit: e.unit || 'percent',
+          valuePerRank: (typeof e.valuePerRank === 'number')
+            ? e.valuePerRank : (e.value || 0) / (maxRank + 1),
+          condition: e.condition || null
+        });
+      }
+    });
+    return {
+      name: raw.name || nameHint,
+      type: raw.type || null,
+      polarity: raw.polarity || null,
+      baseDrain: raw.baseDrain || 0,
+      rarity: raw.rarity || null,
+      maxRank: maxRank,
+      incompatible: raw.incompatible || [],
+      set: raw.set || null,
+      exilus: !!raw.exilus,
+      effects: effs
+    };
+  }
+
   function achievedFrom(ctx, frame, sums) {
     var out = {};
     ABILITY_STATS.forEach(function (k) { out[k] = 100 + sums[k].percent; });
@@ -657,9 +770,11 @@
     var chosen = Object.keys(state.mods).map(function (name) {
       return { name: name, mod: ctx.modByName[name], rank: state.mods[name] };
     });
-    // Greedy assignment: largest drain first, prefer a polarity match.
+    // Greedy assignment: largest drain first, prefer a polarity match
+    // (name tiebreak keeps the assignment deterministic).
     var order = chosen.slice().sort(function (a, b) {
-      return modDrainAt(b.mod, b.rank) - modDrainAt(a.mod, a.rank);
+      return modDrainAt(b.mod, b.rank) - modDrainAt(a.mod, a.rank) ||
+             (a.name < b.name ? -1 : 1);
     });
     var free = slotPols.map(function (_, i) { return i; });
     var assign = {}; // modName -> slotIndex
@@ -693,28 +808,36 @@
     function totalCost(pols) {
       return chosen.reduce(function (s, c) { return s + costOf(c, pols); }, 0);
     }
+    var innatePols = slotPols.slice(); // incl. the appended exilus slot
     var pols = slotPols.slice();
     var cost = totalCost(pols);
     var formaPlan = [];
     var regularUsed = 0;
     var budget = (formaBudget === 'any' || formaBudget == null) ? Infinity : formaBudget;
-    while (cost > capacityMax && regularUsed < budget) {
-      // Forma the assigned slot with the largest saving (skip mods already
-      // matched, and Umbra mods — regular Forma cannot create Umbra).
-      var best = null;
-      chosen.forEach(function (c) {
-        var slot = assign[c.name];
-        if (pols[slot] === c.mod.polarity) return;
-        if (c.mod.polarity === 'Umbra' || !c.mod.polarity) return;
-        var d = modDrainAt(c.mod, c.rank);
-        var saving = d - Math.ceil(d / 2);
-        if (saving > 0 && (!best || saving > best.saving)) {
-          best = { slot: slot, polarity: c.mod.polarity, saving: saving };
-        }
-      });
-      if (!best) break;
-      pols[best.slot] = best.polarity;
-      formaPlan.push({ slot: best.slot, polarity: best.polarity });
+    // Forma allocation (v1.1): biggest unmatched drains first. A
+    // slot's saving (drain - ceil(drain/2)) does not depend on other
+    // slots, so candidates are computed once and applied in
+    // descending-saving order. Slots already polarity-matched (innate
+    // match) never consume Forma; Umbra-polarity mods are skipped
+    // here — only the Umbra Forma pass below may match them.
+    function savingOf(c) {
+      var slot = assign[c.name];
+      if (pols[slot] === c.mod.polarity) return 0;
+      if (!c.mod.polarity) return 0;
+      var d = modDrainAt(c.mod, c.rank);
+      return d - Math.ceil(d / 2);
+    }
+    function bySavingDesc(a, b) {
+      return (b.saving - a.saving) || (assign[a.c.name] - assign[b.c.name]);
+    }
+    var formaCands = chosen.filter(function (c) { return c.mod.polarity !== 'Umbra'; })
+      .map(function (c) { return { c: c, saving: savingOf(c) }; })
+      .filter(function (x) { return x.saving > 0; })
+      .sort(bySavingDesc);
+    for (var fi = 0; fi < formaCands.length && cost > capacityMax && regularUsed < budget; fi++) {
+      var fc = formaCands[fi];
+      pols[assign[fc.c.name]] = fc.c.mod.polarity;
+      formaPlan.push({ slot: assign[fc.c.name], polarity: fc.c.mod.polarity });
       regularUsed++;
       cost = totalCost(pols);
     }
@@ -722,31 +845,47 @@
     // mod are candidates, and only the separate umbraForma budget pays.
     var umbraBudget = umbraForma || 0;
     var umbraUsedCount = 0;
-    while (cost > capacityMax && umbraUsedCount < umbraBudget) {
-      var ubest = null;
-      chosen.forEach(function (c) {
-        if (c.mod.polarity !== 'Umbra') return;
-        var slot = assign[c.name];
-        if (pols[slot] === 'Umbra') return;
-        var d = modDrainAt(c.mod, c.rank);
-        var saving = d - Math.ceil(d / 2);
-        if (saving > 0 && (!ubest || saving > ubest.saving)) {
-          ubest = { slot: slot, saving: saving };
-        }
-      });
-      if (!ubest) break;
-      pols[ubest.slot] = 'Umbra';
-      formaPlan.push({ slot: ubest.slot, polarity: 'Umbra', umbra: true });
+    var umbraCands = chosen.filter(function (c) { return c.mod.polarity === 'Umbra'; })
+      .map(function (c) { return { c: c, saving: savingOf(c) }; })
+      .filter(function (x) { return x.saving > 0; })
+      .sort(bySavingDesc);
+    for (var ui = 0; ui < umbraCands.length && cost > capacityMax && umbraUsedCount < umbraBudget; ui++) {
+      var uc = umbraCands[ui];
+      pols[assign[uc.c.name]] = 'Umbra';
+      formaPlan.push({ slot: assign[uc.c.name], polarity: 'Umbra', umbra: true });
       umbraUsedCount++;
       cost = totalCost(pols);
     }
+    // Per-slot outcome (v1.1): the single source of truth the slot
+    // list is derived from — which mod sits in which slot, the slot's
+    // final polarity, and the mod's effective drain there.
+    var bySlot = {};
+    chosen.forEach(function (c) { bySlot[assign[c.name]] = c; });
+    var slotInfo = innatePols.map(function (innate, i) {
+      var c = bySlot[i] || null;
+      var planEntry = null;
+      formaPlan.forEach(function (p) { if (p.slot === i) planEntry = p; });
+      return {
+        slot: i,
+        mod: c ? c.name : null,
+        rank: c ? c.rank : null,
+        polarity: pols[i],
+        innatePolarity: innate,
+        formaApplied: !!planEntry,
+        umbraFormaApplied: !!(planEntry && planEntry.umbra),
+        effectiveDrain: c ? costOf(c, pols) : 0
+      };
+    });
     return {
       capacityUsed: cost,
       capacityMax: capacityMax,
       formaUsed: regularUsed,
       umbraFormaUsed: umbraUsedCount,
       formaPlan: formaPlan,
-      valid: cost <= capacityMax
+      valid: cost <= capacityMax,
+      assign: assign,
+      pols: pols,
+      slotInfo: slotInfo
     };
   }
 
@@ -773,14 +912,13 @@
     return { score: score, shortfall: shortfall, closestDist: closestDist };
   }
 
-  // ---- solver ---------------------------------------------------------------------
-  function solve(input, data) {
-    var ctx = buildContext(data);
-    // Item kind: 'warframe' (default), 'necramech', 'companion'. The
-    // non-frame kinds reuse this solver with their own base-stat entry,
-    // mod pool, slot count and capacity rule; routes that do not exist
-    // on those items (aura, arcanes, shards, tome, helmets, exilus) are
-    // forced off below.
+  // ---- item resolution ---------------------------------------------------------
+  // Item kind: 'warframe' (default), 'necramech', 'companion'. The
+  // non-frame kinds reuse this solver with their own base-stat entry,
+  // mod pool, slot count and capacity rule. Shared by solve() and
+  // evaluateFrame() so both resolve items identically. Mutates ctx:
+  // swaps modPool/modByName to the kind's pool.
+  function resolveItem(ctx, input) {
     var kind = (input.itemKind === 'necramech' || input.itemKind === 'companion')
       ? input.itemKind : 'warframe';
     var frame;
@@ -815,6 +953,15 @@
       frame = ctx.frames[input.frameName];
       if (!frame) throw new Error('Unknown frame: ' + input.frameName);
     }
+    return { kind: kind, frame: frame };
+  }
+
+  // ---- solver ---------------------------------------------------------------------
+  function solve(input, data) {
+    var ctx = buildContext(data);
+    var resolved = resolveItem(ctx, input);
+    var kind = resolved.kind;
+    var frame = resolved.frame;
     var slotLimit = frame._slotCount || 8;
 
     var routesIn = input.routes || {};
@@ -834,10 +981,84 @@
       routes.exilus = false; routes.tome = false; routes.legacyHelmets = false;
       routes.helminth = false;
     }
-    var targets = input.targets || {};
+    // v1.1: Maximize targets split off — the beam solves the hard
+    // targets (atleast/closest) exactly as before; Maximize stats are
+    // raised afterwards by the fill phase (see fillPhase below).
+    var split = splitTargets(input.targets);
+    var targets = split.hard;
+    var maximizeList = split.maximize;
     var targetedStats = Object.keys(targets).filter(function (s) {
       return targets[s] && targets[s].mode !== 'dontcare' && typeof targets[s].value === 'number';
     });
+
+    // ---- v1.1 locks ------------------------------------------------------
+    // input.lockedMods = [{name, rank}] must appear in the build at
+    // the player's rank; input.lockedArcanes = [name] occupy arcane
+    // slots the same way. Locks are seeded into the start states and
+    // the search never drops or re-ranks them (the capacity trim pass
+    // after the search is the single exception, and it reports).
+    // Records resolve from the kind's pool, then the derived store,
+    // then input.extraModRecords — the last two let callers lock
+    // stat-less mods (e.g. Primed Sure Footed) that the stat model
+    // does not carry.
+    var lockedModNames = [], lockedNameSet = {}, lockedRanks = {};
+    function resolveLockRecord(name) {
+      if (ctx.modByName[name]) return ctx.modByName[name];
+      var raw = null;
+      (ctx.derivedMods || []).forEach(function (m) { if (m.name === name) raw = m; });
+      if (!raw && input.extraModRecords) raw = input.extraModRecords[name];
+      if (!raw) {
+        throw new Error('Unknown locked mod: ' + name +
+          ' (not in the mod pool or the derived store; pass its record via extraModRecords)');
+      }
+      var rec = lockRecordNormalize(raw, name);
+      ctx.modByName[name] = rec;
+      if (rec.set) ctx.setOfMod[name] = rec.set;
+      return rec;
+    }
+    (Array.isArray(input.lockedMods) ? input.lockedMods : []).forEach(function (L) {
+      var name = L && L.name;
+      if (!name) throw new Error('lockedMods entries need a name.');
+      if (lockedNameSet[name]) throw new Error('Duplicate locked mod: ' + name);
+      var rec = resolveLockRecord(name);
+      var wantType = kind === 'warframe' ? 'Warframe'
+        : kind === 'necramech' ? 'Necramech' : null;
+      if (wantType && rec.type && rec.type !== wantType) {
+        throw new Error('Locked mod ' + name + ' is a ' + rec.type +
+          ' mod and cannot be locked onto a ' + kind + ' build.');
+      }
+      if (kind === 'companion' && rec.type && ctx._companionTypes &&
+          !ctx._companionTypes[rec.type]) {
+        throw new Error('Locked mod ' + name + ' is a ' + rec.type +
+          ' mod and cannot be locked onto this companion.');
+      }
+      lockedNameSet[name] = true;
+      lockedModNames.push(name);
+      lockedRanks[name] = (typeof L.rank === 'number')
+        ? Math.max(0, Math.min(rec.maxRank, Math.round(L.rank))) : rec.maxRank;
+    });
+    var lockedArcaneNames = [];
+    (Array.isArray(input.lockedArcanes) ? input.lockedArcanes : []).forEach(function (name) {
+      if (lockedArcaneNames.indexOf(name) >= 0) {
+        throw new Error('Duplicate locked arcane: ' + name);
+      }
+      if (lockedArcaneNames.length >= 2) {
+        throw new Error('At most 2 arcanes can be locked (the item has 2 arcane slots).');
+      }
+      if (ctx.arcaneNames.length && ctx.arcaneNames.indexOf(name) < 0) {
+        throw new Error('Unknown locked arcane: ' + name);
+      }
+      lockedArcaneNames.push(name);
+    });
+    for (var li = 0; li < lockedModNames.length; li++) {
+      for (var lj = li + 1; lj < lockedModNames.length; lj++) {
+        var ra = ctx.modByName[lockedModNames[li]], rb = ctx.modByName[lockedModNames[lj]];
+        if ((ra.incompatible || []).indexOf(rb.name) >= 0 ||
+            (rb.incompatible || []).indexOf(ra.name) >= 0) {
+          throw new Error('Locked mods ' + ra.name + ' and ' + rb.name + ' are incompatible.');
+        }
+      }
+    }
 
     var baseAchieved = achievedFrom(ctx, frame,
       contributions(ctx, emptyState(input.shardWallet), routes, input.supportSetPieces));
@@ -867,47 +1088,80 @@
       return Object.keys(set).map(Number).sort(function (a, b) { return a - b; });
     }
 
-    // Candidate mods: touch at least one targeted stat.
-    var candMods = [];
-    if (routes.mods) {
-      ctx.modPool.forEach(function (mod) {
-        var touches = mod.effects.some(function (e) {
-          return targetedStats.indexOf(e.stat) >= 0 && (!e.condition || routes.conditional);
-        });
-        if (touches) candMods.push({ mod: mod, ranks: candidateRanks(mod) });
-      });
-    }
-    var candArcanes = routes.arcanes ? ctx.arcanes.filter(function (a) {
-      return a.effects.some(function (e) { return targetedStats.indexOf(e.stat) >= 0; }) &&
-             (!a.conditional || routes.conditional);
-    }) : [];
-    // Helminth subsume candidates (S3): dataset entries with modelled
-    // effects touching a targeted stat, donor excluded by base-name
-    // family (a frame — or its Prime — can never receive its own
-    // ability). At most one subsume, replacing one UNLOCKED ability.
+    // Candidate pieces touching a given stat set. Built twice: HARD
+    // (the hard targets — drives the beam search, exactly the v1.0
+    // behaviour) and FILL (the Maximize stats — drives the fill
+    // phase; its rank sets add each mod's half-contribution rank).
     function baseFrameName(n) { return String(n || '').replace(/ Prime$/, ''); }
     var frameAbilities = (kind === 'warframe' && frame && Array.isArray(frame.Abilities))
       ? frame.Abilities : [];
     var abilityLocks = Array.isArray(input.abilityLocks) ? input.abilityLocks : [];
-    var candSubsumes = (routes.helminth && frameAbilities.length) ? ctx.helminth.filter(function (e) {
-      if (baseFrameName(e.frame) === baseFrameName(input.frameName)) return false;
-      return e.effects.some(function (ef) {
-        return targetedStats.indexOf(ef.stat) >= 0 && (!ef.conditional || routes.conditional);
-      });
-    }) : [];
-    var candTomes = (routes.tome && routes.conditional) ? ctx.tomes.filter(function (t) {
-      return targetedStats.indexOf(t.stat) >= 0;
-    }) : [];
-    var candAuras = routes.aura ? ctx.auras.filter(function (a) {
-      return a.effects.some(function (e) {
-        return targetedStats.indexOf(e.stat) >= 0 && (!e.conditional || routes.conditional);
-      });
-    }) : [];
-    var candShardPicks = routes.shards ? ctx.shardPicks.filter(function (p) {
-      return targetedStats.indexOf(p.stat) >= 0;
-    }) : [];
-    var helmetList = routes.legacyHelmets
+    var helmetListAll = routes.legacyHelmets
       ? (ctx.legacyHelmets[input.frameName] || []) : [];
+    function fillRanks(mod) {
+      var set = {};
+      candidateRanks(mod).forEach(function (r) { set[r] = true; });
+      set[mod.maxRank] = true;
+      mod.effects.forEach(function (e) {
+        var isMax = maximizeList.some(function (m) { return m.stat === e.stat; });
+        if (!isMax || (e.condition && !routes.conditional)) return;
+        var total = e.valuePerRank * (mod.maxRank + 1);
+        if (!(total > 0)) return;
+        for (var r = 0; r <= mod.maxRank; r++) {
+          if (e.valuePerRank * (r + 1) >= total / 2) { set[r] = true; break; }
+        }
+      });
+      return Object.keys(set).map(Number).sort(function (a, b) { return a - b; });
+    }
+    function buildCandidates(statSet, ranksFn, unfilteredHelmets) {
+      var mods = [];
+      if (routes.mods) {
+        ctx.modPool.forEach(function (mod) {
+          var touches = mod.effects.some(function (e) {
+            return statSet.indexOf(e.stat) >= 0 && (!e.condition || routes.conditional);
+          });
+          if (touches) mods.push({ mod: mod, ranks: ranksFn(mod) });
+        });
+      }
+      var arcanes = routes.arcanes ? ctx.arcanes.filter(function (a) {
+        return a.effects.some(function (e) { return statSet.indexOf(e.stat) >= 0; }) &&
+               (!a.conditional || routes.conditional);
+      }) : [];
+      // Helminth subsume candidates (S3): dataset entries with
+      // modelled effects touching the stat set, donor excluded by
+      // base-name family (a frame — or its Prime — can never receive
+      // its own ability). At most one subsume, replacing one
+      // UNLOCKED ability.
+      var subsumes = (routes.helminth && frameAbilities.length) ? ctx.helminth.filter(function (e) {
+        if (baseFrameName(e.frame) === baseFrameName(input.frameName)) return false;
+        return e.effects.some(function (ef) {
+          return statSet.indexOf(ef.stat) >= 0 && (!ef.conditional || routes.conditional);
+        });
+      }) : [];
+      var tomes = (routes.tome && routes.conditional) ? ctx.tomes.filter(function (t) {
+        return statSet.indexOf(t.stat) >= 0;
+      }) : [];
+      var auras = routes.aura ? ctx.auras.filter(function (a) {
+        return a.effects.some(function (e) {
+          return statSet.indexOf(e.stat) >= 0 && (!e.conditional || routes.conditional);
+        });
+      }) : [];
+      var shardPicks = routes.shards ? ctx.shardPicks.filter(function (p) {
+        return statSet.indexOf(p.stat) >= 0;
+      }) : [];
+      var helmets = unfilteredHelmets ? helmetListAll.slice()
+        : helmetListAll.filter(function (h) {
+            return h.effects.some(function (e) { return statSet.indexOf(e.stat) >= 0; });
+          });
+      var byName = {};
+      mods.forEach(function (c) { byName[c.mod.name] = c; });
+      return { mods: mods, arcanes: arcanes, subsumes: subsumes, tomes: tomes,
+               auras: auras, shardPicks: shardPicks, helmets: helmets, byName: byName };
+    }
+    var HARD = buildCandidates(targetedStats, candidateRanks, true);
+    var FILL = maximizeList.length
+      ? buildCandidates(maximizeList.map(function (m) { return m.stat; }), fillRanks, false)
+      : null;
 
     function evaluateWith(state, scoreFn) {
       var sums = contributions(ctx, state, routes, input.supportSetPieces);
@@ -931,11 +1185,11 @@
       });
     }
 
-    function expand(state) {
+    function expand(state, cand) {
       var out = [];
       // Mods — normal slots. Exilus-flagged mods may also sit here.
       if (Object.keys(state.mods).length < slotLimit) {
-        candMods.forEach(function (c) {
+        cand.mods.forEach(function (c) {
           if (!canPlace(state, c.mod)) return;
           c.ranks.forEach(function (r) {
             var ns = clone(state); ns.mods[c.mod.name] = r; out.push(ns);
@@ -944,7 +1198,7 @@
       }
       // Exilus slot — exilus-flagged mods only, only when the route is on.
       if (routes.exilus && !state.exilusMod) {
-        candMods.forEach(function (c) {
+        cand.mods.forEach(function (c) {
           if (!c.mod.exilus) return;
           if (!canPlace(state, c.mod)) return;
           c.ranks.forEach(function (r) {
@@ -956,27 +1210,27 @@
       }
       // Arcanes (max 2)
       if (state.arcanes.length < 2) {
-        candArcanes.forEach(function (a) {
+        cand.arcanes.forEach(function (a) {
           if (state.arcanes.indexOf(a.name) >= 0) return;
           var ns = clone(state); ns.arcanes.push(a.name); out.push(ns);
         });
       }
       // Tome (single pick)
       if (!state.tome) {
-        candTomes.forEach(function (t) {
+        cand.tomes.forEach(function (t) {
           var ns = clone(state); ns.tome = t.name; out.push(ns);
         });
       }
       // Aura (single pick)
       if (!state.aura) {
-        candAuras.forEach(function (a) {
+        cand.auras.forEach(function (a) {
           var ns = clone(state); ns.aura = a.name; out.push(ns);
         });
       }
       // Legacy helmets — one candidate move per helmet in the frame's
       // list; still at most one helmet total, no slot / no capacity cost.
-      if (!state.helmet && helmetList.length) {
-        helmetList.forEach(function (h) {
+      if (!state.helmet && cand.helmets.length) {
+        cand.helmets.forEach(function (h) {
           var ns = clone(state);
           ns.helmet = h.helmetName;
           ns._helmetFrame = input.frameName;
@@ -985,8 +1239,8 @@
       }
       // Helminth subsume (S3): at most one; each candidate may replace
       // any one UNLOCKED ability slot (locked abilities never move).
-      if (!state.subsume && candSubsumes.length) {
-        candSubsumes.forEach(function (e) {
+      if (!state.subsume && cand.subsumes.length) {
+        cand.subsumes.forEach(function (e) {
           frameAbilities.forEach(function (ab, idx) {
             if (abilityLocks[idx]) return;
             var ns = clone(state);
@@ -997,7 +1251,7 @@
       }
       // Shards (max 5)
       if (state.shards.length < 5) {
-        candShardPicks.forEach(function (p) {
+        cand.shardPicks.forEach(function (p) {
           ['normal', 'tauforged'].forEach(function (tier) {
             var ns = clone(state);
             var fusion = spendShard(ns.wallet, input.shardWallet, p.colour, tier);
@@ -1020,6 +1274,25 @@
     // path) before they finish stacking. So each round keeps the top
     // states per mod-count lane, then fills up with the best overall.
     var BEAM = 90, LANE = 12;
+    // Deficit lanes (v1.1): alongside the stratified top scorers, keep
+    // a few states that sit BELOW an at-least floor but hold the
+    // highest gross positive contribution toward that floor's stat —
+    // the corrupted-mod compensation pattern (a big upside paired
+    // with a negative on the same stat reads as a bad score until a
+    // second piece compensates). Bound: at most 2 extra states per
+    // at-least stat, at most 6 extra states per round, chosen from
+    // the 6 closest-from-below states per stat.
+    var DEFICIT_PER_STAT = 2, DEFICIT_TOTAL = 6, DEFICIT_POOL = 6;
+    function sigOf(ev) {
+      if (!ev._sig) ev._sig = stateSignature(ev.state);
+      return ev._sig;
+    }
+    function grossFor(ev, stat) {
+      var g = grossPositive(ctx, ev.state, routes, input.supportSetPieces, stat);
+      if (ABILITY_STATS.indexOf(stat) >= 0) return g.percent;
+      var baseKey = { health: 'Health', shield: 'Shield', armor: 'Armor', energyMax: 'Energy' }[stat];
+      return (frame[baseKey] || 0) * g.percent / 100 + g.flat;
+    }
     function selectBeam(evals) {
       var sorted = evals.slice().sort(function (a, b) { return a.score - b.score; });
       var picked = {}, out = [];
@@ -1030,32 +1303,48 @@
       });
       Object.keys(lanes).forEach(function (k) {
         lanes[k].slice(0, LANE).forEach(function (ev) {
-          var sig = stateSignature(ev.state);
+          var sig = sigOf(ev);
           if (!picked[sig]) { picked[sig] = true; out.push(ev); }
         });
       });
       for (var i = 0; i < sorted.length && out.length < BEAM; i++) {
-        var sig2 = stateSignature(sorted[i].state);
+        var sig2 = sigOf(sorted[i]);
         if (!picked[sig2]) { picked[sig2] = true; out.push(sorted[i]); }
+      }
+      // Deficit lanes (see bound above).
+      var extraBudget = DEFICIT_TOTAL;
+      for (var si = 0; si < targetedStats.length && extraBudget > 0; si++) {
+        var stat = targetedStats[si];
+        var t = targets[stat];
+        if (!t || t.mode !== 'atleast') continue;
+        var below = sorted.filter(function (ev) {
+          return !picked[sigOf(ev)] && ev.achieved[stat] < t.value - 1e-9;
+        });
+        if (!below.length) continue;
+        below.sort(function (a, b) { return b.achieved[stat] - a.achieved[stat]; });
+        var cands = below.slice(0, DEFICIT_POOL).map(function (ev) {
+          return { ev: ev, gross: grossFor(ev, stat) };
+        });
+        cands.sort(function (a, b) { return b.gross - a.gross; });
+        cands.slice(0, Math.min(DEFICIT_PER_STAT, extraBudget)).forEach(function (c) {
+          var sig = sigOf(c.ev);
+          if (!picked[sig]) { picked[sig] = true; out.push(c.ev); extraBudget--; }
+        });
       }
       return out.sort(function (a, b) { return a.score - b.score; });
     }
 
-    // Beam search, parameterised by scoring function so the cheapest
-    // pass can re-run the identical search with cost-dominant weights.
-    // acceptFn (optional) restricts which valid states may be returned.
-    // Termination: run until a round generates no new states, or the
-    // round cap. Do NOT stop on a top-score plateau — slow lanes (many
-    // small pieces, e.g. the 0-mod shard path) complete after the beam's
-    // top score has already flattened on a fast lane's solution.
-    function runSearch(scoreFn, acceptFn) {
-      var start = emptyState(input.shardWallet);
-      start._helmetFrame = input.frameName;
-      var beam = [evaluateWith(start, scoreFn)];
+    // Beam search. Termination: run until a round generates no new
+    // states, or the round cap. Do NOT stop on a top-score plateau —
+    // slow lanes (many small pieces, e.g. the 0-mod shard path)
+    // complete after the beam's top score has already flattened on a
+    // fast lane's solution. startStates (v1.1) seeds the beam — the
+    // lock placements; defaults to the single empty state.
+    function runSearch(scoreFn, startStates) {
+      var beam = startStates.map(function (s) { return evaluateWith(s, scoreFn); });
       var bestValidEver = null;
       function consider(ev) {
         if (!ev.fit.valid) return;
-        if (acceptFn && !acceptFn(ev)) return;
         if (!bestValidEver || ev.score < bestValidEver.score) bestValidEver = ev;
       }
       beam.forEach(consider);
@@ -1065,7 +1354,7 @@
         var newCount = 0;
         beam.forEach(function (ev) { seen[stateSignature(ev.state)] = true; next.push(ev); });
         beam.forEach(function (ev) {
-          expand(ev.state).forEach(function (ns) {
+          expand(ev.state, HARD).forEach(function (ns) {
             var sig = stateSignature(ns);
             if (seen[sig]) return;
             seen[sig] = true;
@@ -1079,45 +1368,270 @@
       }
       if (bestValidEver) return { ev: bestValidEver, fellBack: false };
       var finals = beam.slice().sort(function (a, b) { return a.score - b.score; });
-      return { ev: finals[0] || evaluateWith(start, scoreFn), fellBack: true };
+      return { ev: finals[0] || beam[0], fellBack: true };
     }
 
-    var mainRun = runSearch(scoreState, null);
+    // Lock-seeded start states: every locked mod placed at its locked
+    // rank, locked arcanes occupying their slots. For each
+    // exilus-eligible locked mod there is an extra start variant with
+    // that mod in the exilus slot (the solver picks the placement);
+    // the base variant keeps all locks in normal slots.
+    function lockedStartStates() {
+      function seeded(exilusLockName) {
+        var st = emptyState(input.shardWallet);
+        st._helmetFrame = input.frameName;
+        lockedModNames.forEach(function (n) {
+          if (n === exilusLockName) st.exilusMod = { name: n, rank: lockedRanks[n] };
+          else st.mods[n] = lockedRanks[n];
+        });
+        st.arcanes = lockedArcaneNames.slice();
+        return st;
+      }
+      // Exilus variants come FIRST: on an exact score tie the search
+      // keeps the earliest-evaluated state, so an exilus-eligible
+      // lock lands in the free exilus slot unless a normal-slot
+      // placement scores strictly better (e.g. an innate match).
+      var starts = [];
+      if (routes.exilus && kind === 'warframe' &&
+          lockedModNames.length <= slotLimit + 1) {
+        lockedModNames.forEach(function (n) {
+          var rec = ctx.modByName[n];
+          if (rec && rec.exilus && Object.keys(seeded(n).mods).length <= slotLimit) {
+            starts.push(seeded(n));
+          }
+        });
+      }
+      if (lockedModNames.length <= slotLimit) starts.push(seeded(null));
+      if (!starts.length) {
+        throw new Error('Too many locked mods: ' + lockedModNames.length +
+          ' locks for ' + slotLimit + ' slots' +
+          (routes.exilus ? ' + exilus' : '') + '.');
+      }
+      return starts;
+    }
+
+    var mainRun = runSearch(scoreState, lockedStartStates());
     var chosenEv = mainRun.ev;
 
-    // Cheapest variant: same search, cost weights dominant (fewest mods,
-    // then fewest Forma, then fewest shards), restricted to states that
-    // meet every At-least target the main result met (shortfall no
-    // worse) and stay within 0.05 of its Closest distance.
-    var cheapestEv = null;
-    if (targetedStats.length) {
-      var cheapScore = function (tg, achieved, fit, state) {
-        var base = scoreState(tg, achieved, fit, state);
-        // Cost order per the brief: fewest MODS dominate everything,
-        // then fewest Forma, then fewest shards; other pieces only
-        // break exact ties (a mod must never lose to shard costs).
-        var cost = modCount(state) * 10000 + fit.formaUsed * 100 +
-                   (fit.umbraFormaUsed || 0) * 100 + state.shards.length * 10 +
-                   state.fusions.length * 5 + state.arcanes.length +
-                   (state.tome ? 1 : 0) + (state.aura ? 1 : 0) +
-                   (state.helmet ? 1 : 0) + (state.subsume ? 1 : 0);
-        return {
-          score: base.shortfall * 1e9 + base.closestDist * 1e5 + cost +
-                 (fit.valid ? 0 : 1e10),
-          shortfall: base.shortfall, closestDist: base.closestDist
-        };
+    // ---- v1.1 lock capacity trim -------------------------------------
+    // The search never re-ranks a locked mod. If NO valid fitting
+    // exists at the locked ranks, trim locked ranks (largest drain
+    // first) to the highest ranks that fit, and report each trim.
+    var trimNotes = [];
+    if (lockedModNames.length && !chosenEv.fit.valid) {
+      var rankIn = function (st, n) {
+        if (st.mods[n] != null) return st.mods[n];
+        if (st.exilusMod && st.exilusMod.name === n) return st.exilusMod.rank;
+        return null;
       };
-      var mainShortfall = chosenEv.shortfall;
-      var mainClosest = chosenEv.closestDist || 0;
-      var cheapRun = runSearch(cheapScore, function (ev) {
-        return ev.shortfall <= mainShortfall + 1e-9 &&
-               ev.closestDist <= mainClosest + 0.05;
-      });
-      if (!cheapRun.fellBack &&
-          stateSignature(cheapRun.ev.state) !== stateSignature(chosenEv.state)) {
-        cheapestEv = cheapRun.ev;
+      var setRankIn = function (st, n, r) {
+        if (st.mods[n] != null) st.mods[n] = r;
+        else if (st.exilusMod && st.exilusMod.name === n) st.exilusMod.rank = r;
+      };
+      var tst = clone(chosenEv.state);
+      var beforeRanks = {};
+      lockedModNames.forEach(function (n) { beforeRanks[n] = rankIn(tst, n); });
+      var tev = chosenEv, trimGuard = 0;
+      while (!tev.fit.valid && trimGuard++ < 500) {
+        var pickName = null, pickDrain = -1;
+        lockedModNames.forEach(function (n) {
+          var r = rankIn(tst, n);
+          if (r == null || r <= 0) return;
+          var d = modDrainAt(ctx.modByName[n], r);
+          if (d > pickDrain) { pickDrain = d; pickName = n; }
+        });
+        if (!pickName) break;
+        setRankIn(tst, pickName, rankIn(tst, pickName) - 1);
+        tev = evaluateWith(tst, scoreState);
       }
+      lockedModNames.forEach(function (n) {
+        var after = rankIn(tst, n);
+        if (after != null && beforeRanks[n] != null && after < beforeRanks[n]) {
+          trimNotes.push('Locked ' + n + ' rank reduced ' + beforeRanks[n] +
+            '→' + after + ' to fit capacity');
+        }
+      });
+      if (trimNotes.length) chosenEv = tev;
     }
+
+    // ---- v1.1 fill phase ----------------------------------------------
+    // From the best target arrangement, spend ONLY leftover resources
+    // (empty slots, spare capacity, leftover Forma incl. Umbra rules,
+    // unspent wallet shards, free arcane slots) to raise the Maximize
+    // stats lexicographically by priority. A fill move is accepted
+    // only if it does not worsen ANY target outcome vs the anchor
+    // (at-least floors stay met / no worse, closest distances do not
+    // grow) and strictly improves the Maximize vector. Greedy:
+    // each iteration takes the single best move (vector first, then
+    // fewest new slots, then lowest added drain).
+    function maximizeVector(ach) {
+      return maximizeList.map(function (m) { return ach[m.stat]; });
+    }
+    function vecGreater(a, b) {
+      for (var i = 0; i < a.length; i++) {
+        if (a[i] > b[i] + 1e-9) return true;
+        if (a[i] < b[i] - 1e-9) return false;
+      }
+      return false;
+    }
+    function guardOk(evNew, anchor) {
+      for (var i = 0; i < targetedStats.length; i++) {
+        var stat = targetedStats[i], t = targets[stat];
+        if (t.mode === 'atleast') {
+          if (anchor.achieved[stat] >= t.value - 1e-9) {
+            if (evNew.achieved[stat] < t.value - 1e-9) return false;
+          } else if (evNew.achieved[stat] < anchor.achieved[stat] - 1e-9) return false;
+        } else if (t.mode === 'closest') {
+          if (Math.abs(evNew.achieved[stat] - t.value) >
+              Math.abs(anchor.achieved[stat] - t.value) + 1e-9) return false;
+        }
+      }
+      return true;
+    }
+    // Fill-only move shapes the add-only expander cannot express:
+    // rank-ups of placed (non-locked) mods and replacements of a
+    // placed (non-locked) mod by a Maximize candidate.
+    function fillExtraMoves(state) {
+      var out = [];
+      Object.keys(state.mods).forEach(function (name) {
+        if (lockedNameSet[name]) return;
+        var c = FILL.byName[name];
+        if (c) c.ranks.forEach(function (r) {
+          if (r > state.mods[name]) {
+            var ns = clone(state); ns.mods[name] = r; out.push(ns);
+          }
+        });
+      });
+      if (state.exilusMod && !lockedNameSet[state.exilusMod.name]) {
+        var ce = FILL.byName[state.exilusMod.name];
+        if (ce) ce.ranks.forEach(function (r) {
+          if (r > state.exilusMod.rank) {
+            var ns = clone(state); ns.exilusMod.rank = r; out.push(ns);
+          }
+        });
+      }
+      Object.keys(state.mods).forEach(function (nameA) {
+        if (lockedNameSet[nameA]) return;
+        FILL.mods.forEach(function (c) {
+          if (c.mod.name === nameA) return;
+          var base = clone(state);
+          delete base.mods[nameA];
+          if (!canPlace(base, c.mod)) return;
+          c.ranks.forEach(function (r) {
+            var ns = clone(base); ns.mods[c.mod.name] = r; out.push(ns);
+          });
+        });
+      });
+      if (state.exilusMod && !lockedNameSet[state.exilusMod.name] && routes.exilus) {
+        FILL.mods.forEach(function (c) {
+          if (!c.mod.exilus || c.mod.name === state.exilusMod.name) return;
+          var base = clone(state);
+          base.exilusMod = null;
+          if (!canPlace(base, c.mod)) return;
+          c.ranks.forEach(function (r) {
+            var ns = clone(base);
+            ns.exilusMod = { name: c.mod.name, rank: r };
+            out.push(ns);
+          });
+        });
+      }
+      return out;
+    }
+    function fillPhase(anchorEv) {
+      var cur = anchorEv;
+      var changed = false;
+      for (var iter = 0; iter < 40; iter++) {
+        var moves = expand(cur.state, FILL).concat(fillExtraMoves(cur.state));
+        var best = null;
+        moves.forEach(function (ns) {
+          var ev = evaluateWith(ns, scoreState);
+          if (!ev.fit.valid) return;
+          if (!guardOk(ev, anchorEv)) return;
+          if (!vecGreater(maximizeVector(ev.achieved), maximizeVector(cur.achieved))) return;
+          var cand = {
+            ev: ev,
+            slotsDelta: modCount(ns) - modCount(cur.state),
+            drainDelta: ev.fit.capacityUsed - cur.fit.capacityUsed
+          };
+          if (!best) { best = cand; return; }
+          var va = maximizeVector(cand.ev.achieved), vb = maximizeVector(best.ev.achieved);
+          var cmp = 0;
+          for (var i = 0; i < va.length; i++) {
+            if (va[i] > vb[i] + 1e-9) { cmp = 1; break; }
+            if (va[i] < vb[i] - 1e-9) { cmp = -1; break; }
+          }
+          if (cmp > 0 ||
+              (cmp === 0 && (cand.slotsDelta < best.slotsDelta ||
+                (cand.slotsDelta === best.slotsDelta &&
+                 cand.drainDelta < best.drainDelta - 1e-9)))) {
+            best = cand;
+          }
+        });
+        if (!best) break;
+        cur = best.ev;
+        changed = true;
+      }
+      return { ev: cur, changed: changed };
+    }
+
+    var anchorEv = chosenEv;
+    var filledEv = chosenEv, fillChanged = false;
+    if (maximizeList.length && FILL && anchorEv.fit.valid) {
+      var fillRes = fillPhase(anchorEv);
+      filledEv = fillRes.ev;
+      fillChanged = fillRes.changed &&
+        stateSignature(filledEv.state) !== stateSignature(anchorEv.state);
+    }
+    chosenEv = filledEv;
+
+    // Piece origins (v1.1): 'target' for pieces the target solve
+    // chose (same piece, same rank), 'fill' for anything the fill
+    // phase added or re-ranked.
+    function computeOrigins(anchorState, finalState) {
+      var modOrigin = {};
+      Object.keys(finalState.mods).forEach(function (n) {
+        modOrigin[n] = (anchorState.mods[n] === finalState.mods[n]) ? 'target' : 'fill';
+      });
+      if (finalState.exilusMod) {
+        modOrigin[finalState.exilusMod.name] =
+          (anchorState.exilusMod && anchorState.exilusMod.name === finalState.exilusMod.name &&
+           anchorState.exilusMod.rank === finalState.exilusMod.rank) ? 'target' : 'fill';
+      }
+      function multiset(list, keyFn) {
+        var m = {};
+        list.forEach(function (x) { var k = keyFn(x); m[k] = (m[k] || 0) + 1; });
+        return m;
+      }
+      var anchorShards = multiset(anchorState.shards, function (s) {
+        return s.colour + '|' + s.tier + '|' + s.stat;
+      });
+      var shardOrigins = finalState.shards.map(function (s) {
+        var k = s.colour + '|' + s.tier + '|' + s.stat;
+        if (anchorShards[k] > 0) { anchorShards[k]--; return 'target'; }
+        return 'fill';
+      });
+      var anchorArcanes = multiset(anchorState.arcanes, function (n) { return n; });
+      var arcaneOrigins = {};
+      finalState.arcanes.forEach(function (n) {
+        if (anchorArcanes[n] > 0) { anchorArcanes[n]--; arcaneOrigins[n] = 'target'; }
+        else arcaneOrigins[n] = 'fill';
+      });
+      return {
+        mods: modOrigin,
+        shards: shardOrigins,
+        arcanes: arcaneOrigins,
+        aura: finalState.aura
+          ? (finalState.aura === anchorState.aura ? 'target' : 'fill') : null,
+        tome: finalState.tome
+          ? (finalState.tome === anchorState.tome ? 'target' : 'fill') : null,
+        helmet: finalState.helmet
+          ? (finalState.helmet === anchorState.helmet ? 'target' : 'fill') : null,
+        subsume: finalState.subsume
+          ? (anchorState.subsume && anchorState.subsume.ability === finalState.subsume.ability
+             ? 'target' : 'fill') : null
+      };
+    }
+    var origins = fillChanged ? computeOrigins(anchorEv.state, chosenEv.state) : null;
 
     // Set-bonus report for a finished state: pieces counted across the
     // focus item and cross-gear support pieces. Parsed bonuses that map
@@ -1152,9 +1666,12 @@
       return out.sort(function (a, b) { return a.set < b.set ? -1 : 1; });
     }
 
-    function buildResult(evRes) {
+    function buildResult(evRes, org) {
       var st = evRes.state;
       var rNotes = [];
+      var originOf = function (n) {
+        return (org && org.mods && org.mods[n]) || 'target';
+      };
       if (kind === 'necramech') {
         rNotes.push('Necramech solve: 12 mod slots, capacity = rank cap x 2 ' +
           '(80 at rank 40), Necramech mod pool only — Necramechs have no ' +
@@ -1236,7 +1753,7 @@
         } else {
           unknownCost.push(n);
         }
-        return { name: n, rank: rank, slot: slot, rankCost: rc };
+        return { name: n, rank: rank, slot: slot, rankCost: rc, origin: originOf(n) };
       }
       var costedMods = Object.keys(st.mods).sort().map(function (n) {
         return costedEntry(n, st.mods[n], 'normal');
@@ -1247,13 +1764,59 @@
           'excludes them.');
       }
 
+      // Ordered slot list (v1.1): derived from the fit's slotInfo —
+      // the single source of truth for placement, final polarity and
+      // effective drain. Aura first (kind 'aura'), then the normal
+      // slots in slot order, then the exilus slot when the route is on
+      // or a mod sits in it. Aura effectiveDrain is negative: an aura
+      // GRANTS capacity instead of draining it.
+      var slots = [];
+      if (kind === 'warframe') {
+        var aRec = st.aura ? ctx.auraByName[st.aura] : null;
+        slots.push({
+          kind: 'aura', fitSlot: null, mod: st.aura || null,
+          rank: aRec ? aRec.maxRank : null,
+          slotPolarity: frame.AuraPolarity || null,
+          innatePolarity: frame.AuraPolarity || null,
+          formaApplied: false, umbraFormaApplied: false,
+          effectiveDrain: st.aura ? -auraCapacityBonus(ctx, frame, st.aura) : 0,
+          origin: org ? org.aura : 'target'
+        });
+      }
+      (evRes.fit.slotInfo || []).forEach(function (info) {
+        var isExilus = kind === 'warframe' && info.slot === slotLimit;
+        slots.push({
+          kind: isExilus ? 'exilus' : 'normal', fitSlot: info.slot,
+          mod: info.mod, rank: info.rank,
+          slotPolarity: info.polarity, innatePolarity: info.innatePolarity,
+          formaApplied: info.formaApplied,
+          umbraFormaApplied: info.umbraFormaApplied,
+          effectiveDrain: info.effectiveDrain,
+          origin: info.mod ? originOf(info.mod) : 'target'
+        });
+      });
+      if (kind === 'warframe' && routes.exilus && !st.exilusMod) {
+        slots.push({
+          kind: 'exilus', fitSlot: slotLimit, mod: null, rank: null,
+          slotPolarity: null, innatePolarity: null,
+          formaApplied: false, umbraFormaApplied: false,
+          effectiveDrain: 0, origin: 'target'
+        });
+      }
+      slots.forEach(function (s, i) { s.index = i; });
+
       return {
         achieved: achieved,
         arrangement: {
           mods: costedMods,
+          slots: slots,
+          origins: org || null,
           aura: st.aura || null,
           arcanes: st.arcanes.slice(),
-          shards: st.shards.map(function (s) { return { colour: s.colour, tier: s.tier, stat: s.stat }; }),
+          shards: st.shards.map(function (s, i) {
+            return { colour: s.colour, tier: s.tier, stat: s.stat,
+                     origin: org ? org.shards[i] : 'target' };
+          }),
           tome: st.tome || null,
           helmet: st.helmet || null,
           subsume: st.subsume ? {
@@ -1273,13 +1836,51 @@
       };
     }
 
-    var result = buildResult(chosenEv);
+    var result = buildResult(chosenEv, origins);
     if (mainRun.fellBack) {
       result.notes.unshift('No arrangement within the Forma budget fits the mod capacity; showing the best-scoring arrangement, which exceeds capacity.');
     }
+    trimNotes.forEach(function (n) { result.notes.push(n); });
+    if (lockedModNames.length || lockedArcaneNames.length) {
+      var lockNames = lockedModNames.concat(lockedArcaneNames);
+      result.unmetTargets.forEach(function (u) {
+        result.notes.push('Locked piece(s) ' + lockNames.join(', ') +
+          ' are fixed in this build; with them, ' + u.stat +
+          ' tops out at ' + u.achieved + ' (target ' + u.target + ').');
+      });
+    }
+    // v1.1: pieces the fill phase added (origin 'fill'), in kind order.
+    result.fillPieces = [];
+    if (origins) {
+      Object.keys(origins.mods).forEach(function (n) {
+        if (origins.mods[n] === 'fill') result.fillPieces.push({ kind: 'mod', name: n });
+      });
+      Object.keys(origins.arcanes).forEach(function (n) {
+        if (origins.arcanes[n] === 'fill') result.fillPieces.push({ kind: 'arcane', name: n });
+      });
+      origins.shards.forEach(function (o, i) {
+        if (o !== 'fill') return;
+        var sh = chosenEv.state.shards[i];
+        result.fillPieces.push({ kind: 'shard', name: sh.colour + ' Archon Shard' });
+      });
+      if (origins.aura === 'fill') result.fillPieces.push({ kind: 'aura', name: chosenEv.state.aura });
+      if (origins.tome === 'fill') result.fillPieces.push({ kind: 'tome', name: chosenEv.state.tome });
+      if (origins.helmet === 'fill') result.fillPieces.push({ kind: 'helmet', name: chosenEv.state.helmet });
+      if (origins.subsume === 'fill' && chosenEv.state.subsume) {
+        result.fillPieces.push({ kind: 'subsume', name: chosenEv.state.subsume.ability });
+      }
+      result.notes.push('Fill phase (Maximize: ' +
+        maximizeList.map(function (m) { return m.stat; }).join(', ') +
+        ') spent leftover slots/capacity/Forma on ' + result.fillPieces.length +
+        ' piece(s): ' + result.fillPieces.map(function (p) { return p.name; }).join(', ') +
+        '. The pre-fill build is reported as the cheapest variant.');
+    }
+    // Cheapest (v1.1 redefinition): the NO-FILL solve (targets only)
+    // when the fill phase changed the build; null when identical.
+    // This supersedes the v1.0 cost-dominant re-run semantic.
     result.cheapest = null;
-    if (cheapestEv) {
-      var ch = buildResult(cheapestEv);
+    if (fillChanged) {
+      var ch = buildResult(anchorEv, null);
       result.cheapest = {
         achieved: ch.achieved, arrangement: ch.arrangement,
         setBonuses: ch.setBonuses, unmetTargets: ch.unmetTargets,
@@ -1289,8 +1890,124 @@
     return result;
   }
 
+  // ---- forward evaluator (v1.1, for the board editor) ------------------
+  // evaluateFrame(data, frameName, orderedPieces) scores ONE given
+  // arrangement with the solver's own forward math (contributions +
+  // achievedFrom + fitCapacity — no second implementation).
+  // orderedPieces = {
+  //   slots: [{kind: 'aura'|'normal'|'exilus', mod, rank}],  // board order
+  //   arcanes: [name], shards: [{colour, tier, stat}],
+  //   tome, helmet, subsume: {ability, fromFrame, replacedAbility},
+  //   conditional, formaBudget, umbraForma, reactor,
+  //   itemKind, companionEntry, ownerStats, supportSetPieces,
+  //   extraModRecords: {name: record}  // stat-less pool mods
+  // } -> {achieved, capacityUsed, capacityMax, formaUsed,
+  //       umbraFormaUsed, valid, warnings}
+  function evaluateFrame(data, frameName, pieces) {
+    pieces = pieces || {};
+    var ctx = buildContext(data);
+    var resolved = resolveItem(ctx, {
+      itemKind: pieces.itemKind, frameName: frameName,
+      companionEntry: pieces.companionEntry, ownerStats: pieces.ownerStats
+    });
+    var frame = resolved.frame;
+    Object.keys(pieces.extraModRecords || {}).forEach(function (name) {
+      if (!ctx.modByName[name]) {
+        var rec = lockRecordNormalize(pieces.extraModRecords[name], name);
+        if (rec) {
+          ctx.modByName[name] = rec;
+          if (rec.set) ctx.setOfMod[name] = rec.set;
+        }
+      }
+    });
+    var routes = {
+      mods: true, arcanes: true, shards: true, aura: true, exilus: true,
+      tome: true, conditional: !!pieces.conditional,
+      legacyHelmets: true, helminth: true
+    };
+    var warnings = [];
+    var st = emptyState(null);
+    st._helmetFrame = frameName;
+    (pieces.slots || []).forEach(function (s) {
+      if (!s || !s.mod) return;
+      if (s.kind === 'aura') { st.aura = s.mod; return; }
+      var rec = ctx.modByName[s.mod];
+      if (!rec) {
+        warnings.push('Unknown mod "' + s.mod + '" ignored — not in the ' +
+          'solver pool (pass its record via extraModRecords to include it).');
+        return;
+      }
+      var rank = (typeof s.rank === 'number')
+        ? Math.max(0, Math.min(rec.maxRank, Math.round(s.rank))) : rec.maxRank;
+      if (s.kind === 'exilus') {
+        if (st.exilusMod) {
+          warnings.push('Two mods in the exilus slot; "' + s.mod + '" ignored.');
+          return;
+        }
+        if (!rec.exilus) {
+          warnings.push('"' + s.mod + '" is not exilus-flagged but sits in the exilus slot.');
+        }
+        st.exilusMod = { name: s.mod, rank: rank };
+      } else {
+        if (st.mods[s.mod] != null) {
+          warnings.push('Duplicate mod "' + s.mod + '" counted once.');
+          return;
+        }
+        st.mods[s.mod] = rank;
+      }
+    });
+    st.arcanes = (pieces.arcanes || []).slice();
+    if (st.arcanes.length > 2) {
+      warnings.push('More than 2 arcanes listed; extras ignored.');
+      st.arcanes = st.arcanes.slice(0, 2);
+    }
+    st.arcanes.forEach(function (n) {
+      if (!ctx.arcanes.some(function (a) { return a.name === n; })) {
+        warnings.push('Arcane "' + n + '" has no modelled effects; it occupies a slot only.');
+      }
+    });
+    (pieces.shards || []).forEach(function (sh) {
+      var pick = null;
+      ctx.shardPicks.forEach(function (p) {
+        if (p.colour === sh.colour && p.stat === sh.stat) pick = p;
+      });
+      if (!pick) {
+        warnings.push('No shard bonus for ' + sh.colour + ' / ' + sh.stat + '; shard ignored.');
+        return;
+      }
+      st.shards.push({
+        colour: sh.colour, tier: sh.tier, stat: sh.stat, unit: pick.unit,
+        value: sh.tier === 'tauforged' ? pick.tauforged : pick.normal
+      });
+    });
+    if (pieces.tome) st.tome = pieces.tome;
+    if (pieces.helmet) st.helmet = pieces.helmet;
+    if (pieces.subsume) st.subsume = pieces.subsume;
+    var sums = contributions(ctx, st, routes, pieces.supportSetPieces);
+    var achievedRaw = achievedFrom(ctx, frame, sums);
+    var fit = fitCapacity(ctx, frame, st,
+      pieces.formaBudget != null ? pieces.formaBudget : 'any',
+      pieces.reactor !== false, pieces.umbraForma || 0);
+    if (!fit.valid) {
+      warnings.push('Capacity exceeded: ' + fit.capacityUsed +
+        ' used / ' + fit.capacityMax + ' max.');
+    }
+    var achieved = {};
+    ALL_STATS.forEach(function (k) { achieved[k] = round2(achievedRaw[k]); });
+    return {
+      achieved: achieved,
+      capacityUsed: fit.capacityUsed,
+      capacityMax: fit.capacityMax,
+      formaUsed: fit.formaUsed,
+      umbraFormaUsed: fit.umbraFormaUsed || 0,
+      valid: fit.valid,
+      warnings: warnings
+    };
+  }
+
   var Solver = {
     solve: solve,
+    evaluateFrame: evaluateFrame,
     _internal: {
       UT_TO_STAT: UT_TO_STAT,
       SHARD_STAT_MAP: SHARD_STAT_MAP,

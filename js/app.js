@@ -9,6 +9,13 @@
  * Primary / Secondary / Melee / Archgun / Archmelee / Companion Weapon /
  * Kitgun / Zaw (weapon solver; Kitguns and Zaws are assembled from
  * parts by modular.js first), Amp (modular.js arcane solve).
+ *
+ * v1.1 (E2): Maximize targets + priorities, damage-type targets
+ * (dmg:<Type>), per-category mod/arcane locks over the FULL mod pool
+ * (data/modpool.json), and the Results build board: an editable,
+ * slot-ordered rendering of arrangement.slots whose every edit is
+ * re-scored by the solvers' own forward evaluators
+ * (Solver.evaluateFrame / WeaponSolver.evaluateWeapon).
  */
 (function () {
   'use strict';
@@ -38,6 +45,14 @@
     { key: 'reload', label: 'Reload (s)', lowerBetter: true },
     { key: 'punchThrough', label: 'Punch through' }
   ];
+  // Damage-type targets (v1.1): weaponSolver stat keys 'dmg:<Type>' —
+  // final per-shot amount of each type after combining.
+  var DMG_TYPES = ['Impact', 'Puncture', 'Slash', 'Heat', 'Cold',
+    'Electric', 'Toxin', 'Blast', 'Corrosive', 'Gas', 'Magnetic',
+    'Radiation', 'Viral', 'Void'];
+  var DMG_STATS = DMG_TYPES.map(function (t) {
+    return { key: 'dmg:' + t, label: t };
+  });
   var AMP_STATS = [
     { key: 'damage', label: 'Damage' },
     { key: 'critChance', label: 'Crit chance (%)', frac: true },
@@ -157,7 +172,7 @@
   // ---- state -----------------------------------------------------------------
   function emptyTargets(stats) {
     var t = {};
-    stats.forEach(function (s) { t[s.key] = { mode: 'dontcare', value: '' }; });
+    stats.forEach(function (s) { t[s.key] = { mode: 'dontcare', value: '', priority: '' }; });
     return t;
   }
   function defaultState() {
@@ -169,7 +184,7 @@
     ROUTES_FRAME.forEach(function (r) { routesFrame[r.key] = r.def; });
     ROUTES_WEAPON.forEach(function (r) { routesWeapon[r.key] = r.def; });
     return {
-      version: 2,
+      version: 3,
       category: 'Warframe',
       selections: {
         Warframe: null, Necramech: null, Companion: null,
@@ -186,7 +201,12 @@
       attackByItem: {},
       frameTargets: emptyTargets(FRAME_STATS),
       weaponTargets: emptyTargets(WEAPON_STATS),
+      dmgTargets: emptyTargets(DMG_STATS),
       ampTargets: emptyTargets(AMP_STATS),
+      // v1.1: per-category locks {catId: {mods: [{name, rank}],
+      // arcanes: [name]}} and the current board (see serializeBoard).
+      locks: {},
+      board: null,
       routesFrame: routesFrame,
       routesWeapon: routesWeapon,
       ampConditional: true,
@@ -206,10 +226,54 @@
     Object.keys(base).forEach(function (k) {
       var t = saved[k];
       if (t && typeof t === 'object') {
-        if (['dontcare', 'closest', 'atleast'].indexOf(t.mode) >= 0) base[k].mode = t.mode;
+        if (['dontcare', 'closest', 'atleast', 'maximize'].indexOf(t.mode) >= 0) base[k].mode = t.mode;
         if (t.value != null) base[k].value = t.value;
+        if (t.priority != null) base[k].priority = t.priority;
       }
     });
+  }
+  // v1.1 saved locks: {catId: {mods: [{name, rank}], arcanes: [name]}} —
+  // shape-checked entry by entry; anything malformed is dropped.
+  function mergeLocks(base, saved) {
+    if (!saved || typeof saved !== 'object') return;
+    Object.keys(saved).forEach(function (catId) {
+      var L = saved[catId];
+      if (!L || typeof L !== 'object') return;
+      var entry = { mods: [], arcanes: [] };
+      (Array.isArray(L.mods) ? L.mods : []).forEach(function (m) {
+        if (m && typeof m.name === 'string') {
+          var r = parseInt(m.rank, 10);
+          entry.mods.push({ name: m.name, rank: Number.isInteger(r) && r >= 0 ? r : 0 });
+        }
+      });
+      (Array.isArray(L.arcanes) ? L.arcanes : []).forEach(function (n) {
+        if (typeof n === 'string') entry.arcanes.push(n);
+      });
+      if (entry.mods.length || entry.arcanes.length) base[catId] = entry;
+    });
+  }
+  // v1.1 saved board: {kind, catId, itemKey, slots: [{kind, mod, rank}],
+  // extras} — kept only when every slot is shape-valid.
+  function mergeBoard(saved) {
+    if (!saved || typeof saved !== 'object') return null;
+    if (saved.kind !== 'frame' && saved.kind !== 'weapon') return null;
+    if (typeof saved.catId !== 'string' || typeof saved.itemKey !== 'string') return null;
+    if (!Array.isArray(saved.slots) || !saved.slots.length) return null;
+    var kinds = { aura: 1, stance: 1, normal: 1, exilus: 1 };
+    var slots = [];
+    for (var i = 0; i < saved.slots.length; i++) {
+      var s = saved.slots[i];
+      if (!s || !kinds[s.kind]) return null;
+      if (s.mod != null && typeof s.mod !== 'string') return null;
+      var r = s.rank == null ? null : parseInt(s.rank, 10);
+      if (r != null && (!Number.isInteger(r) || r < 0)) return null;
+      slots.push({ kind: s.kind, mod: s.mod || null, rank: r });
+    }
+    return {
+      kind: saved.kind, catId: saved.catId, itemKey: saved.itemKey,
+      slots: slots,
+      extras: (saved.extras && typeof saved.extras === 'object') ? saved.extras : {}
+    };
   }
   function mergeRoutes(base, saved) {
     if (!saved || typeof saved !== 'object') return;
@@ -222,7 +286,7 @@
   function mergeState(base, saved) {
     if (!saved || typeof saved !== 'object') return base;
     try {
-      if (saved.version === 2) {
+      if (saved.version === 2 || saved.version === 3) {
         if (catOf(saved.category).id === saved.category) base.category = saved.category;
         if (saved.selections) {
           Object.keys(base.selections).forEach(function (k) {
@@ -247,7 +311,10 @@
         }
         mergeTargets(base.frameTargets, saved.frameTargets);
         mergeTargets(base.weaponTargets, saved.weaponTargets);
+        mergeTargets(base.dmgTargets, saved.dmgTargets);
         mergeTargets(base.ampTargets, saved.ampTargets);
+        mergeLocks(base.locks, saved.locks);
+        base.board = mergeBoard(saved.board);
         mergeRoutes(base.routesFrame, saved.routesFrame);
         mergeRoutes(base.routesWeapon, saved.routesWeapon);
         if (typeof saved.ampConditional === 'boolean') base.ampConditional = saved.ampConditional;
@@ -476,7 +543,7 @@
       var tdMode = el('td');
       var sel = document.createElement('select');
       sel.id = prefix + '-mode-' + s.key;
-      [['dontcare', "Don't care"], ['closest', 'Closest'], ['atleast', 'At least']].forEach(function (pair) {
+      [['dontcare', "Don't care"], ['closest', 'Closest'], ['atleast', 'At least'], ['maximize', 'Maximize']].forEach(function (pair) {
         var o = document.createElement('option');
         o.value = pair[0]; o.textContent = pair[1];
         sel.appendChild(o);
@@ -488,6 +555,14 @@
       inp.type = 'number'; inp.id = prefix + '-val-' + s.key; inp.step = 'any';
       tdVal.appendChild(inp);
       tr.appendChild(tdVal);
+      var tdPrio = el('td');
+      var prio = document.createElement('input');
+      prio.type = 'number'; prio.min = '1'; prio.step = '1';
+      prio.className = 'prio-input';
+      prio.id = prefix + '-prio-' + s.key;
+      prio.title = 'Maximize priority (1 = fill this stat first; blank = row order)';
+      tdPrio.appendChild(prio);
+      tr.appendChild(tdPrio);
       tbody.appendChild(tr);
     });
   }
@@ -506,6 +581,7 @@
   function buildControls() {
     buildTargetRows($('targets-frame-table').querySelector('tbody'), FRAME_STATS, 'ftgt');
     buildTargetRows($('targets-weapon-table').querySelector('tbody'), WEAPON_STATS, 'wtgt');
+    buildTargetRows($('targets-damage-table').querySelector('tbody'), DMG_STATS, 'dtgt');
     buildTargetRows($('targets-amp-table').querySelector('tbody'), AMP_STATS, 'atgt');
     buildRouteChecks($('route-checks-frame'), ROUTES_FRAME, 'route', null);
     buildRouteChecks($('route-checks-weapon'), ROUTES_WEAPON, 'wroute', null);
@@ -593,20 +669,30 @@
   // ---- UI <-> state ---------------------------------------------------------------
   function applyTargetsToUI(store, prefix) {
     Object.keys(store).forEach(function (k) {
-      var mode = $(prefix + '-mode-' + k), val = $(prefix + '-val-' + k);
+      var mode = $(prefix + '-mode-' + k), val = $(prefix + '-val-' + k),
+          prio = $(prefix + '-prio-' + k);
       if (!mode || !val) return;
       mode.value = store[k].mode;
       val.value = store[k].value;
-      val.disabled = store[k].mode === 'dontcare';
+      // A target value only matters for Closest / At least; Maximize
+      // uses the priority column instead.
+      val.disabled = store[k].mode === 'dontcare' || store[k].mode === 'maximize';
+      if (prio) {
+        prio.value = store[k].priority == null ? '' : store[k].priority;
+        prio.disabled = store[k].mode !== 'maximize';
+      }
     });
   }
   function readTargetsFromUI(store, prefix) {
     Object.keys(store).forEach(function (k) {
-      var mode = $(prefix + '-mode-' + k), val = $(prefix + '-val-' + k);
+      var mode = $(prefix + '-mode-' + k), val = $(prefix + '-val-' + k),
+          prio = $(prefix + '-prio-' + k);
       if (!mode || !val) return;
       store[k].mode = mode.value;
       store[k].value = val.value;
-      val.disabled = store[k].mode === 'dontcare';
+      if (prio) store[k].priority = prio.value;
+      val.disabled = store[k].mode === 'dontcare' || store[k].mode === 'maximize';
+      if (prio) prio.disabled = store[k].mode !== 'maximize';
     });
   }
   function applyStateToUI() {
@@ -624,6 +710,7 @@
     }
     applyTargetsToUI(state.frameTargets, 'ftgt');
     applyTargetsToUI(state.weaponTargets, 'wtgt');
+    applyTargetsToUI(state.dmgTargets, 'dtgt');
     applyTargetsToUI(state.ampTargets, 'atgt');
     ROUTES_FRAME.forEach(function (r) {
       var cb = $('route-' + r.key);
@@ -695,6 +782,7 @@
     }
     readTargetsFromUI(state.frameTargets, 'ftgt');
     readTargetsFromUI(state.weaponTargets, 'wtgt');
+    readTargetsFromUI(state.dmgTargets, 'dtgt');
     readTargetsFromUI(state.ampTargets, 'atgt');
     ROUTES_FRAME.forEach(function (r) {
       var cb = $('route-' + r.key);
@@ -1019,6 +1107,7 @@
     var cat = currentCat();
     $('targets-frame-wrap').hidden = !isFrameKind(cat.kind);
     $('targets-weapon-wrap').hidden = !isWeaponKind(cat.kind);
+    $('targets-damage-wrap').hidden = !isWeaponKind(cat.kind);
     $('targets-amp-wrap').hidden = cat.kind !== 'amp';
     if (cat.kind === 'companion') {
       // Companion solves use the pool-stat subset of the frame table.
@@ -1040,6 +1129,7 @@
 
   function refreshRoutes() {
     var cat = currentCat();
+    refreshLocksUI();
     var framePanel = isFrameKind(cat.kind);
     $('routes-frame-panel').hidden = !framePanel;
     $('routes-weapon-panel').hidden = !isWeaponKind(cat.kind);
@@ -1083,6 +1173,8 @@
     refreshTargets();
     refreshRoutes();
     renderViewer();
+    // The board hides itself when it belongs to another category/item.
+    if (boardCur) refreshBoardUI();
   }
 
   // ---- tabs ---------------------------------------------------------------------
@@ -1093,6 +1185,215 @@
     document.querySelectorAll('section.tab').forEach(function (s) {
       s.classList.toggle('active', s.id === 'tab-' + name);
     });
+  }
+
+  // ---- mod pool + locks (v1.1) ---------------------------------------------------
+  // SITE.modpool (data/modpool.json) is the FULL mod list — the pickers
+  // and extraModRecords are built from it because the solver pools
+  // (mods.json) omit the ~812 mods with no derived effects, and those
+  // are exactly the mods a player locks in by hand.
+  function modpoolRec(name) {
+    return (SITE.modpoolByName && SITE.modpoolByName[name]) || null;
+  }
+  // The mod Types legal on the current item — mirrors the solvers' own
+  // pool rules (frame kinds by fixed/companion type sets; weapons via
+  // WeaponSolver's poolFor over the live bundle, taking the types of
+  // the mods it admits plus the weapon's own Name/Family types).
+  function pickerTypeSet() {
+    var cat = currentCat();
+    var set = {};
+    if (cat.kind === 'frame') { set.Warframe = 1; return set; }
+    if (cat.kind === 'necramech') { set.Necramech = 1; return set; }
+    if (cat.kind === 'companion') {
+      set.Companion = 1;
+      var comp = null, store = null;
+      try { comp = currentCompanion(); } catch (e) { comp = null; }
+      try { store = companionStoreEntry(); } catch (e) { store = null; }
+      var e = (comp && comp.companionEntry) || store;
+      if (e) {
+        if (e.Type) set[e.Type] = 1;
+        if (e.Name) set[e.Name] = 1;
+        if (e.Category === 'Sentinels') { set.Sentinel = 1; set.Robotic = 1; }
+        if (e.Type === 'MOA') { set.MOA = 1; set.Robotic = 1; }
+        if (e.Type === 'Hound') { set.Hound = 1; set.Robotic = 1; }
+        if (e.Category === 'Pets') set.Beast = 1;
+      }
+      return set;
+    }
+    if (isWeaponKind(cat.kind)) {
+      var w = null;
+      try { w = currentWeapon(); } catch (e2) { w = null; }
+      if (w) {
+        try {
+          var ctx = window.WeaponSolver._internal.buildContext(evalBundle());
+          var pool = window.WeaponSolver._internal.poolFor(ctx, w.entry);
+          pool.mods.forEach(function (m) { if (m.type) set[m.type] = 1; });
+        } catch (e3) { /* picker stays empty; the solver still validates */ }
+        if (w.entry.Name) set[w.entry.Name] = 1;
+        if (w.entry.Family) set[w.entry.Family] = 1;
+      }
+      return set;
+    }
+    return set;
+  }
+  // Names offered by the lock / swap-in pickers for the current item.
+  // Stance/posture records (negative baseDrain) are slot furniture,
+  // never normal-slot mods, so they are not offered.
+  function pickerModNames(exilusOnly) {
+    var types = pickerTypeSet();
+    var names = [];
+    ((SITE.modpool && SITE.modpool.mods) || []).forEach(function (m) {
+      if (!types[m.type]) return;
+      if ((m.baseDrain || 0) < 0) return;
+      if (exilusOnly && !m.exilus) return;
+      names.push(m.name);
+    });
+    if (currentCat().kind === 'companion') {
+      ((SITE.links && SITE.links.mods) || []).forEach(function (lm) {
+        if (names.indexOf(lm.name) < 0) names.push(lm.name);
+      });
+    }
+    return names.sort();
+  }
+  function arcanePickerNames() {
+    var cat = currentCat();
+    var out = [];
+    var w = null;
+    if (isWeaponKind(cat.kind)) {
+      try { w = currentWeapon(); } catch (e) { w = null; }
+      if (!w) return out;
+    }
+    (SITE.arcanes.arcanes || []).forEach(function (a) {
+      if (w) {
+        if (window.WeaponSolver._internal.arcaneTypeMatches(a, w.entry)) out.push(a.name);
+      } else if (a.type === 'Warframe') {
+        out.push(a.name);
+      }
+    });
+    return out.sort();
+  }
+  // extraModRecords for the solvers/evaluators: full records for mods
+  // the stat pools do not carry (stat-less locks and swap-ins). Records
+  // for pooled mods are ignored by the solvers' resolution order, so
+  // callers may pass every name they care about.
+  function extraRecordsFor(names) {
+    var out = {};
+    (names || []).forEach(function (name) {
+      var mp = modpoolRec(name);
+      if (!mp) return;
+      out[name] = {
+        name: mp.name, type: mp.type, polarity: mp.polarity,
+        baseDrain: mp.baseDrain || 0, maxRank: mp.maxRank || 0,
+        rarity: mp.rarity, exilus: !!mp.exilus, set: mp.set,
+        incompatible: mp.incompatible || [], effects: []
+      };
+    });
+    return Object.keys(out).length ? out : undefined;
+  }
+  function locksFor(catId) {
+    if (!state.locks[catId]) state.locks[catId] = { mods: [], arcanes: [] };
+    return state.locks[catId];
+  }
+  function isLockedMod(name) {
+    return locksFor(state.category).mods.some(function (L) { return L.name === name; });
+  }
+  function fillDatalist(dl, names) {
+    if (!dl) return;
+    dl.innerHTML = '';
+    names.forEach(function (n) {
+      var o = document.createElement('option');
+      o.value = n;
+      dl.appendChild(o);
+    });
+  }
+  function refreshLocksUI() {
+    var cat = currentCat();
+    $('locks-panel').hidden = cat.kind === 'amp';
+    if (cat.kind === 'amp') return;
+    fillDatalist($('lock-mod-list'), pickerModNames(false));
+    fillDatalist($('lock-arcane-list'), arcanePickerNames());
+    renderLockLists();
+  }
+  function renderLockLists() {
+    var lk = locksFor(state.category);
+    var ml = $('locked-mods-list');
+    ml.innerHTML = '';
+    lk.mods.forEach(function (L, i) {
+      var mp = modpoolRec(L.name);
+      var li = el('li', 'lock-row');
+      li.appendChild(el('span', null, '📌 ' + L.name + ' — rank ' + L.rank + '/' + (mp ? mp.maxRank : '?')));
+      var dn = el('button', null, '−'); dn.type = 'button';
+      dn.addEventListener('click', function () {
+        L.rank = Math.max(0, L.rank - 1); renderLockLists(); saveState();
+      });
+      var up = el('button', null, '+'); up.type = 'button';
+      up.addEventListener('click', function () {
+        L.rank = Math.min(mp ? mp.maxRank : L.rank, L.rank + 1); renderLockLists(); saveState();
+      });
+      var rm = el('button', null, 'Remove'); rm.type = 'button';
+      rm.addEventListener('click', function () {
+        lk.mods.splice(i, 1); renderLockLists(); saveState(); refreshBoardUI();
+      });
+      li.appendChild(dn); li.appendChild(up); li.appendChild(rm);
+      ml.appendChild(li);
+    });
+    if (!lk.mods.length) ml.appendChild(el('li', 'muted', 'No locked mods.'));
+    var al = $('locked-arcanes-list');
+    al.innerHTML = '';
+    lk.arcanes.forEach(function (name, i) {
+      var li = el('li', 'lock-row');
+      li.appendChild(el('span', null, '📌 ' + name));
+      var rm = el('button', null, 'Remove'); rm.type = 'button';
+      rm.addEventListener('click', function () {
+        lk.arcanes.splice(i, 1); renderLockLists(); saveState();
+      });
+      li.appendChild(rm);
+      al.appendChild(li);
+    });
+    if (!lk.arcanes.length) al.appendChild(el('li', 'muted', 'No locked arcanes.'));
+  }
+  function addLockFromSearch(kind) {
+    var cat = currentCat();
+    var lk = locksFor(cat.id);
+    if (kind === 'mod') {
+      var name = $('lock-mod-search').value.trim();
+      if (pickerModNames(false).indexOf(name) < 0) {
+        $('calc-status').textContent = '"' + name + '" is not a lockable mod for this category.';
+        return;
+      }
+      if (lk.mods.some(function (L) { return L.name === name; })) {
+        $('calc-status').textContent = name + ' is already locked.';
+        return;
+      }
+      var mp = modpoolRec(name);
+      lk.mods.push({ name: name, rank: mp ? mp.maxRank : 0 });
+      $('lock-mod-search').value = '';
+    } else {
+      var an = $('lock-arcane-search').value.trim();
+      if (arcanePickerNames().indexOf(an) < 0) {
+        $('calc-status').textContent = '"' + an + '" is not a lockable arcane for this category.';
+        return;
+      }
+      if (lk.arcanes.indexOf(an) >= 0) {
+        $('calc-status').textContent = an + ' is already locked.';
+        return;
+      }
+      lk.arcanes.push(an);
+      $('lock-arcane-search').value = '';
+    }
+    $('calc-status').textContent = '';
+    renderLockLists();
+    saveState();
+  }
+  // Attach the category's locks (if any) to a solve input.
+  function applyLocksToInput(input) {
+    var lk = locksFor(state.category);
+    if (lk.mods.length) {
+      input.lockedMods = lk.mods.map(function (L) { return { name: L.name, rank: L.rank }; });
+      var ex = extraRecordsFor(lk.mods.map(function (L) { return L.name; }));
+      if (ex) input.extraModRecords = ex;
+    }
+    if (lk.arcanes.length) input.lockedArcanes = lk.arcanes.slice();
   }
 
   // ---- solve plumbing ---------------------------------------------------------------
@@ -1148,13 +1449,41 @@
     stats.forEach(function (s) {
       var t = store[s.key];
       if (!t || t.mode === 'dontcare') return;
+      if (t.mode === 'maximize') {
+        // Maximize needs no value; an explicit priority wins, a blank
+        // one leaves the solver's default (row order).
+        var entry = { mode: 'maximize' };
+        var pr = parseInt(t.priority, 10);
+        if (Number.isInteger(pr) && pr >= 1) entry.priority = pr;
+        if (s.lowerBetter) entry.lowerBetter = true;
+        targets[s.key] = entry;
+        return;
+      }
       var v = parseFloat(t.value);
       if (isNaN(v)) return;
-      var entry = { mode: t.mode, value: v };
-      if (s.lowerBetter) entry.lowerBetter = true;
-      targets[s.key] = entry;
+      var entry2 = { mode: t.mode, value: v };
+      if (s.lowerBetter) entry2.lowerBetter = true;
+      targets[s.key] = entry2;
     });
     return targets;
+  }
+  function weaponTargetStore() {
+    return Object.assign({}, state.weaponTargets, state.dmgTargets);
+  }
+  // The bundle for the current selection — Kitguns/Zaws solve against
+  // an override weapons map holding the assembled entry.
+  function evalBundle() {
+    var cat = currentCat();
+    if (cat.kind === 'kitgun' || cat.kind === 'zaw') {
+      var w = null;
+      try { w = currentWeapon(); } catch (e) { w = null; }
+      if (w && w.assembled) {
+        var weapons = Object.assign({}, SITE.weapons);
+        weapons[w.name] = w.entry;
+        return Object.assign({}, BUNDLE, { weapons: weapons });
+      }
+    }
+    return BUNDLE;
   }
   function shardWalletInput() {
     var wallet = {};
@@ -1183,37 +1512,33 @@
       if (!frame || !SITE.frames.warframes[frame]) throw new Error('Pick a valid frame first (Item tab).');
       var routes = {};
       ROUTES_FRAME.forEach(function (r) { routes[r.key] = !!state.routesFrame[r.key]; });
-      return {
-        kind: 'frame',
-        input: {
-          frameName: frame,
-          targets: collectTargets(state.frameTargets, FRAME_STATS),
-          routes: routes,
-          abilityLocks: state.abilityLocks[frame] || [],
-          shardWallet: shardWalletInput(),
-          formaBudget: state.forma,
-          umbraForma: state.umbraForma,
-          supportSetPieces: supportSetsInput(),
-          reactor: true
-        },
-        bundle: BUNDLE
+      var finput = {
+        frameName: frame,
+        targets: collectTargets(state.frameTargets, FRAME_STATS),
+        routes: routes,
+        abilityLocks: state.abilityLocks[frame] || [],
+        shardWallet: shardWalletInput(),
+        formaBudget: state.forma,
+        umbraForma: state.umbraForma,
+        supportSetPieces: supportSetsInput(),
+        reactor: true
       };
+      applyLocksToInput(finput);
+      return { kind: 'frame', input: finput, bundle: BUNDLE };
     }
     if (cat.kind === 'necramech') {
       var mech = state.selections.Necramech;
       if (!mech || !SITE.frames.necramechs[mech]) throw new Error('Pick a valid Necramech first (Item tab).');
-      return {
-        kind: 'frame',
-        input: {
-          itemKind: 'necramech',
-          frameName: mech,
-          targets: collectTargets(state.frameTargets, FRAME_STATS),
-          routes: { mods: state.routesFrame.mods, conditional: state.routesFrame.conditional },
-          formaBudget: state.forma,
-          umbraForma: state.umbraForma
-        },
-        bundle: BUNDLE
+      var minput = {
+        itemKind: 'necramech',
+        frameName: mech,
+        targets: collectTargets(state.frameTargets, FRAME_STATS),
+        routes: { mods: state.routesFrame.mods, conditional: state.routesFrame.conditional },
+        formaBudget: state.forma,
+        umbraForma: state.umbraForma
       };
+      applyLocksToInput(minput);
+      return { kind: 'frame', input: minput, bundle: BUNDLE };
     }
     if (cat.kind === 'companion') {
       var comp = currentCompanion();
@@ -1234,6 +1559,7 @@
       };
       if (comp.companionEntry) cinput.companionEntry = comp.companionEntry;
       if (owner) cinput.ownerStats = owner;
+      applyLocksToInput(cinput);
       return { kind: 'frame', input: cinput, bundle: BUNDLE };
     }
     if (isWeaponKind(cat.kind)) {
@@ -1244,7 +1570,8 @@
       var winput = {
         weaponName: w.name,
         attackIndex: currentAttackIndex(w.entry),
-        targets: collectTargets(state.weaponTargets, WEAPON_STATS),
+        targets: Object.assign(collectTargets(state.weaponTargets, WEAPON_STATS),
+          collectTargets(state.dmgTargets, DMG_STATS)),
         routes: wroutes,
         formaBudget: state.forma,
         umbraForma: state.umbraForma
@@ -1253,20 +1580,18 @@
         var pct = Math.min(60, Math.max(25, state.progenitor.percent || 60));
         winput.progenitor = { element: state.progenitor.element, percent: pct };
       }
-      var bundle = BUNDLE;
-      if (w.assembled) {
-        var weapons = Object.assign({}, SITE.weapons);
-        weapons[w.name] = w.entry;
-        bundle = Object.assign({}, BUNDLE, { weapons: weapons });
-      }
-      return { kind: 'weapon', input: winput, bundle: bundle };
+      applyLocksToInput(winput);
+      return { kind: 'weapon', input: winput, bundle: evalBundle() };
     }
     if (cat.kind === 'amp') {
       var amp = currentAmp();
       var targets = {};
       AMP_STATS.forEach(function (s) {
         var t = state.ampTargets[s.key];
-        if (!t || t.mode === 'dontcare') return;
+        // The amp solver has no fill phase — Maximize is not offered
+        // to it (the exhaustive arcane search already maximises the
+        // targeted stats it can).
+        if (!t || t.mode === 'dontcare' || t.mode === 'maximize') return;
         var v = parseFloat(t.value);
         if (isNaN(v)) return;
         targets[s.key] = { mode: t.mode, value: s.frac ? v / 100 : v };
@@ -1340,6 +1665,9 @@
       var targetText = '—';
       if (t && t.mode === 'atleast') targetText = (s.lowerBetter ? '≤ ' : '≥ ') + t.value;
       if (t && t.mode === 'closest') targetText = '≈ ' + t.value;
+      if (t && t.mode === 'maximize') {
+        targetText = 'Maximize' + (t.priority !== '' && t.priority != null ? ' (priority ' + t.priority + ')' : '');
+      }
       tr.appendChild(el('td', null, targetText));
       var ach = achieved ? achieved[s.key] : null;
       var achDisp = ach;
@@ -1361,6 +1689,657 @@
       tb.appendChild(tr);
     });
   }
+  // ---- build board + editor (v1.1) --------------------------------------------
+  // boardSolved is the immutable solver output (slots with fit meta +
+  // extras + achieved); boardCur is the editable copy the board shows.
+  // Every edit re-scores boardCur through the matching evaluate*
+  // function — the same forward math as the solvers, no second model.
+  var lastInput = null;
+  var boardKind = null;      // 'frame' | 'weapon'
+  var boardCatId = null;     // category the board belongs to
+  var boardItemName = null;  // frameName / weaponName for the evaluators
+  var boardSolved = null;
+  var boardCur = null;
+  var boardSel = -1;
+  var boardDragIdx = -1;
+  var swapPoolNames = [];
+
+  function cloneSlots(slots) {
+    return (slots || []).map(function (s) {
+      return {
+        kind: s.kind, mod: s.mod, rank: s.rank,
+        slotPolarity: s.slotPolarity, innatePolarity: s.innatePolarity,
+        formaApplied: !!s.formaApplied, umbraFormaApplied: !!s.umbraFormaApplied,
+        effectiveDrain: s.effectiveDrain, origin: s.origin || 'target'
+      };
+    });
+  }
+  function deepClone(o) { return o == null ? o : JSON.parse(JSON.stringify(o)); }
+
+  function boardExtrasFromSolve(kind, res) {
+    var arr = res.arrangement || {};
+    if (kind === 'frame') {
+      return {
+        arcanes: (arr.arcanes || []).slice(),
+        shards: (arr.shards || []).map(function (s) {
+          return { colour: s.colour, tier: s.tier, stat: s.stat };
+        }),
+        tome: arr.tome || null, helmet: arr.helmet || null,
+        subsume: arr.subsume || null,
+        conditional: !!(lastInput && lastInput.routes && lastInput.routes.conditional),
+        formaBudget: lastInput ? lastInput.formaBudget : 'any',
+        umbraForma: (lastInput && lastInput.umbraForma) || 0,
+        itemKind: lastInput && lastInput.itemKind,
+        companionEntry: (lastInput && lastInput.companionEntry) || null,
+        ownerStats: (lastInput && lastInput.ownerStats) || null,
+        supportSetPieces: (lastInput && lastInput.supportSetPieces) || null
+      };
+    }
+    return {
+      arcane: arr.arcane || null,
+      conditional: !!(lastInput && lastInput.routes && lastInput.routes.conditional),
+      formaBudget: lastInput ? lastInput.formaBudget : 'any',
+      umbraForma: (lastInput && lastInput.umbraForma) || 0,
+      stance: !(lastInput && lastInput.routes && lastInput.routes.stance === false),
+      progenitor: (lastInput && lastInput.progenitor) || null,
+      attackIndex: (lastInput && lastInput.attackIndex) || 0,
+      weaponName: lastInput && lastInput.weaponName
+    };
+  }
+
+  function setupBoard(kind, res) {
+    boardKind = kind;
+    boardCatId = state.category;
+    boardItemName = lastInput ? (kind === 'frame' ? lastInput.frameName : lastInput.weaponName) : null;
+    boardSolved = {
+      slots: cloneSlots(res.arrangement.slots),
+      extras: boardExtrasFromSolve(kind, res),
+      achieved: res.achieved,
+      unmetTargets: res.unmetTargets || []
+    };
+    boardCur = { slots: cloneSlots(boardSolved.slots), extras: deepClone(boardSolved.extras) };
+    boardSel = -1;
+    syncBoardState();
+    refreshBoardUI();
+  }
+
+  function serializeBoard() {
+    if (!boardCur) return null;
+    return {
+      kind: boardKind,
+      catId: boardCatId,
+      itemKey: currentItemKey(),
+      slots: boardCur.slots.map(function (s) {
+        return { kind: s.kind, mod: s.mod, rank: s.rank };
+      }),
+      extras: boardCur.extras
+    };
+  }
+  function syncBoardState() {
+    state.board = serializeBoard();
+    saveState();
+  }
+
+  function evalBoard() {
+    var names = boardCur.slots.map(function (s) { return s.mod; }).filter(Boolean);
+    var ex = extraRecordsFor(names);
+    var slots = boardCur.slots.map(function (s) {
+      return { kind: s.kind, mod: s.mod, rank: s.rank };
+    });
+    if (boardKind === 'frame') {
+      var e = boardCur.extras;
+      return window.Solver.evaluateFrame(evalBundle(), boardItemName, {
+        slots: slots,
+        arcanes: e.arcanes || [], shards: e.shards || [],
+        tome: e.tome, helmet: e.helmet, subsume: e.subsume,
+        conditional: e.conditional,
+        formaBudget: e.formaBudget, umbraForma: e.umbraForma || 0,
+        reactor: true, itemKind: e.itemKind,
+        companionEntry: e.companionEntry, ownerStats: e.ownerStats,
+        supportSetPieces: e.supportSetPieces,
+        extraModRecords: ex
+      });
+    }
+    var we = boardCur.extras;
+    return window.WeaponSolver.evaluateWeapon(evalBundle(), we.weaponName,
+      we.attackIndex || 0, {
+        slots: slots, arcane: we.arcane,
+        conditional: we.conditional,
+        formaBudget: we.formaBudget, umbraForma: we.umbraForma || 0,
+        stance: we.stance !== false,
+        extraModRecords: ex
+      }, we.progenitor || null);
+  }
+
+  function boardStatDefs() {
+    if (boardKind === 'weapon') {
+      return { defs: WEAPON_STATS.concat(DMG_STATS), store: weaponTargetStore() };
+    }
+    var cat = catOf(boardCatId || state.category);
+    return {
+      defs: cat.kind === 'companion' ? COMPANION_STATS : FRAME_STATS,
+      store: state.frameTargets
+    };
+  }
+  // At-least floors broken by a given achieved set — computed from the
+  // target store (the solvers' unmetTargets describe the SOLVED build;
+  // an edited board needs its own check).
+  function computeUnmet(defs, store, achieved) {
+    var unmet = [];
+    defs.forEach(function (s) {
+      var t = store[s.key];
+      if (!t || t.mode !== 'atleast') return;
+      var v = parseFloat(t.value);
+      if (isNaN(v)) return;
+      var a = achieved ? achieved[s.key] : null;
+      if (typeof a !== 'number') return;
+      if (s.lowerBetter ? a > v + 1e-9 : a < v - 1e-9) {
+        unmet.push({ stat: s.key, target: v, achieved: a });
+      }
+    });
+    return unmet;
+  }
+
+  function slotMaxRank(name, kind) {
+    if (!name) return null;
+    var rec = modRecord(name) || modpoolRec(name);
+    if (rec) return rec.maxRank;
+    var lm = ((SITE.links && SITE.links.mods) || []).filter(function (m) { return m.name === name; })[0];
+    return lm ? lm.maxRank : null;
+  }
+  function slotDrainInfo(s) {
+    if (!s.mod) return null;
+    if (s.kind === 'aura' || s.kind === 'stance') {
+      return { eff: s.effectiveDrain || 0, granted: true, matched: false };
+    }
+    var rec = modRecord(s.mod) || modpoolRec(s.mod);
+    if (!rec) return typeof s.effectiveDrain === 'number'
+      ? { eff: s.effectiveDrain, granted: false, matched: false } : null;
+    var base = (rec.baseDrain || 0) + (s.rank || 0);
+    var matched = !!(s.slotPolarity && rec.polarity &&
+      (s.slotPolarity === rec.polarity || s.slotPolarity === 'Universal'));
+    return {
+      eff: matched ? Math.ceil(base / 2) : base,
+      granted: false, matched: matched
+    };
+  }
+  function slotKindLabel(s, normalIdx) {
+    if (s.kind === 'aura') return 'Aura';
+    if (s.kind === 'stance') return 'Stance';
+    if (s.kind === 'exilus') return 'Exilus';
+    return 'Slot ' + normalIdx;
+  }
+  function isLockedName(name) {
+    return !!name && locksFor(boardCatId || state.category).mods
+      .some(function (L) { return L.name === name; });
+  }
+
+  function renderBoardGrid() {
+    var box = $('board');
+    box.innerHTML = '';
+    var normalIdx = 0;
+    boardCur.slots.forEach(function (s, i) {
+      if (s.kind === 'normal') normalIdx++;
+      var cell = el('div', 'slot' + (s.mod ? '' : ' empty') +
+        (i === boardSel ? ' selected' : '') + (s.kind === 'stance' ? ' fixed' : ''));
+      cell.appendChild(el('span', 'slot-kind', slotKindLabel(s, normalIdx)));
+      cell.appendChild(el('span', 'slot-mod', s.mod || '— empty —'));
+      if (s.mod) {
+        var maxR = slotMaxRank(s.mod, s.kind);
+        var metaBits = ['r' + s.rank + '/' + (maxR == null ? '?' : maxR)];
+        if (s.slotPolarity) metaBits.push(s.slotPolarity);
+        cell.appendChild(el('span', 'slot-meta', metaBits.join(' · ')));
+        var d = slotDrainInfo(s);
+        if (d) {
+          var dt = el('span', 'slot-meta' + (d.matched ? ' matched-drain' : ''),
+            d.granted ? 'grants ' + Math.abs(d.eff) + ' capacity'
+                      : 'drain ' + d.eff + (d.matched ? ' (polarity match)' : ''));
+          cell.appendChild(dt);
+        }
+        if (s.umbraFormaApplied) cell.appendChild(el('span', 'badge', 'Umbra Forma'));
+        else if (s.formaApplied) cell.appendChild(el('span', 'badge', 'Forma'));
+        if (s.origin === 'fill') cell.appendChild(el('span', 'tag-fill', 'fill'));
+        if (s.origin === 'edited') cell.appendChild(el('span', 'badge', 'edited'));
+        if (isLockedName(s.mod)) cell.appendChild(el('span', 'badge', '📌 locked'));
+      }
+      if (s.kind !== 'stance') {
+        cell.addEventListener('click', function () { onCellClick(i); });
+        cell.draggable = true;
+        cell.addEventListener('dragstart', function (ev) {
+          boardDragIdx = i;
+          if (ev.dataTransfer) {
+            try { ev.dataTransfer.setData('text/plain', String(i)); } catch (e) { /* noop */ }
+          }
+        });
+        cell.addEventListener('dragover', function (ev) {
+          if (ev.preventDefault) ev.preventDefault();
+          cell.classList.add('dragover');
+        });
+        cell.addEventListener('dragleave', function () { cell.classList.remove('dragover'); });
+        cell.addEventListener('drop', function (ev) {
+          if (ev.preventDefault) ev.preventDefault();
+          cell.classList.remove('dragover');
+          var from = boardDragIdx;
+          if (from < 0 && ev.dataTransfer) {
+            var v = parseInt(ev.dataTransfer.getData('text/plain'), 10);
+            if (Number.isInteger(v)) from = v;
+          }
+          boardDragIdx = -1;
+          if (from >= 0 && from !== i && canSwapPos(from, i)) {
+            swapPositions(from, i);
+            boardSel = -1;
+            afterBoardEdit();
+          }
+        });
+      }
+      box.appendChild(cell);
+    });
+  }
+
+  function canSwapPos(a, b) {
+    var ka = boardCur.slots[a].kind, kb = boardCur.slots[b].kind;
+    return ka !== 'aura' && ka !== 'stance' && kb !== 'aura' && kb !== 'stance';
+  }
+  // Positions keep their kind / polarity / Forma plan; the PIECES
+  // (mod, rank, origin) move — polarity belongs to the slot, not the mod.
+  function swapPositions(a, b) {
+    var A = boardCur.slots[a], B = boardCur.slots[b];
+    var m = A.mod, r = A.rank, o = A.origin;
+    A.mod = B.mod; A.rank = B.rank; A.origin = B.origin;
+    B.mod = m; B.rank = r; B.origin = o;
+  }
+  function onCellClick(i) {
+    if (boardSel >= 0 && boardSel !== i && canSwapPos(boardSel, i)) {
+      swapPositions(boardSel, i);
+      boardSel = -1;
+      afterBoardEdit();
+      return;
+    }
+    boardSel = i;
+    $('board-swap').hidden = true;
+    renderBoardGrid();
+    renderBoardActions();
+  }
+
+  function renderBoardActions() {
+    var bar = $('board-actions');
+    var s = boardSel >= 0 ? boardCur.slots[boardSel] : null;
+    if (!s || s.kind === 'stance') { bar.hidden = true; return; }
+    bar.hidden = false;
+    var normalIdx = 0, myIdx = 0;
+    boardCur.slots.forEach(function (x, xi) {
+      if (x.kind === 'normal') { normalIdx++; if (xi === boardSel) myIdx = normalIdx; }
+    });
+    $('board-sel-label').textContent = slotKindLabel(s, myIdx) + ': ' + (s.mod || '— empty —');
+    $('btn-rank-down').disabled = !s.mod || s.kind === 'aura';
+    $('btn-rank-up').disabled = !s.mod || s.kind === 'aura';
+    $('btn-cell-remove').disabled = !s.mod;
+    $('btn-cell-pin').disabled = !s.mod;
+    $('btn-cell-pin').textContent = s.mod && isLockedName(s.mod) ? '📌 Unpin lock' : '📌 Pin as lock';
+  }
+
+  function afterBoardEdit() {
+    syncBoardState();
+    refreshBoardUI();
+    lastPieces = collectBoardPieces();
+    renderAcquisition();
+  }
+
+  function collectBoardPieces() {
+    if (!boardCur) return [];
+    var out = [];
+    boardCur.slots.forEach(function (s) {
+      if (!s.mod) return;
+      out.push({
+        name: s.mod,
+        kind: s.kind === 'exilus' ? 'Exilus mod'
+          : s.kind === 'aura' ? 'Aura'
+          : s.kind === 'stance' ? 'Stance' : 'Mod'
+      });
+    });
+    var e = boardCur.extras;
+    if (boardKind === 'frame') {
+      (e.arcanes || []).forEach(function (n) { out.push({ name: n, kind: 'Arcane' }); });
+      (e.shards || []).forEach(function (sh) {
+        out.push({ name: sh.colour + ' Archon Shard', kind: 'Archon Shard (' + sh.tier + ', ' + (FRAME_LABEL[sh.stat] || sh.stat) + ')' });
+      });
+      if (e.helmet) out.push({ name: e.helmet, kind: 'Legacy Arcane Helmet' });
+      if (e.tome) out.push({ name: e.tome, kind: 'Tome mod (cross-gear)' });
+      if (e.subsume) out.push({ name: e.subsume.ability, kind: 'Subsumed ability (from ' + e.subsume.fromFrame + ')' });
+    } else if (e.arcane) {
+      out.push({ name: e.arcane, kind: 'Arcane' });
+    }
+    return out;
+  }
+
+  var SINGLE_ELEMS = ['Heat', 'Cold', 'Electric', 'Toxin'];
+  function modElement(name) {
+    var rec = modRecord(name);
+    if (!rec || !rec.effects) return null;
+    var W = window.WeaponSolver._internal;
+    for (var i = 0; i < rec.effects.length; i++) {
+      var c = null;
+      try { c = W.classifyEffect(rec.effects[i], rec.maxRank || 0); } catch (e) { c = null; }
+      if (c && c.kind === 'typedAdd' && c.element) return c.element;
+    }
+    return null;
+  }
+  // "Slot 3 Cold + Slot 4 Toxin → Viral" — the modded elemental
+  // sequence (progenitor first) folded with the solver's COMBO table.
+  function elementalNote() {
+    var W = window.WeaponSolver._internal;
+    var COMBO = W.COMBO || {};
+    function comboOf(a, b) { return COMBO[a + '|' + b] || COMBO[b + '|' + a] || null; }
+    var seq = [];
+    var ex = boardCur.extras;
+    if (ex.progenitor && ex.progenitor.element) {
+      seq.push({ element: ex.progenitor.element, label: 'Progenitor', combined: false });
+    }
+    var normalIdx = 0;
+    boardCur.slots.forEach(function (s) {
+      if (s.kind === 'normal') normalIdx++;
+      if (s.kind !== 'normal' || !s.mod) return;
+      var e = modElement(s.mod);
+      if (e) seq.push({ element: e, label: 'Slot ' + normalIdx, combined: SINGLE_ELEMS.indexOf(e) < 0 });
+    });
+    var notes = [];
+    var changed = true;
+    while (changed) {
+      changed = false;
+      for (var i = 0; i + 1 < seq.length; i++) {
+        var a = seq[i], b = seq[i + 1];
+        if (a.combined || b.combined || a.element === b.element) continue;
+        var c = comboOf(a.element, b.element);
+        if (c) {
+          notes.push(a.label + ' ' + a.element + ' + ' + b.label + ' ' + b.element + ' → ' + c);
+          seq.splice(i, 2, { element: c, label: a.label + '+' + b.label, combined: true });
+          changed = true;
+          break;
+        }
+      }
+    }
+    return notes.length ? 'Element sequence: ' + notes.join('; ') + '.' : '';
+  }
+
+  function boardDiffers() {
+    if (!boardSolved || !boardCur) return false;
+    if (boardSolved.slots.length !== boardCur.slots.length) return true;
+    for (var i = 0; i < boardCur.slots.length; i++) {
+      var a = boardSolved.slots[i], b = boardCur.slots[i];
+      if (a.kind !== b.kind || a.mod !== b.mod || a.rank !== b.rank) return true;
+    }
+    return false;
+  }
+
+  function renderDelta(ev) {
+    var panel = $('board-delta');
+    if (!boardSolved || !boardDiffers()) { panel.hidden = true; return; }
+    panel.hidden = false;
+    var body = $('board-delta-body');
+    body.innerHTML = '';
+    var sd = boardStatDefs();
+    var table = el('table', 'grid');
+    var tb = document.createElement('tbody');
+    var rows = 0;
+    sd.defs.forEach(function (s) {
+      var t = sd.store[s.key];
+      if (!t || t.mode === 'dontcare') return;
+      var sv = boardSolved.achieved ? boardSolved.achieved[s.key] : null;
+      var cv = ev.achieved ? ev.achieved[s.key] : null;
+      if (typeof sv !== 'number' || typeof cv !== 'number') return;
+      if (Math.abs(cv - sv) < 1e-9) return;
+      rows++;
+      var tr = el('tr');
+      tr.appendChild(el('td', null, s.label));
+      tr.appendChild(el('td', null, fmt(sv) + ' → ' + fmt(cv)));
+      var up = cv > sv;
+      var cls = '', note = '';
+      if (t.mode === 'atleast') {
+        var tv = parseFloat(t.value);
+        var broke = s.lowerBetter ? (cv > tv && sv <= tv) : (cv < tv && sv >= tv);
+        var fixed = s.lowerBetter ? (cv <= tv && sv > tv) : (cv >= tv && sv < tv);
+        if (broke) { cls = 'status-unmet'; note = ' — floor broken'; }
+        else if (fixed) { cls = 'status-met'; note = ' — floor now met'; }
+      } else if (t.mode === 'closest') {
+        var tv2 = parseFloat(t.value);
+        if (Math.abs(cv - tv2) > Math.abs(sv - tv2) + 1e-9) cls = 'status-unmet';
+        else if (Math.abs(cv - tv2) < Math.abs(sv - tv2) - 1e-9) cls = 'status-met';
+      } else if (t.mode === 'maximize') {
+        cls = up ? 'status-met' : 'status-unmet';
+      }
+      var arrow = el('td', cls, (up ? '▲ ' : '▼ ') + fmt(Math.abs(cv - sv)) + note);
+      arrow.className = (arrow.className ? arrow.className + ' ' : '') + 'delta-arrow';
+      tr.appendChild(arrow);
+      tb.appendChild(tr);
+    });
+    if (!rows) {
+      body.appendChild(el('p', 'muted', 'Board edited — no targeted stat changed.'));
+      return;
+    }
+    table.appendChild(tb);
+    body.appendChild(table);
+  }
+
+  function refreshBoardUI() {
+    var panel = $('board-panel');
+    if (!boardCur || boardCatId !== state.category) { panel.hidden = true; return; }
+    var ser = serializeBoard();
+    if (!ser || ser.itemKey !== currentItemKey()) { panel.hidden = true; return; }
+    panel.hidden = false;
+    var ev = null, err = null;
+    try { ev = evalBoard(); } catch (e) { err = e; }
+    renderBoardGrid();
+    renderBoardActions();
+    var cap = $('board-capacity');
+    if (err) {
+      cap.textContent = 'Evaluation error: ' + err.message;
+      cap.className = 'cap-over';
+    } else {
+      cap.className = ev.valid ? '' : 'cap-over';
+      var rankCapNote = '';
+      if (boardKind === 'weapon') {
+        var bw = null;
+        try { bw = currentWeapon(); } catch (e2) { bw = null; }
+        if (bw && bw.entry.MaxRank && bw.entry.MaxRank > 30) {
+          rankCapNote = ' · rank cap ' + bw.entry.MaxRank + ' (over-ranked via Forma)';
+        }
+      }
+      cap.textContent = 'Capacity: ' + ev.capacityUsed + ' / ' + ev.capacityMax +
+        ' · Forma: ' + ev.formaUsed +
+        (ev.umbraFormaUsed ? ' · Umbra Forma: ' + ev.umbraFormaUsed : '') +
+        (boardKind === 'weapon' && ev.overRankForma ? ' (incl. ' + ev.overRankForma + ' over-rank)' : '') +
+        rankCapNote +
+        (ev.valid ? '' : ' — OVER CAPACITY');
+    }
+    $('board-seq').textContent = boardKind === 'weapon' && !err ? elementalNote() : '';
+    var wl = $('board-warnings');
+    wl.innerHTML = '';
+    if (ev) {
+      ev.warnings.forEach(function (w) { wl.appendChild(el('li', null, w)); });
+      if (!ev.valid) {
+        wl.appendChild(el('li', null, 'Over capacity by ' + (ev.capacityUsed - ev.capacityMax) +
+          ' — this arrangement needs more Forma headroom or fewer drain.'));
+      }
+    }
+    if (ev) {
+      var sd = boardStatDefs();
+      achievedTable(sd.defs, sd.store, ev.achieved,
+        computeUnmet(sd.defs, sd.store, ev.achieved), false);
+      renderDelta(ev);
+    }
+  }
+
+  // ---- board editor actions ---------------------------------------------------
+  function selectedSlot() {
+    return boardSel >= 0 && boardCur ? boardCur.slots[boardSel] : null;
+  }
+  function boardRankStep(delta) {
+    var s = selectedSlot();
+    if (!s || !s.mod || s.kind === 'aura' || s.kind === 'stance') return;
+    var maxR = slotMaxRank(s.mod, s.kind);
+    var nr = (s.rank || 0) + delta;
+    if (nr < 0) nr = 0;
+    if (maxR != null && nr > maxR) nr = maxR;
+    if (nr === s.rank) return;
+    s.rank = nr;
+    afterBoardEdit();
+  }
+  function boardRemoveSelected() {
+    var s = selectedSlot();
+    if (!s || !s.mod) return;
+    s.mod = null;
+    s.rank = null;
+    s.origin = 'target';
+    $('board-swap').hidden = true;
+    afterBoardEdit();
+  }
+  function boardOpenSwap() {
+    var s = selectedSlot();
+    if (!s || s.kind === 'stance') return;
+    if (s.kind === 'aura') {
+      swapPoolNames = (SITE.auras.mods || []).map(function (m) { return m.name; }).sort();
+    } else {
+      swapPoolNames = pickerModNames(s.kind === 'exilus');
+    }
+    fillDatalist($('swap-list'), swapPoolNames);
+    $('swap-search').value = '';
+    $('board-swap').hidden = false;
+  }
+  function boardApplySwap() {
+    var s = selectedSlot();
+    if (!s) return;
+    var name = $('swap-search').value.trim();
+    if (swapPoolNames.indexOf(name) < 0) {
+      $('calc-status').textContent = '"' + name + '" is not in this slot\'s legal pool.';
+      return;
+    }
+    $('calc-status').textContent = '';
+    s.mod = name;
+    s.rank = slotMaxRank(name, s.kind);
+    if (s.kind !== 'aura' && s.kind !== 'stance') s.origin = 'edited';
+    $('board-swap').hidden = true;
+    afterBoardEdit();
+  }
+  function boardTogglePin() {
+    var s = selectedSlot();
+    if (!s || !s.mod) return;
+    var lk = locksFor(boardCatId || state.category);
+    var idx = -1;
+    lk.mods.forEach(function (L, i) { if (L.name === s.mod) idx = i; });
+    if (idx >= 0) lk.mods.splice(idx, 1);
+    else lk.mods.push({ name: s.mod, rank: s.rank == null ? (slotMaxRank(s.mod, s.kind) || 0) : s.rank });
+    renderLockLists();
+    saveState();
+    refreshBoardUI();
+  }
+  function boardReset() {
+    if (!boardSolved) return;
+    boardCur = { slots: cloneSlots(boardSolved.slots), extras: deepClone(boardSolved.extras) };
+    boardSel = -1;
+    $('board-swap').hidden = true;
+    afterBoardEdit();
+  }
+
+  // Restore a board carried by state (share link / save) WITHOUT
+  // running the solver: the board renders and is scored by the
+  // evaluator only. Slot polarity meta falls back to the item's
+  // innate polarities (a shared board carries no Forma plan).
+  function restoreBoardFromState() {
+    var b = state.board;
+    if (!b || b.catId !== state.category) return;
+    if (b.itemKey !== currentItemKey()) return;
+    var cat = currentCat();
+    boardKind = b.kind;
+    boardCatId = b.catId;
+    if (b.kind === 'frame') {
+      if (cat.kind === 'companion') {
+        var comp = null;
+        try { comp = currentCompanion(); } catch (e) { comp = null; }
+        boardItemName = comp ? comp.frameName : null;
+      } else {
+        boardItemName = state.selections[cat.id];
+      }
+    } else {
+      var w = null;
+      try { w = currentWeapon(); } catch (e2) { w = null; }
+      boardItemName = w ? w.name : null;
+      if (b.extras) b.extras.weaponName = boardItemName;
+    }
+    if (!boardItemName) { boardCur = null; return; }
+    var innate = innatePolaritiesForBoard();
+    var n = 0;
+    var slots = b.slots.map(function (s) {
+      var slot = {
+        kind: s.kind, mod: s.mod, rank: s.rank,
+        slotPolarity: null, innatePolarity: null,
+        formaApplied: false, umbraFormaApplied: false,
+        effectiveDrain: 0, origin: 'target'
+      };
+      if (s.kind === 'aura') slot.slotPolarity = slot.innatePolarity = innate.aura;
+      else if (s.kind === 'stance') slot.slotPolarity = slot.innatePolarity = innate.stance;
+      else if (s.kind === 'exilus') slot.slotPolarity = slot.innatePolarity = innate.exilus;
+      else { slot.slotPolarity = slot.innatePolarity = innate.normals[n] || null; n++; }
+      if ((s.kind === 'aura' || s.kind === 'stance') && s.mod) {
+        // Capacity furniture: magnitude |baseDrain| + maxRank, doubled
+        // on a polarity match (the solvers' own bonus rule).
+        var rec = modRecord(s.mod);
+        if (rec) {
+          var mag = Math.abs(rec.baseDrain || 0) + (rec.maxRank || 0);
+          if (rec.polarity && rec.polarity === slot.innatePolarity) mag *= 2;
+          slot.effectiveDrain = -mag;
+        }
+      } else {
+        var d = slotDrainInfo(slot);
+        slot.effectiveDrain = d ? d.eff : 0;
+      }
+      return slot;
+    });
+    boardSolved = { slots: cloneSlots(slots), extras: deepClone(b.extras), achieved: null, unmetTargets: [] };
+    boardCur = { slots: cloneSlots(slots), extras: deepClone(b.extras) };
+    boardSel = -1;
+    var ev = null;
+    try { ev = evalBoard(); } catch (e3) { ev = null; }
+    if (ev) boardSolved.achieved = ev.achieved;
+    $('results-empty').hidden = true;
+    $('results-body').hidden = false;
+    var notes = $('result-notes');
+    notes.innerHTML = '';
+    notes.appendChild(el('li', null, 'Build restored from a share link / saved state — shown as-is and scored by the evaluator, not re-solved. Press Calculate to re-solve.'));
+    $('capacity-line').textContent = '';
+    $('cost-line').textContent = '';
+    $('forma-line').innerHTML = '';
+    $('cheapest-panel').hidden = true;
+    lastKind = b.kind;
+    lastPieces = collectBoardPieces();
+    refreshBoardUI();
+  }
+  function innatePolaritiesForBoard() {
+    var cat = currentCat();
+    var out = { aura: null, stance: null, exilus: null, normals: [] };
+    try {
+      if (boardKind === 'weapon') {
+        var w = currentWeapon();
+        if (w) {
+          out.normals = (w.entry.Polarities || []).slice();
+          out.stance = w.entry.StancePolarity || null;
+          out.exilus = w.entry.ExilusPolarity || null;
+        }
+      } else if (cat.kind === 'frame') {
+        var f = SITE.frames.warframes[state.selections.Warframe];
+        if (f) { out.normals = (f.polarities || []).slice(); out.aura = f.auraPolarity || null; }
+      } else if (cat.kind === 'necramech') {
+        var m = SITE.frames.necramechs[state.selections.Necramech];
+        if (m) out.normals = (m.Polarities || []).slice();
+      } else if (cat.kind === 'companion') {
+        var store = companionStoreEntry();
+        var comp = currentCompanion();
+        var e = (comp && comp.companionEntry) || store;
+        if (e) out.normals = (e.Polarities || []).slice();
+      }
+    } catch (e) { /* honest empty meta */ }
+    return out;
+  }
+
   function renderNotes(res) {
     var notes = $('result-notes');
     notes.innerHTML = '';
@@ -1444,6 +2423,7 @@
     $('results-body').hidden = false;
     var cat = currentCat();
     var arr = res.arrangement || {};
+    if (kind === 'amp') $('board-panel').hidden = true;
     renderNotes(res);
     var box = $('arrangement');
     box.innerHTML = '';
@@ -1465,7 +2445,7 @@
       var fp = formaPlanText(arr, false);
       if (fp) $('forma-line').appendChild(el('p', null, fp));
     } else if (kind === 'weapon') {
-      achievedTable(WEAPON_STATS, state.weaponTargets, res.achieved, res.unmetTargets, false);
+      achievedTable(WEAPON_STATS.concat(DMG_STATS), weaponTargetStore(), res.achieved, res.unmetTargets, false);
       // Modular parts are build pieces too.
       if (cat.kind === 'kitgun') {
         lastPieces.push({ name: state.parts.kitgun.chamber, kind: 'Part (Chamber)' });
@@ -1545,13 +2525,19 @@
       cp.hidden = true;
     }
     if (!box.children.length) box.appendChild(el('p', 'muted', 'Empty build — no pieces needed for the current targets.'));
+    // v1.1: the board (frame + weapon kinds) becomes the editable
+    // source of truth for the achieved table from here on.
+    if ((kind === 'frame' || kind === 'weapon') && res.arrangement && res.arrangement.slots) {
+      setupBoard(kind, res);
+      lastPieces = collectBoardPieces();
+    }
     renderAcquisition();
   }
 
   function renderAcquisition() {
     var hint = $('acq-hint');
     var table = $('acq-table');
-    if (!lastResult) {
+    if (!lastResult && !boardCur) {
       hint.textContent = 'Run Calculate to see acquisition for a build.';
       hint.hidden = false;
       table.hidden = true;
@@ -1597,6 +2583,7 @@
       showTab('item');
       return;
     }
+    lastInput = req.input;
     var btn = $('btn-calc');
     btn.disabled = true;
     btn.textContent = 'Calculating…';
@@ -1629,14 +2616,16 @@
       fetchJSON('data/shards.json'), fetchJSON('data/helmets.json'),
       fetchJSON('data/modular.json'), fetchJSON('data/helminth.json'),
       fetchJSON('data/set_bonuses.json'), fetchJSON('data/links.json'),
-      fetchJSON('data/acquisition.json')
+      fetchJSON('data/acquisition.json'), fetchJSON('data/modpool.json')
     ]).then(function (parts) {
       SITE = {
         frames: parts[0], weapons: parts[1], mods: parts[2], arcanes: parts[3],
         tomes: parts[4], auras: parts[5], shards: parts[6], helmets: parts[7],
         modular: parts[8], helminth: parts[9], setBonuses: parts[10],
-        links: parts[11], acquisition: parts[12]
+        links: parts[11], acquisition: parts[12], modpool: parts[13]
       };
+      SITE.modpoolByName = {};
+      (SITE.modpool.mods || []).forEach(function (m) { SITE.modpoolByName[m.name] = m; });
       BUNDLE = assembleBundle(SITE);
       state = defaultState();
       // Share-link state wins over localStorage.
@@ -1650,6 +2639,16 @@
         b.addEventListener('click', function () { showTab(b.getAttribute('data-tab')); });
       });
       $('btn-calc').addEventListener('click', calculate);
+      $('btn-lock-mod').addEventListener('click', function () { addLockFromSearch('mod'); });
+      $('btn-lock-arcane').addEventListener('click', function () { addLockFromSearch('arcane'); });
+      $('btn-rank-down').addEventListener('click', function () { boardRankStep(-1); });
+      $('btn-rank-up').addEventListener('click', function () { boardRankStep(1); });
+      $('btn-cell-remove').addEventListener('click', boardRemoveSelected);
+      $('btn-cell-swap').addEventListener('click', boardOpenSwap);
+      $('btn-swap-apply').addEventListener('click', boardApplySwap);
+      $('btn-swap-cancel').addEventListener('click', function () { $('board-swap').hidden = true; });
+      $('btn-cell-pin').addEventListener('click', boardTogglePin);
+      $('btn-board-reset').addEventListener('click', boardReset);
       $('btn-share').addEventListener('click', function () {
         readUIFromControls();
         var url = location.href.split('#')[0] + '#' + encodeHash(state);
@@ -1680,6 +2679,7 @@
           saveState();
         }
       });
+      restoreBoardFromState();
       renderAcquisition();
     }).catch(function (e) {
       $('calc-status').textContent = 'Failed to load site data: ' + e.message;
