@@ -114,6 +114,26 @@
  *    highest gross positive contribution toward it.
  *  - evaluateFrame(data, frameName, orderedPieces): forward
  *    evaluator for the board editor, sharing this file's math.
+ *
+ * v1.2 (engine stage F1):
+ *  - Excludes: input.excludedMods / input.excludedArcanes ban pieces
+ *    from every candidate pool (search AND fill); a piece that is
+ *    both locked and excluded is a hard Error.
+ *  - Helminth forced choice: input.helminthChoice {donor,
+ *    replacesIndex} pins the subsume the player picked (seeded into
+ *    the start states, so the auto-pick can never override it).
+ *    Modelled donors apply as usual; non-modelled donors ride as
+ *    arrangement.subsumeInstruction — a build instruction with the
+ *    diminished text, never a stat effect.
+ *  - Cross-gear planning: with input.crossGear present, the finished
+ *    build gains result.crossGearPlan — specific mods on specific
+ *    support gear completing reachable set bonuses — and planned
+ *    pieces count in setBonuses totals immediately.
+ *    input.supportSetPieces remains accepted (legacy counts) but is
+ *    no longer the primary path.
+ *  - Breakdowns: results and evaluateFrame return `breakdown` —
+ *    per-stat contributor chains in application order whose final
+ *    cumulative equals the reported achieved value (round2).
  */
 (function () {
   'use strict';
@@ -285,6 +305,19 @@
     ctx.helminth = ((data.helminth && data.helminth.subsumes) || []).filter(function (e) {
       return e && e.ability && Array.isArray(e.effects) && e.effects.length;
     });
+    // ALL subsumes (v1.2 forced choice): the player may force any
+    // donor, modelled or not — non-modelled entries carry their
+    // diminished text and ride as a build instruction only.
+    ctx.helminthAll = ((data.helminth && data.helminth.subsumes) || [])
+      .filter(function (e) { return e && e.ability; })
+      .map(function (e) {
+        return {
+          ability: e.ability, frame: e.frame || '',
+          diminishedText: e.diminishedText || '',
+          effects: Array.isArray(e.effects) ? e.effects : null,
+          modelled: Array.isArray(e.effects) && e.effects.length > 0
+        };
+      });
 
     // Mod pools by item kind: Warframe-type mods for frames, Necramech-
     // type for Necramechs (companion pools are built per-solve, since
@@ -303,6 +336,13 @@
     // other single pick by name.
     ctx.setOfMod = {};
     mods.forEach(function (m) { if (m.set) ctx.setOfMod[m.name] = m.set; });
+    // name -> {type, set} for every derived mod (v1.2 cross-gear
+    // planning reads member types for gear labels / focus-pool tests,
+    // including mods the stat model dropped from the pools).
+    ctx.derivedByName = {};
+    mods.forEach(function (m) {
+      ctx.derivedByName[m.name] = { type: m.type || null, set: m.set || null };
+    });
 
     // Every arcane name in the bundle (v1.1 locks may occupy a slot
     // with an arcane the stat model cannot use).
@@ -391,7 +431,8 @@
           ? s.enhanceModsPercent : null,
         parseStatus: s.parseStatus || 'prose',
         sourceText: s.sourceText || '',
-        numUpgradesInSet: s.numUpgradesInSet || null
+        numUpgradesInSet: s.numUpgradesInSet || null,
+        members: Array.isArray(s.members) ? s.members.slice() : []
       };
     });
 
@@ -540,9 +581,13 @@
   // (stat, unit, v) — the deficit-lane metric (v1.1) uses it to total
   // only the POSITIVE contributions toward one stat.
   function contributions(ctx, state, routes, supportSetPieces) {
-    return walkContributions(ctx, state, routes, supportSetPieces, null);
+    return walkContributions(ctx, state, routes, supportSetPieces, null, false);
   }
-  function walkContributions(ctx, state, routes, supportSetPieces, collect) {
+  // noSetBonuses (v1.2 breakdowns): skip the per-piece set block and
+  // the set-enhance scaling, so a prefix state can be scored with set
+  // bonuses attributed to a single final "Set bonuses" step instead
+  // of leaking into whichever mod prefix completed the count.
+  function walkContributions(ctx, state, routes, supportSetPieces, collect, noSetBonuses) {
     var sums = {};
     ALL_STATS.forEach(function (k) { sums[k] = { percent: 0, flat: 0 }; });
     var counts = setPieceCounts(ctx, state, supportSetPieces);
@@ -560,7 +605,7 @@
       // such sets surface via the "not modelled" note instead.
       var scale = 1;
       var sb = mod.set ? ctx.setBonuses[mod.set] : null;
-      if (sb && typeof sb.enhanceModsPercent === 'number') {
+      if (!noSetBonuses && sb && typeof sb.enhanceModsPercent === 'number') {
         var c = counts[mod.set];
         var pieces = c ? c.focus + c.support : 0;
         if (pieces > 1) scale = 1 + sb.enhanceModsPercent * (pieces - 1) / 100;
@@ -598,7 +643,7 @@
     // (focus + support). Bonuses that don't map (Augur conversion,
     // Proton/Boreal damage-taken, Gladiator crit-per-combo, ...) are
     // mechanics, not stats — setBonusReport surfaces them instead.
-    Object.keys(counts).forEach(function (set) {
+    if (!noSetBonuses) Object.keys(counts).forEach(function (set) {
       var sb2 = ctx.setBonuses[set];
       if (!sb2 || !sb2.perPiece) return;
       var total = counts[set].focus + counts[set].support;
@@ -656,6 +701,208 @@
       if (unit === 'flat') acc.flat += v; else acc.percent += v;
     });
     return acc;
+  }
+
+  // ---- v1.2 cross-gear planning -------------------------------------
+  // Gear label for a support mod, from its pool Type (the loadout
+  // slot a player would put it on). Unknown/weapon-specific types
+  // fall back to the type string itself.
+  function gearLabelForType(type) {
+    if (!type) return 'Support gear';
+    if (type === 'Warframe') return 'Warframe';
+    if (type === 'Aura') return 'Warframe (Aura slot)';
+    if (type === 'Necramech') return 'Necramech';
+    if (type === 'Archgun') return 'Archgun';
+    if (type === 'Archmelee') return 'Archmelee';
+    if (['Rifle', 'Shotgun', 'Sniper', 'Bow', 'Primary',
+         'Assault Rifle'].indexOf(type) >= 0) return 'Primary';
+    if (type === 'Pistol' || type === 'Tome') return 'Secondary';
+    if (['Companion', 'Beast', 'Claws', 'Robotic', 'Robotic Weapon',
+         'Sentinel', 'Kavat Claws', 'Kubrow Claws'].indexOf(type) >= 0 ||
+        /Kavat|Kubrow|Vulpaphyla|Predasite|Charger/.test(type) ||
+        type === 'MOA' || type === 'Hound') return 'Companion';
+    return 'Melee';
+  }
+  function crossGearModType(ctx, name) {
+    var d = ctx.derivedByName && ctx.derivedByName[name];
+    if (d && d.type) return d.type;
+    var p = ctx.modByName && ctx.modByName[name];
+    return (p && p.type) || null;
+  }
+  // Plan specific cross-gear mods for the FINISHED build (a report-
+  // layer computation — the plan never feeds back into the search).
+  // o = {crossGear, focusCounts {set: n}, focusNames {name: 1},
+  //      legacySupport {set: n} | null, focusTypes {type: 1},
+  //      excludedMods {name: 1}}
+  // Candidate sets: >= 1 focus piece, or a set named by a cross-gear
+  // include. Selection per set (name asc): includes first, then the
+  // set's remaining members (name asc), until focus + legacy support
+  // + planned reaches the set's largest published size
+  // (numUpgradesInSet, else member count). A member is never planned
+  // when it is excluded (by global ban or the cross-gear exclude
+  // list), when its set is excluded, when it already sits on the
+  // focus item, or when its Type belongs to the focus item's own
+  // pool (that is the focus solve's business, not cross-gear).
+  function crossGearPlan(ctx, o) {
+    var plan = [], plannedBySet = {}, notes = [];
+    if (!o.crossGear) return { plan: plan, plannedBySet: plannedBySet, notes: notes };
+    var excludeSetNames = {}, excludeModNames = {};
+    (Array.isArray(o.crossGear.exclude) ? o.crossGear.exclude : [])
+      .forEach(function (x) {
+        if (typeof x !== 'string') return;
+        if (ctx.setBonuses[x]) excludeSetNames[x] = 1;
+        excludeModNames[x] = 1; // the same string may also name a mod
+      });
+    var includeBySet = {};
+    (Array.isArray(o.crossGear.include) ? o.crossGear.include : [])
+      .forEach(function (inc) {
+        var name = inc && inc.mod;
+        if (!name || typeof name !== 'string') return;
+        var set = ctx.setOfMod[name];
+        if (!set) {
+          notes.push('Cross-gear include ' + name + ' skipped: it belongs to no set.');
+          return;
+        }
+        if (excludeSetNames[set] || excludeModNames[name] || o.excludedMods[name]) {
+          notes.push('Cross-gear include ' + name + ' skipped: it is excluded.');
+          return;
+        }
+        if (o.focusNames[name]) return; // already on the focus item
+        var t = crossGearModType(ctx, name);
+        if (t && o.focusTypes[t]) return; // belongs to the focus solve
+        (includeBySet[set] = includeBySet[set] || []).push(name);
+      });
+    var candidateSets = {};
+    Object.keys(o.focusCounts).forEach(function (set) {
+      if (o.focusCounts[set] > 0) candidateSets[set] = 1;
+    });
+    Object.keys(includeBySet).forEach(function (set) { candidateSets[set] = 1; });
+    Object.keys(candidateSets).sort().forEach(function (set) {
+      if (excludeSetNames[set]) return;
+      var sb = ctx.setBonuses[set];
+      var members = (sb && sb.members) || [];
+      if (!members.length) return;
+      var cap = (sb && sb.numUpgradesInSet) || members.length;
+      var current = (o.focusCounts[set] || 0) +
+        ((o.legacySupport && o.legacySupport[set]) || 0);
+      if (current >= cap) return;
+      var chosen = [];
+      var ordered = (includeBySet[set] || []).slice().sort()
+        .concat(members.slice().sort());
+      ordered.forEach(function (name) {
+        if (current >= cap) return;
+        if (chosen.indexOf(name) >= 0 || o.focusNames[name]) return;
+        if (excludeModNames[name] || o.excludedMods[name]) return;
+        var t = crossGearModType(ctx, name);
+        if (t && o.focusTypes[t]) return;
+        chosen.push(name);
+        current++;
+      });
+      chosen.forEach(function (name) {
+        plan.push({ mod: name, gear: gearLabelForType(crossGearModType(ctx, name)), set: set });
+      });
+      if (chosen.length) plannedBySet[set] = chosen.length;
+    });
+    plan.sort(function (a, b) {
+      return a.set < b.set ? -1 : a.set > b.set ? 1
+        : (a.mod < b.mod ? -1 : a.mod > b.mod ? 1 : 0);
+    });
+    return { plan: plan, plannedBySet: plannedBySet, notes: notes };
+  }
+
+  // ---- v1.2 per-stat breakdown (frames) -----------------------------
+  // Contributor chain per stat, in application order: Base -> aura ->
+  // normal mods in slot order -> exilus -> arcanes -> shards (grouped
+  // per colour/tier/stat pick) -> Tome -> Helminth subsume -> legacy
+  // helmet -> Set bonuses. Each prefix is re-scored with the solver's
+  // own contributions + achievedFrom (set bonuses suppressed until
+  // the final step, where they land as one entry). A source appears
+  // in a stat's chain only when it moves that stat. cumulative values
+  // are round2; the final entry equals the reported achieved value.
+  function frameBreakdown(ctx, frame, state, routes, supportSetPieces,
+                          orderedMods, exilusName, helmetFrame) {
+    var chains = {};
+    ALL_STATS.forEach(function (s) { chains[s] = []; });
+    function achievedOf(st, noSet) {
+      return achievedFrom(ctx, frame,
+        walkContributions(ctx, st, routes, supportSetPieces, null, noSet));
+    }
+    var prefix = emptyState(null);
+    prefix._helmetFrame = helmetFrame || state._helmetFrame;
+    var prev = achievedOf(prefix, true);
+    ALL_STATS.forEach(function (s) {
+      chains[s].push({ source: 'Base', kind: 'base', cumulative: round2(prev[s]) });
+    });
+    var steps = [];
+    if (state.aura) {
+      steps.push({ source: state.aura, kind: 'aura',
+        apply: function (p) { p.aura = state.aura; } });
+    }
+    (orderedMods || []).forEach(function (n) {
+      if (state.mods[n] == null) return;
+      steps.push({ source: n, kind: 'mod',
+        apply: function (p) { p.mods[n] = state.mods[n]; } });
+    });
+    if (exilusName && state.exilusMod) {
+      steps.push({ source: exilusName, kind: 'exilus',
+        apply: function (p) {
+          p.exilusMod = { name: state.exilusMod.name, rank: state.exilusMod.rank };
+        } });
+    }
+    (state.arcanes || []).forEach(function (n) {
+      steps.push({ source: n, kind: 'arcane',
+        apply: function (p) { p.arcanes.push(n); } });
+    });
+    var groups = [], gidx = {};
+    (state.shards || []).forEach(function (sh) {
+      var k = sh.colour + '|' + sh.tier + '|' + sh.stat;
+      if (!(k in gidx)) {
+        gidx[k] = groups.length;
+        groups.push({ sh: sh, count: 0, items: [] });
+      }
+      groups[gidx[k]].count++;
+      groups[gidx[k]].items.push(sh);
+    });
+    groups.forEach(function (g) {
+      var label = (g.sh.tier === 'tauforged' ? 'Tauforged ' : '') +
+        g.sh.colour + ' Archon Shard' + (g.count > 1 ? ' ×' + g.count : '');
+      steps.push({ source: label, kind: 'shard',
+        apply: function (p) {
+          g.items.forEach(function (sh) { p.shards.push(sh); });
+        } });
+    });
+    if (state.tome) {
+      steps.push({ source: state.tome, kind: 'tome',
+        apply: function (p) { p.tome = state.tome; } });
+    }
+    if (state.subsume) {
+      steps.push({ source: state.subsume.ability, kind: 'subsume',
+        apply: function (p) { p.subsume = state.subsume; } });
+    }
+    if (state.helmet) {
+      steps.push({ source: state.helmet, kind: 'helmet',
+        apply: function (p) { p.helmet = state.helmet; } });
+    }
+    steps.forEach(function (step) {
+      step.apply(prefix);
+      var now = achievedOf(prefix, true);
+      ALL_STATS.forEach(function (s) {
+        if (Math.abs(now[s] - prev[s]) > 1e-9) {
+          chains[s].push({ source: step.source, kind: step.kind,
+                           cumulative: round2(now[s]) });
+        }
+      });
+      prev = now;
+    });
+    // Final step: set bonuses land (full contribution walk).
+    var full = achievedOf(state, false);
+    ALL_STATS.forEach(function (s) {
+      if (Math.abs(full[s] - prev[s]) > 1e-9) {
+        chains[s].push({ source: 'Set bonuses', kind: 'set',
+                         cumulative: round2(full[s]) });
+      }
+    });
+    return chains;
   }
 
   // Split input.targets into hard targets (atleast/closest/dontcare,
@@ -991,6 +1238,26 @@
       return targets[s] && targets[s].mode !== 'dontcare' && typeof targets[s].value === 'number';
     });
 
+    // ---- v1.2 excludes ---------------------------------------------------
+    // input.excludedMods / input.excludedArcanes ban pieces from
+    // every candidate pool (search AND fill, incl. tome/aura picks
+    // and cross-gear planning). A piece that is both locked and
+    // excluded is a contradiction — hard Error, raised in the lock
+    // loops below.
+    var excludedModSet = {}, excludedArcaneSet = {};
+    (Array.isArray(input.excludedMods) ? input.excludedMods : []).forEach(function (n) {
+      if (typeof n === 'string') excludedModSet[n] = 1;
+    });
+    (Array.isArray(input.excludedArcanes) ? input.excludedArcanes : []).forEach(function (n) {
+      if (typeof n === 'string') excludedArcaneSet[n] = 1;
+    });
+    // Pool Types the focus item itself can hold (v1.2 cross-gear:
+    // set members of these types belong to the focus solve, never
+    // to the cross-gear plan). Aura picks are focus-side for frames.
+    var focusTypeSet = {};
+    ctx.modPool.forEach(function (m) { if (m.type) focusTypeSet[m.type] = 1; });
+    if (kind === 'warframe') focusTypeSet.Aura = 1;
+
     // ---- v1.1 locks ------------------------------------------------------
     // input.lockedMods = [{name, rank}] must appear in the build at
     // the player's rank; input.lockedArcanes = [name] occupy arcane
@@ -1019,6 +1286,9 @@
     (Array.isArray(input.lockedMods) ? input.lockedMods : []).forEach(function (L) {
       var name = L && L.name;
       if (!name) throw new Error('lockedMods entries need a name.');
+      if (excludedModSet[name]) {
+        throw new Error('Mod ' + name + ' is both locked and excluded.');
+      }
       if (lockedNameSet[name]) throw new Error('Duplicate locked mod: ' + name);
       var rec = resolveLockRecord(name);
       var wantType = kind === 'warframe' ? 'Warframe'
@@ -1039,6 +1309,9 @@
     });
     var lockedArcaneNames = [];
     (Array.isArray(input.lockedArcanes) ? input.lockedArcanes : []).forEach(function (name) {
+      if (excludedArcaneSet[name]) {
+        throw new Error('Arcane ' + name + ' is both locked and excluded.');
+      }
       if (lockedArcaneNames.indexOf(name) >= 0) {
         throw new Error('Duplicate locked arcane: ' + name);
       }
@@ -1096,6 +1369,45 @@
     var frameAbilities = (kind === 'warframe' && frame && Array.isArray(frame.Abilities))
       ? frame.Abilities : [];
     var abilityLocks = Array.isArray(input.abilityLocks) ? input.abilityLocks : [];
+    // ---- v1.2 Helminth forced choice -----------------------------------
+    // input.helminthChoice = {donor, replacesIndex} pins the exact
+    // subsume the player picked. It is seeded into every start state
+    // (see lockedStartStates), so the beam's auto-pick can never add
+    // a different or additional subsume. Only meaningful with the
+    // helminth route on; with the route off the choice is inert.
+    var forcedChoice = null;
+    if (input.helminthChoice && routes.helminth) {
+      var hc = input.helminthChoice;
+      var donorEntry = null;
+      ctx.helminthAll.forEach(function (e) {
+        if (e.ability === hc.donor) donorEntry = e;
+      });
+      if (!donorEntry) {
+        throw new Error('Unknown helminth donor: ' + hc.donor +
+          ' (not a subsumable ability in the Helminth dataset).');
+      }
+      if (baseFrameName(donorEntry.frame) === baseFrameName(input.frameName)) {
+        throw new Error('Helminth donor ' + hc.donor + ' is from ' +
+          input.frameName + "'s own family — a frame cannot subsume its own ability.");
+      }
+      var ri = hc.replacesIndex;
+      if (typeof ri !== 'number' || ri % 1 !== 0 || ri < 0 || ri > 3) {
+        throw new Error('helminthChoice.replacesIndex must be an integer 0..3, got ' +
+          JSON.stringify(ri) + '.');
+      }
+      if (abilityLocks[ri]) {
+        throw new Error('helminthChoice replaces ability ' + (ri + 1) +
+          ' (' + (frameAbilities[ri] || 'unknown') +
+          '), but that ability is locked and can never be replaced.');
+      }
+      var replacedName = frameAbilities[ri] || ('Ability ' + (ri + 1));
+      forcedChoice = {
+        donor: donorEntry.ability, donorFrame: donorEntry.frame,
+        replacesIndex: ri, replacesAbility: replacedName,
+        diminishedText: donorEntry.diminishedText,
+        modelled: ctx.helminth.some(function (e) { return e.ability === donorEntry.ability; })
+      };
+    }
     var helmetListAll = routes.legacyHelmets
       ? (ctx.legacyHelmets[input.frameName] || []) : [];
     function fillRanks(mod) {
@@ -1117,6 +1429,7 @@
       var mods = [];
       if (routes.mods) {
         ctx.modPool.forEach(function (mod) {
+          if (excludedModSet[mod.name]) return; // v1.2 ban
           var touches = mod.effects.some(function (e) {
             return statSet.indexOf(e.stat) >= 0 && (!e.condition || routes.conditional);
           });
@@ -1124,7 +1437,8 @@
         });
       }
       var arcanes = routes.arcanes ? ctx.arcanes.filter(function (a) {
-        return a.effects.some(function (e) { return statSet.indexOf(e.stat) >= 0; }) &&
+        return !excludedArcaneSet[a.name] && // v1.2 ban
+               a.effects.some(function (e) { return statSet.indexOf(e.stat) >= 0; }) &&
                (!a.conditional || routes.conditional);
       }) : [];
       // Helminth subsume candidates (S3): dataset entries with
@@ -1139,10 +1453,11 @@
         });
       }) : [];
       var tomes = (routes.tome && routes.conditional) ? ctx.tomes.filter(function (t) {
-        return statSet.indexOf(t.stat) >= 0;
+        return !excludedModSet[t.name] && statSet.indexOf(t.stat) >= 0; // v1.2 ban
       }) : [];
       var auras = routes.aura ? ctx.auras.filter(function (a) {
-        return a.effects.some(function (e) {
+        return !excludedModSet[a.name] && // v1.2 ban (aura names are mod names)
+               a.effects.some(function (e) {
           return statSet.indexOf(e.stat) >= 0 && (!e.conditional || routes.conditional);
         });
       }) : [];
@@ -1385,6 +1700,17 @@
           else st.mods[n] = lockedRanks[n];
         });
         st.arcanes = lockedArcaneNames.slice();
+        // v1.2: a forced Helminth choice rides in every start state;
+        // expand() only adds a subsume to a state that has none, so
+        // the auto-pick can never override or stack on it. A
+        // non-modelled donor simply never matches a ctx.helminth
+        // entry in the contribution walk — no stat effect.
+        if (forcedChoice) {
+          st.subsume = {
+            ability: forcedChoice.donor, fromFrame: forcedChoice.donorFrame,
+            replacedAbility: forcedChoice.replacesAbility
+          };
+        }
         return st;
       }
       // Exilus variants come FIRST: on an exact score tie the search
@@ -1638,15 +1964,24 @@
     // to a solver stat are already inside `achieved` (see contributions)
     // and are flagged applied here; everything else is reported so a
     // real mechanic is never silently absent from the result.
-    function setBonusReport(state) {
-      var counts = setPieceCounts(ctx, state, input.supportSetPieces);
+    function setBonusReport(counts, plannedBySet) {
       var out = [];
-      Object.keys(counts).forEach(function (set) {
+      var allSets = {};
+      Object.keys(counts).forEach(function (set) { allSets[set] = 1; });
+      Object.keys(plannedBySet || {}).forEach(function (set) { allSets[set] = 1; });
+      Object.keys(allSets).forEach(function (set) {
+        var c = counts[set] || { focus: 0, support: 0 };
+        var planned = (plannedBySet && plannedBySet[set]) || 0;
         var sb = ctx.setBonuses[set];
-        var pieces = counts[set].focus + counts[set].support;
+        // v1.2: planned cross-gear pieces count in the totals
+        // immediately (Tacusin's decision — support gear is treated
+        // as already built); supportPieces keeps the legacy
+        // supportSetPieces counts only.
+        var pieces = c.focus + c.support + planned;
         if (!sb) {
-          out.push({ set: set, pieces: pieces, focusPieces: counts[set].focus,
-                     supportPieces: counts[set].support, parseStatus: 'unknown',
+          out.push({ set: set, pieces: pieces, focusPieces: c.focus,
+                     supportPieces: c.support, plannedPieces: planned,
+                     parseStatus: 'unknown',
                      perPiece: null, totalValue: null, applied: false, sourceText: '' });
           return;
         }
@@ -1654,8 +1989,9 @@
           return !!UT_TO_STAT[pp.upgradeType];
         }));
         out.push({
-          set: set, pieces: pieces, focusPieces: counts[set].focus,
-          supportPieces: counts[set].support, parseStatus: sb.parseStatus,
+          set: set, pieces: pieces, focusPieces: c.focus,
+          supportPieces: c.support, plannedPieces: planned,
+          parseStatus: sb.parseStatus,
           perPiece: sb.perPiece,
           totalValue: (sb.perPiece && sb.perPiece.length === 1 &&
                        typeof sb.perPiece[0].value === 'number')
@@ -1717,10 +2053,19 @@
         }
       });
       if (st.subsume) {
-        rNotes.push('Helminth subsume: ' + st.subsume.ability + ' (from ' +
-          st.subsume.fromFrame + ') replaces ' + st.subsume.replacedAbility +
-          '. Modelled effects are the diminished values from the Helminth ' +
-          'dataset; conditional effects count under the conditional route.');
+        if (forcedChoice && !forcedChoice.modelled &&
+            st.subsume.ability === forcedChoice.donor) {
+          rNotes.push('Helminth subsume (your choice): ' + st.subsume.ability +
+            ' (from ' + st.subsume.fromFrame + ') replaces ' +
+            st.subsume.replacedAbility + '. This subsume is NOT stat-modelled ' +
+            '— it is included as a build instruction only and does not move ' +
+            'any paper stat.');
+        } else {
+          rNotes.push('Helminth subsume: ' + st.subsume.ability + ' (from ' +
+            st.subsume.fromFrame + ') replaces ' + st.subsume.replacedAbility +
+            '. Modelled effects are the diminished values from the Helminth ' +
+            'dataset; conditional effects count under the conditional route.');
+        }
       }
       st.fusions.forEach(function (f) {
         if (f.kind === 'ascent') rNotes.push('Ascent Fusion: 3x ' + f.colour + ' -> 1 Tauforged ' + f.colour + '.');
@@ -1732,7 +2077,25 @@
       })) {
         rNotes.push('Conditional arcane effects are counted at full stacks for the whole build (paper stats).');
       }
-      var report = setBonusReport(st);
+      // v1.2 cross-gear plan for THIS finished build (main and
+      // cheapest each plan from their own final state).
+      var pieceCounts = setPieceCounts(ctx, st, input.supportSetPieces);
+      var focusNames = {};
+      Object.keys(st.mods).forEach(function (n) { focusNames[n] = 1; });
+      if (st.exilusMod) focusNames[st.exilusMod.name] = 1;
+      if (st.aura) focusNames[st.aura] = 1;
+      var focusCounts = {};
+      Object.keys(pieceCounts).forEach(function (set) {
+        focusCounts[set] = pieceCounts[set].focus;
+      });
+      var cg = crossGearPlan(ctx, {
+        crossGear: input.crossGear || null,
+        focusCounts: focusCounts, focusNames: focusNames,
+        legacySupport: input.supportSetPieces || null,
+        focusTypes: focusTypeSet, excludedMods: excludedModSet
+      });
+      cg.notes.forEach(function (n) { rNotes.push(n); });
+      var report = setBonusReport(pieceCounts, cg.plannedBySet);
       report.forEach(function (r) {
         if (r.pieces >= 2 && r.parseStatus !== 'parsed' && r.parseStatus !== 'unknown') {
           rNotes.push('Set bonus for ' + r.set + ' not modelled (prose effect)' +
@@ -1805,8 +2168,41 @@
       }
       slots.forEach(function (s, i) { s.index = i; });
 
+      // v1.2 breakdown: contributor chains in slot order (the fit's
+      // slotInfo order — the same order the slot list reports).
+      var orderedModNames = [];
+      (evRes.fit.slotInfo || []).forEach(function (info) {
+        if (!info.mod) return;
+        if (st.exilusMod && info.slot === slotLimit) return; // exilus steps separately
+        orderedModNames.push(info.mod);
+      });
+      var breakdown = frameBreakdown(ctx, frame, st, routes,
+        input.supportSetPieces, orderedModNames,
+        st.exilusMod ? st.exilusMod.name : null, input.frameName);
+      // v1.2 forced Helminth choice echoes: modelled choices name
+      // the replaced ability alongside arrangement.subsume;
+      // non-modelled choices ride as an instruction object.
+      var subsumeReplaces = (forcedChoice && st.subsume &&
+        st.subsume.ability === forcedChoice.donor)
+        ? forcedChoice.replacesAbility : null;
+      var subsumeInstruction = (forcedChoice && !forcedChoice.modelled &&
+        st.subsume && st.subsume.ability === forcedChoice.donor) ? {
+          donor: forcedChoice.donor, donorFrame: forcedChoice.donorFrame,
+          replacesAbility: forcedChoice.replacesAbility,
+          diminishedText: forcedChoice.diminishedText, modelled: false
+        } : null;
+      // A non-modelled forced subsume is NOT reported in
+      // arrangement.subsume (that field means "applied subsume") —
+      // subsumeInstruction above carries it instead.
+      var arrangementSubsume = subsumeInstruction ? null : (st.subsume ? {
+        ability: st.subsume.ability, fromFrame: st.subsume.fromFrame,
+        replacedAbility: st.subsume.replacedAbility
+      } : null);
+
       return {
         achieved: achieved,
+        breakdown: breakdown,
+        crossGearPlan: cg.plan,
         arrangement: {
           mods: costedMods,
           slots: slots,
@@ -1819,10 +2215,9 @@
           }),
           tome: st.tome || null,
           helmet: st.helmet || null,
-          subsume: st.subsume ? {
-            ability: st.subsume.ability, fromFrame: st.subsume.fromFrame,
-            replacedAbility: st.subsume.replacedAbility
-          } : null,
+          subsume: arrangementSubsume,
+          subsumeReplaces: subsumeReplaces,
+          subsumeInstruction: subsumeInstruction,
           formaUsed: evRes.fit.formaUsed,
           umbraFormaUsed: evRes.fit.umbraFormaUsed || 0,
           formaPlan: evRes.fit.formaPlan,
@@ -1884,7 +2279,8 @@
       result.cheapest = {
         achieved: ch.achieved, arrangement: ch.arrangement,
         setBonuses: ch.setBonuses, unmetTargets: ch.unmetTargets,
-        totalRankCost: ch.totalRankCost
+        totalRankCost: ch.totalRankCost,
+        breakdown: ch.breakdown, crossGearPlan: ch.crossGearPlan
       };
     }
     return result;
@@ -1994,8 +2390,19 @@
     }
     var achieved = {};
     ALL_STATS.forEach(function (k) { achieved[k] = round2(achievedRaw[k]); });
+    // v1.2 breakdown for the board editor: chains follow the board's
+    // own slot order (normal slots as listed, exilus after them).
+    var evalOrdered = [], evalExilus = null;
+    (pieces.slots || []).forEach(function (s) {
+      if (!s || !s.mod) return;
+      if (s.kind === 'exilus') evalExilus = s.mod;
+      else if (s.kind !== 'aura' && st.mods[s.mod] != null) evalOrdered.push(s.mod);
+    });
+    var breakdown = frameBreakdown(ctx, frame, st, routes,
+      pieces.supportSetPieces, evalOrdered, evalExilus, frameName);
     return {
       achieved: achieved,
+      breakdown: breakdown,
       capacityUsed: fit.capacityUsed,
       capacityMax: fit.capacityMax,
       formaUsed: fit.formaUsed,
