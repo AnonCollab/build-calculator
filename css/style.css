@@ -161,6 +161,19 @@ tr.bd-row td { background: var(--panel2); }
 }
 .excl-row span { color: var(--bad); }
 
+/* ---- v1.3: build intent + sustained floor + guide ---------------------- */
+.intent-off { opacity: .55; }
+#peak-line { font-weight: 600; margin: 4px 0; }
+#sustained-line { margin: 6px 0 2px; }
+.guide-step { padding: 2px 0; font-size: 14px; }
+.guide-final { padding: 4px 0; font-size: 14px; font-weight: 600; }
+.guide-card {
+  border: 1px solid var(--border); border-radius: 6px;
+  background: var(--panel2); padding: 8px 10px; margin: 8px 0;
+}
+.guide-card p { margin: 2px 0; font-size: 13px; }
+.guide-flag { color: var(--bad); font-weight: 600; }
+
 /* ---- Mobile layout (<=760px): single column, scrollable tab bar,
    tables scroll inside their wrappers (never the page), >=44px touch
    targets, >=16px input text (prevents iOS focus zoom). Desktop rules

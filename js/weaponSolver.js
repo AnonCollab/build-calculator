@@ -290,8 +290,19 @@
     }
   }
 
+  // v1.3: is this piece burst-class per the Stage 1 classification
+  // (data.conditionalClasses, keyed by piece name)? Unclassified and
+  // non-conditional pieces are never burst.
+  function isBurstPiece(ctx, name) {
+    var r = name ? ctx.condClasses[name] : null;
+    return !!(r && r.class === 'burst');
+  }
+
   function buildContext(data) {
     var ctx = {};
+    // v1.3 conditional-piece classes (Stage 1). Optional bundle
+    // key — absent means no intent pruning anywhere.
+    ctx.condClasses = (data && data.conditionalClasses) || {};
     var w = data.weapons || {};
     ctx.weapons = w.Weapons || w;
     ctx.modPool = [];
@@ -1066,6 +1077,14 @@
     (Array.isArray(input.excludedArcanes) ? input.excludedArcanes : []).forEach(function (n) {
       if (typeof n === 'string') excludedArcaneSet[n] = 1;
     });
+    // ---- v1.3 build intent -------------------------------------------------
+    // input.intent ('window' | 'upkeep') is consulted ONLY when the
+    // conditional route is on; 'window' / absent (or route off) is
+    // byte-identical to v1.2. 'upkeep' prunes burst-class pieces
+    // from the candidate builders below (search AND fill share
+    // them). Locks override the pruning and are flagged in notes.
+    var pruneBurst = routes.conditional && input.intent === 'upkeep';
+    function isBurst(name) { return isBurstPiece(ctx, name); }
     // v1.1: Maximize targets split off (fill phase raises them after
     // the hard targets solve); the beam sees only the hard targets.
     var split = splitTargets(input.targets);
@@ -1192,6 +1211,7 @@
       if (!routes.mods) return out;
       pool.mods.forEach(function (rec) {
         if (excludedModSet[rec.name]) return; // v1.2 ban
+        if (pruneBurst && isBurst(rec.name)) return; // v1.3 upkeep
         var touches = rec.effects.some(function (eff) {
           if (eff.conditional && !routes.conditional) return false;
           return statList.some(function (stat) {
@@ -1243,6 +1263,7 @@
         // arcanes and fill arcane swaps read their effects from it).
         if (!arcaneByName[entry.name]) arcaneByName[entry.name] = effs;
         if (excludedArcaneSet[entry.name]) return; // v1.2 ban
+        if (pruneBurst && isBurst(entry.name)) return; // v1.3 upkeep
         if (effs.some(function (eff) { return arcaneTouches(eff, statList); })) {
           names.push(entry.name);
         }
@@ -1837,6 +1858,34 @@
     }
     var originsW = fillChanged ? computeOriginsW(anchorEv.state, chosenEv.state) : null;
 
+    // ---- v1.3 sustained floor (parity with solver.js) ------------------
+    // The final build re-evaluated with burst-class pieces removed,
+    // via evaluateWeapon on the filtered board — no new math.
+    // Present only when the build actually uses ≥1 burst piece
+    // (mod, exilus or arcane); otherwise null. The evaluator stays
+    // intent-free: it scores the pieces it is given; filtering
+    // happens here.
+    function sustainedForW(st, slots) {
+      var hasBurst = false;
+      var kept = [];
+      (slots || []).forEach(function (s) {
+        if (!s.mod || s.kind === 'stance') return;
+        if (isBurst(s.mod)) { hasBurst = true; return; }
+        kept.push({ kind: s.kind, mod: s.mod, rank: s.rank });
+      });
+      var arcane = st.arcane || null;
+      if (arcane && isBurst(arcane)) { hasBurst = true; arcane = null; }
+      if (!hasBurst) return null;
+      var ev = evaluateWeapon(data, input.weaponName, input.attackIndex, {
+        slots: kept, arcane: arcane,
+        arcaneEffects: input.arcaneEffects || null,
+        conditional: routes.conditional,
+        formaBudget: input.formaBudget, umbraForma: input.umbraForma || 0,
+        extraModRecords: input.extraModRecords
+      }, input.progenitor || null);
+      return { achieved: ev.achieved, breakdown: ev.breakdown };
+    }
+
     function buildResult(evRes, org) {
     var st = evRes.state;
     var notes = [];
@@ -2043,6 +2092,7 @@
     return {
       achieved: achieved,
       breakdown: breakdown,
+      sustained: sustainedForW(st, slots),
       crossGearPlan: cgW.plan,
       forward: evRes.fwd,
       arrangement: {
@@ -2070,6 +2120,18 @@
       result.notes.unshift('No arrangement within the Forma budget fits the mod capacity; showing the best-scoring arrangement, which exceeds capacity.');
     }
     trimNotes.forEach(function (n) { result.notes.push(n); });
+    // v1.3: locked burst pieces kept in an upkeep build are flagged
+    // — the lock overrode the pruning.
+    if (pruneBurst) {
+      lockedModNames.forEach(function (n) {
+        if (isBurst(n)) {
+          result.notes.push('Locked ' + n + ' is a burst piece kept in an upkeep build because it is locked.');
+        }
+      });
+      if (lockedArcaneName && isBurst(lockedArcaneName)) {
+        result.notes.push('Locked ' + lockedArcaneName + ' is a burst piece kept in an upkeep build because it is locked.');
+      }
+    }
     if (lockedModNames.length || lockedArcaneName) {
       var lockNames = lockedModNames.concat(lockedArcaneName ? [lockedArcaneName] : []);
       result.unmetTargets.forEach(function (u) {
@@ -2101,7 +2163,8 @@
         achieved: ch.achieved, arrangement: ch.arrangement,
         setBonuses: ch.setBonuses, unmetTargets: ch.unmetTargets,
         totalRankCost: ch.totalRankCost,
-        breakdown: ch.breakdown, crossGearPlan: ch.crossGearPlan
+        breakdown: ch.breakdown, crossGearPlan: ch.crossGearPlan,
+        sustained: ch.sustained
       };
     }
     return result;
@@ -2111,7 +2174,11 @@
   // evaluateWeapon(data, weaponName, attackIndex, orderedPieces,
   // progenitor) scores ONE given arrangement with the solver's own
   // forward model + fitting (forwardCalc + fitWeapon — no second
-  // implementation). orderedPieces = {
+  // implementation).
+  // v1.3: evaluators are intent-free by design — they score the
+  // exact piece list given and never drop pieces; intent pruning
+  // lives in solve() (candidate pools) and in the sustained-floor
+  // filter at the buildResult call site. orderedPieces = {
   //   slots: [{kind: 'stance'|'normal'|'exilus', mod, rank}] in board
   //     order (the elemental sequence follows this order exactly),
   //   arcane: name | null, arcaneEffects: [...] (optional override),

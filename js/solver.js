@@ -294,8 +294,21 @@
     return built;
   }
 
+  // v1.3: is this piece burst-class per the Stage 1 classification
+  // (data.conditionalClasses, keyed by piece name)? Unclassified and
+  // non-conditional pieces are never burst.
+  function isBurstPiece(ctx, name) {
+    var r = name ? ctx.condClasses[name] : null;
+    return !!(r && r.class === 'burst');
+  }
+
   function buildContext(data) {
     var ctx = { unmappedUpgradeTypes: {} };
+
+    // v1.3 conditional-piece classes (Stage 1): {name: {kind, class,
+    // windowSeconds, maxStacks, trigger, evidence}}. Optional bundle
+    // key — absent means no intent pruning anywhere.
+    ctx.condClasses = (data && data.conditionalClasses) || {};
 
     var wf = (data.warframes && data.warframes.Warframes) || {};
     ctx.frames = wf;
@@ -1242,6 +1255,17 @@
       routes.exilus = false; routes.tome = false; routes.legacyHelmets = false;
       routes.helminth = false;
     }
+    // ---- v1.3 build intent -------------------------------------------------
+    // input.intent ('window' | 'upkeep') is consulted ONLY when the
+    // conditional route is on; with it off (or intent 'window' /
+    // absent) the solve is byte-identical to v1.2. 'upkeep' prunes
+    // burst-class pieces (Stage 1 classes) from every candidate
+    // pool below — search AND fill share buildCandidates. Locks and
+    // a forced Helminth choice override the pruning (explicit
+    // player direction) and are flagged in the result notes.
+    var intent = routes.conditional ? (input.intent || null) : null;
+    var pruneBurst = intent === 'upkeep';
+    function isBurst(name) { return isBurstPiece(ctx, name); }
     // v1.1: Maximize targets split off — the beam solves the hard
     // targets (atleast/closest) exactly as before; Maximize stats are
     // raised afterwards by the fill phase (see fillPhase below).
@@ -1444,6 +1468,7 @@
       if (routes.mods) {
         ctx.modPool.forEach(function (mod) {
           if (excludedModSet[mod.name]) return; // v1.2 ban
+          if (pruneBurst && isBurst(mod.name)) return; // v1.3 upkeep
           var touches = mod.effects.some(function (e) {
             return statSet.indexOf(e.stat) >= 0 && (!e.condition || routes.conditional);
           });
@@ -1452,6 +1477,7 @@
       }
       var arcanes = routes.arcanes ? ctx.arcanes.filter(function (a) {
         return !excludedArcaneSet[a.name] && // v1.2 ban
+               !(pruneBurst && isBurst(a.name)) && // v1.3 upkeep
                a.effects.some(function (e) { return statSet.indexOf(e.stat) >= 0; }) &&
                (!a.conditional || routes.conditional);
       }) : [];
@@ -1462,15 +1488,19 @@
       // UNLOCKED ability.
       var subsumes = (routes.helminth && frameAbilities.length) ? ctx.helminth.filter(function (e) {
         if (baseFrameName(e.frame) === baseFrameName(input.frameName)) return false;
+        if (pruneBurst && isBurst(e.ability)) return false; // v1.3 upkeep
         return e.effects.some(function (ef) {
           return statSet.indexOf(ef.stat) >= 0 && (!ef.conditional || routes.conditional);
         });
       }) : [];
       var tomes = (routes.tome && routes.conditional) ? ctx.tomes.filter(function (t) {
-        return !excludedModSet[t.name] && statSet.indexOf(t.stat) >= 0; // v1.2 ban
+        return !excludedModSet[t.name] && // v1.2 ban
+               !(pruneBurst && isBurst(t.name)) && // v1.3 upkeep
+               statSet.indexOf(t.stat) >= 0;
       }) : [];
       var auras = routes.aura ? ctx.auras.filter(function (a) {
         return !excludedModSet[a.name] && // v1.2 ban (aura names are mod names)
+               !(pruneBurst && isBurst(a.name)) && // v1.3 upkeep
                a.effects.some(function (e) {
           return statSet.indexOf(e.stat) >= 0 && (!e.conditional || routes.conditional);
         });
@@ -2016,6 +2046,50 @@
       return out.sort(function (a, b) { return a.set < b.set ? -1 : 1; });
     }
 
+    // ---- v1.3 sustained floor ------------------------------------------
+    // The final build re-evaluated with burst-class pieces removed,
+    // via the forward evaluator on the filtered piece list — no new
+    // math. Present only when the build actually uses ≥1 burst
+    // piece (mod, exilus, aura, arcane, Tome or subsume); otherwise
+    // null. The evaluators themselves stay intent-free: they score
+    // the piece list they are given, filtering happens here.
+    function sustainedFor(st) {
+      var hasBurst = false;
+      function keep(name) {
+        if (isBurst(name)) { hasBurst = true; return false; }
+        return true;
+      }
+      var slots = [];
+      if (st.aura && keep(st.aura)) {
+        slots.push({ kind: 'aura', mod: st.aura, rank: null });
+      }
+      Object.keys(st.mods).forEach(function (n) {
+        if (keep(n)) slots.push({ kind: 'normal', mod: n, rank: st.mods[n] });
+      });
+      if (st.exilusMod && keep(st.exilusMod.name)) {
+        slots.push({ kind: 'exilus', mod: st.exilusMod.name, rank: st.exilusMod.rank });
+      }
+      var keptArcanes = st.arcanes.filter(keep);
+      var keptTome = (st.tome && keep(st.tome)) ? st.tome : null;
+      var keptSubsume = st.subsume || null;
+      if (keptSubsume && !keep(keptSubsume.ability)) keptSubsume = null;
+      if (!hasBurst) return null;
+      var ev = evaluateFrame(data, input.frameName, {
+        slots: slots, arcanes: keptArcanes,
+        shards: st.shards.map(function (s) {
+          return { colour: s.colour, tier: s.tier, stat: s.stat };
+        }),
+        tome: keptTome, helmet: st.helmet || null, subsume: keptSubsume,
+        conditional: routes.conditional,
+        formaBudget: input.formaBudget, umbraForma: input.umbraForma || 0,
+        reactor: input.reactor, itemKind: input.itemKind,
+        companionEntry: input.companionEntry, ownerStats: input.ownerStats,
+        supportSetPieces: input.supportSetPieces,
+        extraModRecords: input.extraModRecords
+      });
+      return { achieved: ev.achieved, breakdown: ev.breakdown };
+    }
+
     function buildResult(evRes, org) {
       var st = evRes.state;
       var rNotes = [];
@@ -2216,6 +2290,7 @@
       return {
         achieved: achieved,
         breakdown: breakdown,
+        sustained: sustainedFor(st),
         crossGearPlan: cg.plan,
         arrangement: {
           mods: costedMods,
@@ -2250,6 +2325,24 @@
       result.notes.unshift('No arrangement within the Forma budget fits the mod capacity; showing the best-scoring arrangement, which exceeds capacity.');
     }
     trimNotes.forEach(function (n) { result.notes.push(n); });
+    // v1.3: locked (or explicitly chosen) burst pieces kept in an
+    // upkeep build are flagged — the lock/choice overrode pruning.
+    if (pruneBurst) {
+      lockedModNames.forEach(function (n) {
+        if (isBurst(n)) {
+          result.notes.push('Locked ' + n + ' is a burst piece kept in an upkeep build because it is locked.');
+        }
+      });
+      lockedArcaneNames.forEach(function (n) {
+        if (isBurst(n)) {
+          result.notes.push('Locked ' + n + ' is a burst piece kept in an upkeep build because it is locked.');
+        }
+      });
+      if (forcedChoice && isBurst(forcedChoice.donor)) {
+        result.notes.push('Helminth choice ' + forcedChoice.donor +
+          ' is a burst piece kept in an upkeep build because it was explicitly chosen.');
+      }
+    }
     if (lockedModNames.length || lockedArcaneNames.length) {
       var lockNames = lockedModNames.concat(lockedArcaneNames);
       result.unmetTargets.forEach(function (u) {
@@ -2294,7 +2387,8 @@
         achieved: ch.achieved, arrangement: ch.arrangement,
         setBonuses: ch.setBonuses, unmetTargets: ch.unmetTargets,
         totalRankCost: ch.totalRankCost,
-        breakdown: ch.breakdown, crossGearPlan: ch.crossGearPlan
+        breakdown: ch.breakdown, crossGearPlan: ch.crossGearPlan,
+        sustained: ch.sustained
       };
     }
     return result;
@@ -2304,6 +2398,10 @@
   // evaluateFrame(data, frameName, orderedPieces) scores ONE given
   // arrangement with the solver's own forward math (contributions +
   // achievedFrom + fitCapacity — no second implementation).
+  // v1.3: evaluators are intent-free by design — they score the
+  // exact piece list given and never drop pieces; intent pruning
+  // lives in solve() (candidate pools) and in the sustained-floor
+  // filter at the buildResult call site.
   // orderedPieces = {
   //   slots: [{kind: 'aura'|'normal'|'exilus', mod, rank}],  // board order
   //   arcanes: [name], shards: [{colour, tier, stat}],
