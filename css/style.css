@@ -102,6 +102,10 @@ a { color: var(--accent); }
 
 /* ---- S4 additions ---------------------------------------------------- */
 .tablewrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+/* The hidden attribute must always win: an author display rule (e.g.
+   .parts { display: grid }) otherwise overrides the UA's [hidden]
+   handling and panels show even when app.js hides them. */
+[hidden] { display: none !important; }
 .parts {
   display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
   gap: 6px 16px;
