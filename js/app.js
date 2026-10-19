@@ -52,6 +52,12 @@
  * table (with its breakdown chain). State v7 carries
  * channelPreference + the frameTargets.channelDrain entry; v6 saves
  * migrate with the 'efficiency' default.
+ *
+ * v1.5.1 (site): Spare the shards — a "Spare the shards" toggle in
+ * the frame Routes panel (Warframe category only): the solver
+ * prefers spending Forma (up to the budget) over Archon Shards for
+ * stat targets (input.spareShards). State v9 carries `spareShards`;
+ * v8 and older saves migrate to false.
  */
 (function () {
   'use strict';
@@ -246,7 +252,7 @@
     ROUTES_FRAME.forEach(function (r) { routesFrame[r.key] = r.def; });
     ROUTES_WEAPON.forEach(function (r) { routesWeapon[r.key] = r.def; });
     return {
-      version: 8,
+      version: 9,
       category: 'Warframe',
       intent: 'window',
       // v1.4: Hybrid burst allowance (1 | 2). routesFrame.augments
@@ -255,6 +261,10 @@
       // v1.5: channel preference ('efficiency' | 'duration') — the
       // solver's ordering bias while a channelDrain target is active.
       channelPreference: 'efficiency',
+      // v1.5.1: spare-the-shards preference — a frame-category route
+      // toggle (state v9); the solver input flag input.spareShards.
+      // v8 and older saves migrate to false in mergeState.
+      spareShards: false,
       selections: {
         Warframe: null, Necramech: null, Companion: null,
         Primary: null, Secondary: null, Melee: null, Archgun: null,
@@ -406,7 +416,7 @@
   function mergeState(base, saved) {
     if (!saved || typeof saved !== 'object') return base;
     try {
-      if (saved.version === 2 || saved.version === 3 || saved.version === 4 || saved.version === 5 || saved.version === 6 || saved.version === 7 || saved.version === 8) {
+      if (saved.version === 2 || saved.version === 3 || saved.version === 4 || saved.version === 5 || saved.version === 6 || saved.version === 7 || saved.version === 8 || saved.version === 9) {
         if (catOf(saved.category).id === saved.category) base.category = saved.category;
         // v1.3: intent arrived in state v5; v2–v4 saves keep the
         // default 'window' (the engines' unset behaviour). v1.4:
@@ -506,6 +516,9 @@
         });
       }
       if (typeof saved.canFuseCoalescent === 'boolean') base.canFuseCoalescent = saved.canFuseCoalescent;
+      // v1.5.1: spareShards arrived in state v9; v8 and older saves
+      // keep the false default.
+      if (typeof saved.spareShards === 'boolean') base.spareShards = saved.spareShards;
       if (saved.forma === 'any' || (Number.isInteger(saved.forma) && saved.forma >= 0 && saved.forma <= 10)) {
         base.forma = saved.forma;
       }
@@ -533,6 +546,61 @@
       while (b.length % 4) b += '=';
       return JSON.parse(decodeURIComponent(escape(atob(b))));
     } catch (e) { return null; }
+  }
+
+  // ---- v1.5.1 Stage C: bit-packed share codes + build files ------------
+  var shareCodec = null;
+  function getShareCodec() {
+    if (shareCodec) return shareCodec;
+    if (typeof window !== 'undefined' && window.ShareCodec && SITE && SITE.registry) {
+      try { shareCodec = window.ShareCodec.create(SITE.registry); }
+      catch (e) { shareCodec = null; }
+    }
+    return shareCodec;
+  }
+  // A failed "#b=" decode is REPORTED (shareLoadError), never silently
+  // parsed — the boot falls back to the saved build and says so.
+  var shareLoadError = null;
+  // Returns the decoded state for a "#b=" hash, null when the code
+  // failed (error recorded), or undefined when the hash is not a code
+  // hash at all (the caller then tries the legacy path).
+  function decodeShareCode() {
+    if (!location.hash || location.hash.indexOf('#b=') !== 0) return undefined;
+    var codec = getShareCodec();
+    if (!codec) {
+      shareLoadError = 'Share codes are unavailable (the index registry ' +
+        'failed to load) — loaded your saved build instead.';
+      return null;
+    }
+    try {
+      var st = codec.decode(location.hash.slice(3));
+      // The codec carries only the PRESENCE of a board's assembled
+      // companion entry — it is a pure function of parts + shipped
+      // data, so re-assemble it exactly as everywhere else does.
+      if (st.board && st.board.extras && st.board.extras.companionEntry &&
+          st.board.extras.companionEntry.fromParts) {
+        st.board.extras.companionEntry = assembledCompanionFor(st);
+      }
+      return st;
+    } catch (e) {
+      shareLoadError = (e && /check out/.test(e.message))
+        ? "This share code doesn't check out — it may have been mistyped " +
+          'or cut off. Loaded your saved build instead.'
+        : 'That share link could not be read (' + (e ? e.message : 'error') +
+          ') — loaded your saved build instead.';
+      return null;
+    }
+  }
+  function assembledCompanionFor(st) {
+    var M = window.WFModular;
+    if (!M || !SITE || !st.parts) return null;
+    if (st.selections && st.selections.Companion === 'Moa') {
+      return M.assembleMOA(SITE.modular.modular, st.parts.moa);
+    }
+    if (st.selections && st.selections.Companion === 'Hound') {
+      return M.assembleHound(SITE.modular.modular, st.parts.hound);
+    }
+    return null;
   }
 
   var state = null;
@@ -911,6 +979,7 @@
       if (a) a.checked = !!state.wallet[c].canFuseAscent;
     });
     $('chk-coalescent').checked = !!state.canFuseCoalescent;
+    $('chk-spare-shards').checked = !!state.spareShards;
     $('sel-forma').value = state.forma === 'any' ? 'any' : String(state.forma);
     $('inp-umbra').value = state.umbraForma;
     $('inp-owner-health').value = state.ownerStats.health;
@@ -1011,6 +1080,8 @@
       if (a) state.wallet[c].canFuseAscent = a.checked;
     });
     state.canFuseCoalescent = $('chk-coalescent').checked;
+    // v1.5.1: spare-the-shards toggle (frame routes panel).
+    state.spareShards = $('chk-spare-shards').checked;
     var fv = $('sel-forma').value;
     state.forma = fv === 'any' ? 'any' : parseInt(fv, 10);
     state.umbraForma = Math.max(0, parseInt($('inp-umbra').value, 10) || 0);
@@ -1377,6 +1448,9 @@
       // v1.5: the Focus school picker is a frame-category route of
       // its own (no separate toggle — the pick IS the route).
       $('focus-block').hidden = cat.kind !== 'frame';
+      // v1.5.1: spare-the-shards prices a frame-only route (Archon
+      // Shards); the toggle shows for the Warframe category only.
+      $('spare-shards-block').hidden = cat.kind !== 'frame';
       if (cat.kind === 'frame') buildFocusChooser();
     }
   }
@@ -2203,6 +2277,9 @@
         }
         finput.channelPreference = state.channelPreference;
       }
+      // v1.5.1: spare-the-shards preference (frame category only —
+      // the solver flag is inert for the other kinds anyway).
+      if (state.spareShards) finput.spareShards = true;
       var hc = currentHelminthChoice();
       if (hc) finput.helminthChoice = hc;
       // v1.5: Focus school route — routes.focus = {school}, the
@@ -2523,7 +2600,16 @@
       catId: boardCatId,
       itemKey: currentItemKey(),
       slots: boardCur.slots.map(function (s) {
-        return { kind: s.kind, mod: s.mod, rank: s.rank };
+        var out = { kind: s.kind, mod: s.mod, rank: s.rank };
+        // v1.5.1: frame boards carry a slot's polarity when it differs
+        // from the innate fallback, plus its forma flags; old links
+        // lack the keys and restore exactly as before.
+        if (boardKind === 'frame' && (s.kind === 'normal' || s.kind === 'exilus')) {
+          if ((s.slotPolarity || null) !== (s.innatePolarity || null)) out.pol = s.slotPolarity || null;
+          if (s.formaApplied) out.f = 1;
+          if (s.umbraFormaApplied) out.uf = 1;
+        }
+        return out;
       }),
       extras: boardCur.extras
     };
@@ -2537,7 +2623,13 @@
     var names = boardCur.slots.map(function (s) { return s.mod; }).filter(Boolean);
     var ex = extraRecordsFor(names);
     var slots = boardCur.slots.map(function (s) {
-      return { kind: s.kind, mod: s.mod, rank: s.rank };
+      var out = { kind: s.kind, mod: s.mod, rank: s.rank };
+      // v1.5.1: frame boards score their arrangement as-is — the
+      // evaluator's given-polarity mode prices it via the pool formula.
+      if (boardKind === 'frame' && s.kind !== 'aura' && s.kind !== 'stance') {
+        out.polarity = s.slotPolarity || null;
+      }
+      return out;
     });
     if (boardKind === 'frame') {
       var e = boardCur.extras;
@@ -2739,6 +2831,10 @@
     $('btn-cell-ban').disabled = !s.mod || s.kind === 'aura';
     $('btn-cell-ban').textContent = s.mod && isExcludedMod(boardCatId || state.category, s.mod)
       ? 'Banned' : 'Ban this mod';
+    // v1.5.1: per-slot polarity picker (frame boards, non-aura cells).
+    var showPol = boardKind === 'frame' && s.kind !== 'aura';
+    $('cell-polarity-field').hidden = !showPol;
+    if (showPol) $('sel-cell-polarity').value = s.slotPolarity || '';
   }
 
   function afterBoardEdit() {
@@ -2897,6 +2993,7 @@
       return;
     }
     panel.hidden = false;
+    $('btn-board-reforma').hidden = boardKind !== 'frame';
     var ev = null, err = null;
     try { ev = evalBoard(); } catch (e) { err = e; }
     renderBoardGrid();
@@ -3032,6 +3129,103 @@
     saveState();
     afterBoardEdit();
   }
+  // ---- v1.5.1 forma tools ---------------------------------------------
+  // Board forma flags are an ATTRIBUTION of the polarity multiset:
+  // walking the non-aura cells in board order, a polarity still covered
+  // by the remaining innate pool costs nothing; each uncovered one is
+  // flagged forma (Umbra: umbra forma). The evaluator's pool formula
+  // counts the same total, so the flags and the capacity line agree.
+  function attributeFormaFlags() {
+    if (!boardCur || boardKind !== 'frame') return;
+    var remaining = {};
+    boardCur.slots.forEach(function (s) {
+      if (s.kind === 'normal' && s.innatePolarity) {
+        remaining[s.innatePolarity] = (remaining[s.innatePolarity] || 0) + 1;
+      }
+    });
+    boardCur.slots.forEach(function (s) {
+      if (s.kind === 'aura' || s.kind === 'stance') return;
+      var p = s.slotPolarity || null;
+      s.formaApplied = false;
+      s.umbraFormaApplied = false;
+      if (!p) return;
+      if (remaining[p] > 0) { remaining[p]--; return; }
+      if (p === 'Umbra') s.umbraFormaApplied = true; else s.formaApplied = true;
+    });
+  }
+
+  function boardPolarityChange() {
+    if (!boardCur || boardSel < 0) return;
+    var s = boardCur.slots[boardSel];
+    if (!s || s.kind === 'aura' || s.kind === 'stance') return;
+    s.slotPolarity = $('sel-cell-polarity').value || null;
+    attributeFormaFlags();
+    afterBoardEdit();
+  }
+
+  // Re-Forma: run the pool fit over the board's CURRENT mods/ranks and
+  // apply the optimal plan to the cells — mods never move. Free-matched
+  // cells take their mod's polarity (innate-covered, no flag),
+  // forma-matched cells take it plus the flag; innate polarities not
+  // consumed by free matches land on the remaining unmatched normal
+  // cells in board order; an unmatched exilus cell clears to None.
+  function boardReForma() {
+    if (!boardCur || boardKind !== 'frame') return;
+    var names = boardCur.slots.map(function (s) { return s.mod; }).filter(Boolean);
+    var e = boardCur.extras;
+    var res = window.Solver.evaluateFrame(evalBundle(), boardItemName, {
+      slots: boardCur.slots.map(function (s) {
+        return { kind: s.kind, mod: s.mod, rank: s.rank };
+      }),
+      arcanes: e.arcanes || [], shards: e.shards || [],
+      tome: e.tome, helmet: e.helmet, subsume: e.subsume,
+      focus: e.focus || null,
+      conditional: e.conditional,
+      formaBudget: 'any', umbraForma: 99,
+      reactor: true, itemKind: e.itemKind,
+      companionEntry: e.companionEntry, ownerStats: e.ownerStats,
+      supportSetPieces: e.supportSetPieces,
+      extraModRecords: extraRecordsFor(names)
+    });
+    if (!res || !res.plan) return;
+    var free = {}, forma = {}, umbra = {};
+    res.plan.free.forEach(function (n) { free[n] = 1; });
+    res.plan.forma.forEach(function (n) { forma[n] = 1; });
+    res.plan.umbra.forEach(function (n) { umbra[n] = 1; });
+    function modPol(s) {
+      var rec = s.mod ? (modRecord(s.mod) || modpoolRec(s.mod)) : null;
+      return (rec && rec.polarity && rec.polarity !== 'None') ? rec.polarity : null;
+    }
+    // Innate multiset left over after the free matches take theirs.
+    var rest = {};
+    boardCur.slots.forEach(function (s) {
+      if (s.kind === 'normal' && s.innatePolarity) {
+        rest[s.innatePolarity] = (rest[s.innatePolarity] || 0) + 1;
+      }
+    });
+    boardCur.slots.forEach(function (s) {
+      if (s.kind === 'normal' && s.mod && free[s.mod]) {
+        var p = modPol(s);
+        if (p && rest[p] > 0) rest[p]--;
+      }
+    });
+    var restQueue = [];
+    Object.keys(rest).forEach(function (p) {
+      for (var i = 0; i < rest[p]; i++) restQueue.push(p);
+    });
+    boardCur.slots.forEach(function (s) {
+      if (s.kind === 'aura' || s.kind === 'stance') return;
+      s.formaApplied = false;
+      s.umbraFormaApplied = false;
+      if (s.mod && umbra[s.mod]) { s.slotPolarity = 'Umbra'; s.umbraFormaApplied = true; }
+      else if (s.mod && forma[s.mod]) { s.slotPolarity = modPol(s); s.formaApplied = true; }
+      else if (s.mod && free[s.mod]) { s.slotPolarity = modPol(s); }
+      else if (s.kind === 'normal') { s.slotPolarity = restQueue.length ? restQueue.shift() : null; }
+      else { s.slotPolarity = null; }
+    });
+    afterBoardEdit();
+  }
+
   function boardReset() {
     if (!boardSolved) return;
     boardCur = { slots: cloneSlots(boardSolved.slots), extras: deepClone(boardSolved.extras) };
@@ -3079,6 +3273,13 @@
       else if (s.kind === 'stance') slot.slotPolarity = slot.innatePolarity = innate.stance;
       else if (s.kind === 'exilus') slot.slotPolarity = slot.innatePolarity = innate.exilus;
       else { slot.slotPolarity = slot.innatePolarity = innate.normals[n] || null; n++; }
+      // v1.5.1: a saved polarity/forma plan (frame boards) wins over
+      // the innate fallback; links without the keys restore as before.
+      if (b.kind === 'frame' && (s.kind === 'normal' || s.kind === 'exilus')) {
+        if ('pol' in s) slot.slotPolarity = s.pol || null;
+        if (s.f) slot.formaApplied = true;
+        if (s.uf) slot.umbraFormaApplied = true;
+      }
       if ((s.kind === 'aura' || s.kind === 'stance') && s.mod) {
         // Capacity furniture: magnitude |baseDrain| + maxRank, doubled
         // on a polarity match (the solvers' own bonus rule).
@@ -3696,7 +3897,7 @@
       fetchJSON('data/set_bonuses.json'), fetchJSON('data/links.json'),
       fetchJSON('data/acquisition.json'), fetchJSON('data/modpool.json'),
       fetchJSON('data/conditional_classes.json'), fetchJSON('data/channels.json'),
-      fetchJSON('data/focus.json')
+      fetchJSON('data/focus.json'), fetchJSON('data/registry.json')
     ]).then(function (parts) {
       SITE = {
         frames: parts[0], weapons: parts[1], mods: parts[2], arcanes: parts[3],
@@ -3704,14 +3905,18 @@
         modular: parts[8], helminth: parts[9], setBonuses: parts[10],
         links: parts[11], acquisition: parts[12], modpool: parts[13],
         conditionalClasses: parts[14], channels: parts[15],
-        focus: parts[16]
+        focus: parts[16], registry: parts[17]
       };
       SITE.modpoolByName = {};
       (SITE.modpool.mods || []).forEach(function (m) { SITE.modpoolByName[m.name] = m; });
       BUNDLE = assembleBundle(SITE);
       state = defaultState();
-      // Share-link state wins over localStorage.
-      state = mergeState(state, decodeHash() || loadSaved());
+      // Share-link state wins over localStorage. "#b=" links carry a
+      // bit-packed Stage C code; every older hash is legacy
+      // base64-JSON and decodes exactly as it always has.
+      var incoming = decodeShareCode();
+      if (incoming === undefined) incoming = decodeHash();
+      state = mergeState(state, incoming || loadSaved());
       buildControls();
       applyStateToUI();
       refreshCategoryUI();
@@ -3735,12 +3940,25 @@
       $('btn-swap-cancel').addEventListener('click', function () { $('board-swap').hidden = true; });
       $('btn-cell-pin').addEventListener('click', boardTogglePin);
       $('btn-cell-ban').addEventListener('click', boardBanSelected);
+      $('btn-board-reforma').addEventListener('click', boardReForma);
+      $('sel-cell-polarity').addEventListener('change', boardPolarityChange);
       $('btn-board-reset').addEventListener('click', boardReset);
       $('btn-share').addEventListener('click', function () {
         readUIFromControls();
-        var url = location.href.split('#')[0] + '#' + encodeHash(state);
+        // Stage C: the short bit-packed code is the default carrier.
+        // If this state holds something the codec cannot name, fall
+        // back to the legacy long link rather than dropping data.
+        var codec = getShareCodec();
+        var code = codec ? codec.encode(state) : null;
+        var url, note = '';
+        if (code) {
+          url = location.href.split('#')[0] + '#b=' + code;
+        } else {
+          url = location.href.split('#')[0] + '#' + encodeHash(state);
+          note = ' (This build needed the long link format.)';
+        }
         try { history.replaceState(null, '', url); } catch (e) { /* file:// */ }
-        function done() { $('calc-status').textContent = 'Share link copied.'; }
+        function done() { $('calc-status').textContent = 'Share link copied.' + note; }
         if (navigator.clipboard && navigator.clipboard.writeText) {
           navigator.clipboard.writeText(url).then(done, function () {
             window.prompt('Copy this share link:', url);
@@ -3748,6 +3966,51 @@
         } else {
           window.prompt('Copy this share link:', url);
         }
+      });
+      $('btn-download').addEventListener('click', function () {
+        readUIFromControls();
+        // The escape hatch: the full state as a JSON file, loadable
+        // via "Load build file" — carries everything, no size limit.
+        var name = (currentItemKey() || 'build').replace(/[^A-Za-z0-9_-]+/g, '-');
+        var blob = new Blob([JSON.stringify(state, null, 1)],
+          { type: 'application/json' });
+        var a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = name + '-build.json';
+        if (a.click) a.click();
+        try { URL.revokeObjectURL(a.href); } catch (e) { /* older engines */ }
+        $('calc-status').textContent = 'Build file downloaded.';
+      });
+      $('btn-load').addEventListener('click', function () { $('file-load').click(); });
+      $('file-load').addEventListener('change', function () {
+        var input = $('file-load');
+        var f = input.files && input.files[0];
+        input.value = '';
+        if (!f) return;
+        var read = f.text ? f.text() : new Promise(function (res, rej) {
+          var fr = new FileReader();
+          fr.onload = function () { res(fr.result); };
+          fr.onerror = function () { rej(new Error('read failed')); };
+          fr.readAsText(f);
+        });
+        Promise.resolve(read).then(function (text) {
+          var parsed = null;
+          try { parsed = JSON.parse(text); } catch (e) { /* reported below */ }
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            $('calc-status').textContent =
+              'That file is not a build file — nothing was loaded.';
+            return;
+          }
+          // Same state-apply path as a share link or a save.
+          state = mergeState(defaultState(), parsed);
+          applyStateToUI();
+          refreshCategoryUI();
+          restoreBoardFromState();
+          saveState();
+          $('calc-status').textContent = 'Build loaded from file.';
+        }, function () {
+          $('calc-status').textContent = 'Could not read that file.';
+        });
       });
       document.querySelector('main').addEventListener('change', function (e) {
         readUIFromControls();
@@ -3768,6 +4031,7 @@
       });
       restoreBoardFromState();
       renderAcquisition();
+      if (shareLoadError) $('calc-status').textContent = shareLoadError;
     }).catch(function (e) {
       $('calc-status').textContent = 'Failed to load site data: ' + e.message;
     });
