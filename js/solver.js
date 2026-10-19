@@ -236,6 +236,26 @@
  *    {school, nodes}. evaluateFrame takes pieces.focus in the same
  *    {school, nodes} shape (nodes omitted = the school's full
  *    modelled set) for board parity.
+ *
+ * v1.5.1 Stage B (spare the shards, warframe kind only):
+ *  - input.spareShards (bool, default false): Tacusin's preference —
+ *    when a stat target can be covered either by Archon Shards or by
+ *    mods paid for with Forma (within the build's Forma budget),
+ *    spend the Forma first and keep the shards free. (He previously
+ *    forced the trade by locking Primed Continuity; this automates
+ *    it.) Mechanism: a per-shard score weight inside scoreState
+ *    (0.05/shard via opts.spareShards — see the comment there for the
+ *    sizing), which reprices shard lanes above mod+Forma lanes
+ *    everywhere scoreState ranks states (beam selection, best-valid
+ *    tracking, the lock trim re-evaluation).
+ *    Nothing is banned: when mods + Forma within budget cannot meet
+ *    a target, shards are spent as before (pinned by test: the
+ *    golden scenario at Forma budget 0 falls back to shards), and
+ *    the weight can never outvote a target term. Locks are
+ *    untouched — a locked shard is impossible (shards are never
+ *    lockable) and locked mods still ride the start states.
+ *  - Invariance: flag unset/false -> scoreOpts carries no
+ *    spareShards field -> every score is byte-identical to Stage A.
  */
 (function () {
   'use strict';
@@ -1305,9 +1325,24 @@
 
   function modDrainAt(mod, rank) { return mod.baseDrain + rank; }
 
-  // Assign chosen mods to the frame's slots (greedy), then spend Forma.
-  // umbraForma (default 0) is a SEPARATE budget: only it can turn a slot
-  // Umbra to match an Umbra-polarity mod.
+  // Fit chosen mods to the frame's capacity under the POLARITY POOL
+  // model (v1.5.1, Tacusin's mechanic): once a slot is forma'd its
+  // polarity is freely swappable among the non-aura slots, so a build
+  // owns a pool = the frame's innate polarities + one polarity per
+  // forma spent. The fit is therefore counted from the pool, not from a
+  // slot assignment: (1) free matches — per polarity, the biggest-drain
+  // mods of that polarity up to the innate count (polarities never
+  // compete, so biggest-first per polarity is optimal); (2) forma spend
+  // — remaining unmatched mods, biggest saving first (saving = drain −
+  // ceil(drain/2)), each forma adds that mod's polarity to the pool and
+  // matches it, until capacity fits or the budget runs out. The exilus
+  // mod participates in the forma spend but is never free-matched (its
+  // slot has no innate polarity). umbraForma (default 0) is a SEPARATE
+  // budget: only it can match an Umbra-polarity mod. Slot PLACEMENT is
+  // derived after counting (slotInfo shape unchanged): free-matched
+  // mods into innate slots of their polarity, forma'd mods into the
+  // remaining slots preferring non-innate ones, leftovers ascending;
+  // the exilus mod stays pinned to the exilus slot.
   function fitCapacity(ctx, frame, state, formaBudget, reactor, umbraForma) {
     // Necramech/Companion items carry _slotCount/_baseCapacity markers
     // (set in solve): their capacity is rank-cap based, not reactor based.
@@ -1321,101 +1356,135 @@
     var chosen = Object.keys(state.mods).map(function (name) {
       return { name: name, mod: ctx.modByName[name], rank: state.mods[name] };
     });
-    // Greedy assignment: largest drain first, prefer a polarity match
-    // (name tiebreak keeps the assignment deterministic).
-    var order = chosen.slice().sort(function (a, b) {
-      return modDrainAt(b.mod, b.rank) - modDrainAt(a.mod, a.rank) ||
-             (a.name < b.name ? -1 : 1);
-    });
-    var free = slotPols.map(function (_, i) { return i; });
-    var assign = {}; // modName -> slotIndex
-    order.forEach(function (c) {
-      var idx = -1;
-      for (var i = 0; i < free.length; i++) {
-        if (slotPols[free[i]] && slotPols[free[i]] === c.mod.polarity) { idx = free[i]; break; }
-      }
-      if (idx < 0) idx = free[0];
-      free.splice(free.indexOf(idx), 1);
-      assign[c.name] = idx;
-    });
-    // Exilus slot: one extra slot with NO innate polarity, appended after
-    // the 8 normal slots. The exilus mod is pinned to it; the Forma pass
-    // below may polarise it like any other slot (same budget).
+    // Exilus slot: one extra slot with NO innate polarity, appended
+    // after the normal slots. The exilus mod is pinned to it.
+    var exEntry = null;
     if (state.exilusMod) {
       var exMod = ctx.modByName[state.exilusMod.name];
-      if (exMod) {
-        slotPols.push(null);
-        assign[state.exilusMod.name] = slotPols.length - 1;
-        chosen.push({
-          name: state.exilusMod.name, mod: exMod, rank: state.exilusMod.rank
-        });
+      if (exMod) exEntry = { name: state.exilusMod.name, mod: exMod, rank: state.exilusMod.rank };
+    }
+    var all = exEntry ? chosen.concat([exEntry]) : chosen.slice();
+
+    function polOf(c) {
+      var p = c.mod.polarity;
+      return (p && p !== 'None') ? p : null;
+    }
+    function drainOf(c) { return modDrainAt(c.mod, c.rank); }
+    function savingOf(c) { var d = drainOf(c); return d - Math.ceil(d / 2); }
+    // Deterministic candidate order: biggest saving, then biggest
+    // drain, then name — never input order.
+    function bySaving(a, b) {
+      return (savingOf(b) - savingOf(a)) || (drainOf(b) - drainOf(a)) ||
+             (a.name < b.name ? -1 : 1);
+    }
+    function byDrain(a, b) {
+      return (drainOf(b) - drainOf(a)) || (a.name < b.name ? -1 : 1);
+    }
+
+    var cost = all.reduce(function (s, c) { return s + drainOf(c); }, 0);
+    var matched = {};                       // modName -> true
+    var matchedFree = [], matchedForma = [], matchedUmbra = [];
+
+    // (1) Free matches from the innate pool (normal slots only).
+    var pool = {};
+    slotPols.forEach(function (p) { if (p) pool[p] = (pool[p] || 0) + 1; });
+    var byPol = {};
+    chosen.forEach(function (c) {
+      var p = polOf(c);
+      if (p) (byPol[p] = byPol[p] || []).push(c);
+    });
+    Object.keys(byPol).forEach(function (p) {
+      var list = byPol[p].slice().sort(byDrain);
+      var n = Math.min(pool[p] || 0, list.length);
+      for (var i = 0; i < n; i++) {
+        matched[list[i].name] = true;
+        matchedFree.push(list[i].name);
+        cost -= savingOf(list[i]);
       }
-    }
-    function costOf(c, pols) {
-      var d = modDrainAt(c.mod, c.rank);
-      return (pols[assign[c.name]] && pols[assign[c.name]] === c.mod.polarity)
-        ? Math.ceil(d / 2) : d;
-    }
-    function totalCost(pols) {
-      return chosen.reduce(function (s, c) { return s + costOf(c, pols); }, 0);
-    }
-    var innatePols = slotPols.slice(); // incl. the appended exilus slot
-    var pols = slotPols.slice();
-    var cost = totalCost(pols);
-    var formaPlan = [];
-    var regularUsed = 0;
+    });
+
+    // (2) Forma spend, then the Umbra Forma pass (separate budget).
     var budget = (formaBudget === 'any' || formaBudget == null) ? Infinity : formaBudget;
-    // Forma allocation (v1.1): biggest unmatched drains first. A
-    // slot's saving (drain - ceil(drain/2)) does not depend on other
-    // slots, so candidates are computed once and applied in
-    // descending-saving order. Slots already polarity-matched (innate
-    // match) never consume Forma; Umbra-polarity mods are skipped
-    // here — only the Umbra Forma pass below may match them.
-    function savingOf(c) {
-      var slot = assign[c.name];
-      if (pols[slot] === c.mod.polarity) return 0;
-      if (!c.mod.polarity) return 0;
-      var d = modDrainAt(c.mod, c.rank);
-      return d - Math.ceil(d / 2);
-    }
-    function bySavingDesc(a, b) {
-      return (b.saving - a.saving) || (assign[a.c.name] - assign[b.c.name]);
-    }
-    var formaCands = chosen.filter(function (c) { return c.mod.polarity !== 'Umbra'; })
-      .map(function (c) { return { c: c, saving: savingOf(c) }; })
-      .filter(function (x) { return x.saving > 0; })
-      .sort(bySavingDesc);
+    var regularUsed = 0;
+    var formaCands = all.filter(function (c) {
+      return !matched[c.name] && polOf(c) && polOf(c) !== 'Umbra' && savingOf(c) > 0;
+    }).sort(bySaving);
     for (var fi = 0; fi < formaCands.length && cost > capacityMax && regularUsed < budget; fi++) {
-      var fc = formaCands[fi];
-      pols[assign[fc.c.name]] = fc.c.mod.polarity;
-      formaPlan.push({ slot: assign[fc.c.name], polarity: fc.c.mod.polarity });
+      matched[formaCands[fi].name] = true;
+      matchedForma.push(formaCands[fi].name);
       regularUsed++;
-      cost = totalCost(pols);
+      cost -= savingOf(formaCands[fi]);
     }
-    // Umbra Forma pass: only slots actually holding an Umbra-polarity
-    // mod are candidates, and only the separate umbraForma budget pays.
     var umbraBudget = umbraForma || 0;
     var umbraUsedCount = 0;
-    var umbraCands = chosen.filter(function (c) { return c.mod.polarity === 'Umbra'; })
-      .map(function (c) { return { c: c, saving: savingOf(c) }; })
-      .filter(function (x) { return x.saving > 0; })
-      .sort(bySavingDesc);
+    var umbraCands = all.filter(function (c) {
+      return !matched[c.name] && polOf(c) === 'Umbra' && savingOf(c) > 0;
+    }).sort(bySaving);
     for (var ui = 0; ui < umbraCands.length && cost > capacityMax && umbraUsedCount < umbraBudget; ui++) {
-      var uc = umbraCands[ui];
-      pols[assign[uc.c.name]] = 'Umbra';
-      formaPlan.push({ slot: assign[uc.c.name], polarity: 'Umbra', umbra: true });
+      matched[umbraCands[ui].name] = true;
+      matchedUmbra.push(umbraCands[ui].name);
       umbraUsedCount++;
-      cost = totalCost(pols);
+      cost -= savingOf(umbraCands[ui]);
     }
+
+    // (3) Derived placement. Slot indices: 0..slotCount-1 normal, plus
+    // slotCount for the exilus slot when present.
+    var innatePols = exEntry ? slotPols.concat([null]) : slotPols.slice();
+    var pols = innatePols.slice();
+    var assign = {}; // modName -> slotIndex
+    var taken = {};
+    function freeSlots(filter) {
+      var out = [];
+      for (var i = 0; i < slotCount; i++) {
+        if (!taken[i] && filter(i)) out.push(i);
+      }
+      return out;
+    }
+    if (exEntry) { assign[exEntry.name] = slotCount; taken[slotCount] = true; }
+    var byName = {};
+    all.forEach(function (c) { byName[c.name] = c; });
+    // Free-matched mods into innate slots of their polarity.
+    matchedFree.slice().sort(function (a, b) { return byDrain(byName[a], byName[b]); })
+      .forEach(function (name) {
+        var c = byName[name];
+        var slots = freeSlots(function (i) { return innatePols[i] === polOf(c); });
+        if (slots.length) { assign[name] = slots[0]; taken[slots[0]] = true; }
+      });
+    // Forma'd mods (incl. Umbra) into remaining slots, non-innate first.
+    matchedForma.concat(matchedUmbra).forEach(function (name) {
+      var c = byName[name];
+      if (name === (exEntry && exEntry.name)) { pols[slotCount] = polOf(c); return; }
+      var slots = freeSlots(function (i) { return !innatePols[i]; });
+      if (!slots.length) slots = freeSlots(function () { return true; });
+      if (slots.length) {
+        assign[name] = slots[0]; taken[slots[0]] = true;
+        pols[slots[0]] = polOf(c);
+      }
+    });
+    // Leftover mods into the remaining slots, ascending.
+    all.forEach(function (c) {
+      if (c.name in assign) return;
+      var slots = freeSlots(function () { return true; });
+      if (slots.length) { assign[c.name] = slots[0]; taken[slots[0]] = true; }
+    });
+
+    var formaPlan = [];
+    matchedForma.forEach(function (name) {
+      if (name in assign) formaPlan.push({ slot: assign[name], polarity: polOf(byName[name]) });
+    });
+    matchedUmbra.forEach(function (name) {
+      if (name in assign) formaPlan.push({ slot: assign[name], polarity: 'Umbra', umbra: true });
+    });
     // Per-slot outcome (v1.1): the single source of truth the slot
     // list is derived from — which mod sits in which slot, the slot's
     // final polarity, and the mod's effective drain there.
     var bySlot = {};
-    chosen.forEach(function (c) { bySlot[assign[c.name]] = c; });
+    all.forEach(function (c) { if (c.name in assign) bySlot[assign[c.name]] = c; });
+    var planBySlot = {};
+    formaPlan.forEach(function (p) { planBySlot[p.slot] = p; });
     var slotInfo = innatePols.map(function (innate, i) {
       var c = bySlot[i] || null;
-      var planEntry = null;
-      formaPlan.forEach(function (p) { if (p.slot === i) planEntry = p; });
+      var planEntry = planBySlot[i] || null;
       return {
         slot: i,
         mod: c ? c.name : null,
@@ -1424,7 +1493,7 @@
         innatePolarity: innate,
         formaApplied: !!planEntry,
         umbraFormaApplied: !!(planEntry && planEntry.umbra),
-        effectiveDrain: c ? costOf(c, pols) : 0
+        effectiveDrain: c ? (matched[c.name] ? Math.ceil(drainOf(c) / 2) : drainOf(c)) : 0
       };
     });
     return {
@@ -1436,7 +1505,8 @@
       valid: cost <= capacityMax,
       assign: assign,
       pols: pols,
-      slotInfo: slotInfo
+      slotInfo: slotInfo,
+      matched: { free: matchedFree, forma: matchedForma, umbra: matchedUmbra }
     };
   }
 
@@ -1465,6 +1535,19 @@
     var tertiary = modCount(state) * 0.01 +
                    fit.formaUsed * 0.01 + pieces * 0.002 + state.fusions.length * 0.002;
     var score = shortfall * 10000 + closestDist * 100 + tertiary;
+    // v1.5.1 Stage B (spare the shards): with the preference on, each
+    // shard in the build carries a flat 0.05 score weight — sized
+    // ABOVE the whole tertiary economy (a shard otherwise costs
+    // 0.002-0.004 against 0.012+ per mod and 0.01 per Forma, so
+    // shard-spending lanes win every close trade by default), which
+    // makes lanes that cover targets with mods + Forma outrank lanes
+    // that spend shards. It stays far below the target terms (a 1%
+    // shortfall step = 100 points; a 1% closest step = 1; five
+    // shards max = 0.25), so a shard is still spent whenever mods +
+    // Forma within the Forma budget cannot meet a target, or a
+    // closest target gains more than the weight buys elsewhere.
+    // Preference, never prohibition.
+    if (opts && opts.spareShards) score += state.shards.length * 0.05;
     // v1.5 channel preference: an ORDERING bias only (see header) —
     // present solely while a channelDrain target is scored, sized to
     // outrank the tertiary economy term but never a target term.
@@ -1617,12 +1700,23 @@
       if (t && typeof t.lowerBetter === 'boolean') return t.lowerBetter;
       return true;
     }
-    // Preference bias plumbing for scoreState: non-null ONLY while
-    // a channelDrain target is active (invariance contract).
-    var scoreOpts = channelTargeted ? {
-      prefStat: channelPreference === 'duration'
-        ? 'abilityDuration' : 'abilityEfficiency'
-    } : null;
+    // Preference bias plumbing for scoreState: each field is present
+    // ONLY while its preference is active (invariance contract —
+    // with neither active, scoreOpts stays null and every score is
+    // byte-identical to the pre-preference engine).
+    // v1.5.1 Stage B: spare-the-shards is a warframe-kind preference
+    // (shards are a frame route; the other kinds never field shards,
+    // so the flag is inert for them even if passed).
+    var spareShards = kind === 'warframe' && !!input.spareShards;
+    var scoreOpts = null;
+    if (channelTargeted || spareShards) {
+      scoreOpts = {};
+      if (channelTargeted) {
+        scoreOpts.prefStat = channelPreference === 'duration'
+          ? 'abilityDuration' : 'abilityEfficiency';
+      }
+      if (spareShards) scoreOpts.spareShards = true;
+    }
 
     // ---- v1.5 Focus school route --------------------------------
     // input.routes.focus = {school} picks ONE school (warframe kind
@@ -2981,7 +3075,7 @@
   // lives in solve() (candidate pools) and in the sustained-floor
   // filter at the buildResult call site.
   // orderedPieces = {
-  //   slots: [{kind: 'aura'|'normal'|'exilus', mod, rank}],  // board order
+  //   slots: [{kind: 'aura'|'normal'|'exilus', mod, rank, polarity?}],  // board order; a polarity on any non-aura slot switches scoring to given mode (v1.5.1)
   //   arcanes: [name], shards: [{colour, tier, stat}],
   //   tome, helmet, subsume: {ability, fromFrame, replacedAbility},
   //   focus: {school, nodes?} (v1.5 — nodes omitted = full modelled set),
@@ -3086,9 +3180,65 @@
     if (pieces.subsume) st.subsume = pieces.subsume;
     var sums = contributions(ctx, st, routes, pieces.supportSetPieces);
     var achievedRaw = achievedFrom(ctx, frame, sums);
-    var fit = fitCapacity(ctx, frame, st,
-      pieces.formaBudget != null ? pieces.formaBudget : 'any',
-      pieces.reactor !== false, pieces.umbraForma || 0);
+    // v1.5.1: GIVEN-polarity mode. When any non-aura slot entry carries
+    // a `polarity` property, the board's arrangement is scored as-is:
+    // drain halves where the slot polarity matches the mod (a
+    // 'Universal' slot matches everything), and the forma count comes
+    // from the pool formula — polarized non-aura slots minus the
+    // multiset intersection of assigned vs innate polarities, with the
+    // Umbra excess reported separately. Without polarities the optimal
+    // pool fit runs instead, and its matched plan is returned for the
+    // editor's Re-Forma tool.
+    var anyGiven = (pieces.slots || []).some(function (s) {
+      return s && s.kind !== 'aura' && ('polarity' in s);
+    });
+    var fit = null, plan = null;
+    if (anyGiven) {
+      var gSlotCount = frame._slotCount || 8;
+      var polAt = {}, nameIdx = {}, assigned = {}, polarized = 0, ni = 0;
+      (pieces.slots || []).forEach(function (s) {
+        if (!s || s.kind === 'aura') return;
+        var idx = s.kind === 'exilus' ? gSlotCount : ni++;
+        var p = ('polarity' in s) ? (s.polarity || null) : null;
+        polAt[idx] = p;
+        if (p) { assigned[p] = (assigned[p] || 0) + 1; polarized++; }
+        if (s.mod && (st.mods[s.mod] != null ||
+            (st.exilusMod && st.exilusMod.name === s.mod))) nameIdx[s.mod] = idx;
+      });
+      var innateCounts = {};
+      (frame.Polarities || []).slice(0, gSlotCount).forEach(function (p) {
+        if (p) innateCounts[p] = (innateCounts[p] || 0) + 1;
+      });
+      var inter = 0;
+      Object.keys(assigned).forEach(function (p) {
+        inter += Math.min(assigned[p], innateCounts[p] || 0);
+      });
+      var gUmbra = Math.max(0, (assigned.Umbra || 0) - (innateCounts.Umbra || 0));
+      var gUsed = 0;
+      Object.keys(st.mods).concat(st.exilusMod ? [st.exilusMod.name] : [])
+        .forEach(function (name) {
+          var rec = ctx.modByName[name];
+          var rank = st.mods[name] != null ? st.mods[name] : st.exilusMod.rank;
+          var d = rec.baseDrain + rank;
+          var rp = (rec.polarity && rec.polarity !== 'None') ? rec.polarity : null;
+          var sp = polAt[nameIdx[name]];
+          gUsed += (sp && rp && (sp === rp || sp === 'Universal'))
+            ? Math.ceil(d / 2) : d;
+        });
+      var gMax = (typeof frame._baseCapacity === 'number'
+        ? frame._baseCapacity : (pieces.reactor !== false ? 60 : 30)) +
+        auraCapacityBonus(ctx, frame, st.aura);
+      fit = {
+        capacityUsed: gUsed, capacityMax: gMax,
+        formaUsed: (polarized - inter) - gUmbra, umbraFormaUsed: gUmbra,
+        valid: gUsed <= gMax
+      };
+    } else {
+      fit = fitCapacity(ctx, frame, st,
+        pieces.formaBudget != null ? pieces.formaBudget : 'any',
+        pieces.reactor !== false, pieces.umbraForma || 0);
+      plan = fit.matched || null;
+    }
     if (!fit.valid) {
       warnings.push('Capacity exceeded: ' + fit.capacityUsed +
         ' used / ' + fit.capacityMax + ' max.');
@@ -3116,7 +3266,8 @@
       formaUsed: fit.formaUsed,
       umbraFormaUsed: fit.umbraFormaUsed || 0,
       valid: fit.valid,
-      warnings: warnings
+      warnings: warnings,
+      plan: plan
     };
   }
 
