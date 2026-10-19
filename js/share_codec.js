@@ -14,12 +14,16 @@
  *    pipeline/build_index_registry.py). An ID never changes and is
  *    never reused, so a code decodes to the same build forever.
  *  - Schema: a 4-bit version field leads the payload. The encoder
- *    writes v2; decoders accept v1 and v2 and refuse anything else
- *    loudly. v2 (v1.5.2) widens two v1 layouts: board slots carry
- *    the polarity/forma bits on normal+exilus slots of WEAPON
+ *    writes v3; decoders accept v1, v2 and v3 and refuse anything
+ *    else loudly. v2 (v1.5.2) widens two v1 layouts: board slots
+ *    carry the polarity/forma bits on normal+exilus slots of WEAPON
  *    boards too (v1 wrote them for frame boards only), and weapon
  *    board extras gain a trailing optional overRankForma (u3,
  *    appended after the v1 fields so the v1 prefix is untouched).
+ *    v3 (v1.5.3) adds two fields, both version-gated on decode so
+ *    v1/v2 payloads parse bit-identically: the state-level omniAura
+ *    toggle (1 bit, after spareShards) and polarity/forma bits on
+ *    AURA slots (an aura Forma purchase; previously unrepresentable).
  *  - Checksum: a digit-polynomial over the base62 body
  *    (h = (h*33 + digit) mod 3844 = 62^2), rendered as the final 2
  *    base62 chars and verified BEFORE any field is parsed — a
@@ -34,7 +38,8 @@
  *    otherwise vanish).
  *  - Canonical form: fields at their defaults cost only their flag /
  *    mode bits (dontcare targets, empty wallet colours, absent board,
- *    ...). The decoder re-expands everything to a full v9 state.
+ *    ...). The decoder re-expands everything to a full v10 state
+ *    (v1/v2 payloads gain the v10 defaults: omniAura false).
  *  - encode() returns null (never throws, never guesses) when a state
  *    carries something the schema cannot name — the app then falls
  *    back to the legacy long link. Documented refusals: names absent
@@ -58,7 +63,7 @@
   'use strict';
 
   var B62 = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
-  var SCHEMA_VERSION = 2;
+  var SCHEMA_VERSION = 3;
 
   // Fixed enums (mirror site/js/app.js — the category order is the
   // app's CATEGORIES order; stat lists are the app's target stores).
@@ -580,7 +585,9 @@
           }
         }
         // v1: frame boards only. v2: weapon boards too (v1.5.2).
-        if (s.kind === 'normal' || s.kind === 'exilus') {
+        // v3: aura slots carry the bits too (v1.5.3) — an aura
+        // Forma purchase is board state like any other.
+        if (s.kind === 'normal' || s.kind === 'exilus' || s.kind === 'aura') {
           var hasPol = Object.prototype.hasOwnProperty.call(s, 'pol');
           w.wBool(hasPol);
           if (hasPol) {
@@ -612,8 +619,10 @@
           slot.rank = r.rBool() ? r.r(4) : null;
         }
         // v1 codes carry these bits on frame boards only; v2 on both.
-        if ((version >= 2 || kind === 'frame') &&
-            (sk === 'normal' || sk === 'exilus')) {
+        // v3 adds them on aura slots (v1/v2 aura slots have none).
+        if (((version >= 2 || kind === 'frame') &&
+             (sk === 'normal' || sk === 'exilus')) ||
+            (version >= 3 && sk === 'aura')) {
           if (r.rBool()) slot.pol = POLARITIES[r.r(4)];
           if (r.rBool()) slot.f = true;
           if (r.rBool()) slot.uf = true;
@@ -636,6 +645,7 @@
       w.wBool(state.hybridAllowance === 2);
       w.wBool(state.channelPreference === 'duration');
       w.wBool(!!state.spareShards);
+      w.wBool(!!state.omniAura); // v3 (v1.5.3): Omni Forma aura toggle
       // selections
       var selections = state.selections || {};
       SELECTION_KEYS.forEach(function (k) {
@@ -781,16 +791,18 @@
 
     function decodeState(r) {
       var version = r.r(4);
-      if (version !== 1 && version !== SCHEMA_VERSION) {
+      if (version < 1 || version > SCHEMA_VERSION) {
         throw CodecError('unsupported share code version ' + version);
       }
-      var st = { version: 9 };
+      var st = { version: 10 };
       st.category = CATEGORIES[r.r(4)];
       var intent = r.r(2);
       st.intent = intent === 1 ? 'upkeep' : intent === 2 ? 'hybrid' : 'window';
       st.hybridAllowance = r.rBool() ? 2 : 1;
       st.channelPreference = r.rBool() ? 'duration' : 'efficiency';
       st.spareShards = r.rBool();
+      // v3 field; v1/v2 payloads take the migration default.
+      st.omniAura = version >= 3 ? r.rBool() : false;
       st.selections = {};
       SELECTION_KEYS.forEach(function (k) {
         var mode = r.r(2);

@@ -256,6 +256,22 @@
  *    lockable) and locked mods still ride the start states.
  *  - Invariance: flag unset/false -> scoreOpts carries no
  *    spareShards field -> every score is byte-identical to Stage A.
+ *
+ * v1.5.3 (aura slot):
+ *  - input.omniAura (bool, default false): the build uses an Omni
+ *    Forma on the aura slot — the slot becomes a universal match
+ *    (capacity bonus x2 for any aura). A toggle, not a pool
+ *    (Tacusin's design: one forma on one slot). The Omni Forma
+ *    counts as 1 in the build's total formaUsed (it IS a Forma —
+ *    Tacusin's correction), but as a user declaration it is NOT
+ *    charged against the Forma budget: discretionary purchases
+ *    still respect the budget, so a total can read budget-spend + 1.
+ *    fitCapacity / evaluateFrame price it identically;
+ *    evaluateFrame takes pieces.omniAura in the same role.
+ *  - Without the toggle, the fit may buy the aura match with 1
+ *    regular Forma (see fitCapacity's header note for the purchase
+ *    discipline), and the aura mismatch bonus is the wiki's 80%
+ *    rounded down (see auraCapacityBonus).
  */
 (function () {
   'use strict';
@@ -1311,16 +1327,30 @@
   }
 
   // ---- capacity / forma fitting ----------------------------------------------
-  function auraCapacityBonus(ctx, frame, auraName) {
+  // Aura capacity bonus (wiki "Aura"): an aura GRANTS capacity equal
+  // to its drain magnitude (|baseDrain| + maxRank, e.g. 7 for most
+  // auras) — doubled when the aura slot's polarity matches, the plain
+  // magnitude in an unpolarized slot, and 80% of the magnitude rounded
+  // DOWN in a slot of a different polarity. Aura mods of polarity
+  // 'Any' always count as matching. slotPol === undefined reads the
+  // frame's innate AuraPolarity; callers pass the EFFECTIVE polarity
+  // instead (v1.5.3): a Forma-purchased polarity, or 'Omni' when the
+  // build's Omni Forma toggle is on ('Universal' — the polarity
+  // picker's name for the same thing — is treated identically).
+  // Pre-v1.5.3 the mismatch branch HALVED the bonus (floor(mag/2)) —
+  // an invented rule, never wiki-checked; it made Tacusin's Follie +
+  // Growing Power build read capacity 63 where the game reads 65.
+  function auraCapacityBonus(ctx, frame, auraName, slotPol) {
     if (!auraName) return 0;
     var a = ctx.auraByName[auraName];
     if (!a) return 0;
     var mag = Math.abs(a.baseDrain) + a.maxRank; // aura drain magnitude at max rank
-    var framePol = frame.AuraPolarity || null;
+    var framePol = slotPol === undefined ? (frame.AuraPolarity || null) : slotPol;
     if (a.polarity === 'Any') return mag * 2;
+    if (framePol === 'Omni' || framePol === 'Universal') return mag * 2; // universal match
     if (framePol && a.polarity === framePol) return mag * 2; // matching doubles
     if (!framePol || framePol === 'None') return mag;       // no slot polarity: neutral
-    return Math.floor(mag / 2);                              // mismatched halves (floor)
+    return Math.floor(mag * 0.8);                            // mismatch: 80%, rounded down
   }
 
   function modDrainAt(mod, rank) { return mod.baseDrain + rank; }
@@ -1343,13 +1373,34 @@
   // mods into innate slots of their polarity, forma'd mods into the
   // remaining slots preferring non-innate ones, leftovers ascending;
   // the exilus mod stays pinned to the exilus slot.
-  function fitCapacity(ctx, frame, state, formaBudget, reactor, umbraForma) {
+  // v1.5.3: the AURA slot stays out of the pool (it never swaps), but
+  // its polarity is spendable state of its own. auraOpts.omniAura (the
+  // build's Omni Forma toggle) makes the slot a universal match —
+  // bonus x2 for any aura — and the Omni Forma counts as 1 in the
+  // returned formaUsed total (Tacusin's correction: an Omni Forma is
+  // still a Forma), though it is never charged against formaBudget
+  // (the toggle is a user declaration, like a lock). Otherwise the fit may BUY
+  // the match with 1 regular Forma: the purchase is a capacity-side
+  // candidate inside the regular forma pass below, competing on gain
+  // (2*mag - current bonus) against the mods' drain savings, spent
+  // only while the fit is invalid and budget remains — the fit's
+  // existing spend-only-while-invalid discipline. Exact gain ties
+  // keep mods first (the aura candidate is appended last and the sort
+  // is stable). The outcome rides the return as auraBonus /
+  // auraSlotPolarity / auraFormaUsed / auraOmni.
+  function fitCapacity(ctx, frame, state, formaBudget, reactor, umbraForma, auraOpts) {
     // Necramech/Companion items carry _slotCount/_baseCapacity markers
     // (set in solve): their capacity is rank-cap based, not reactor based.
     var slotCount = frame._slotCount || 8;
+    var auraRec = state.aura ? ctx.auraByName[state.aura] : null;
+    var auraMag = auraRec ? Math.abs(auraRec.baseDrain) + auraRec.maxRank : 0;
+    var auraOmni = !!(auraOpts && auraOpts.omniAura && auraRec);
+    var auraBonus = auraCapacityBonus(ctx, frame, state.aura,
+      auraOmni ? 'Omni' : undefined);
+    var auraSlotPolarity = auraOmni ? 'Omni' : (frame.AuraPolarity || null);
+    var auraFormaUsed = 0;
     var capacityMax = (typeof frame._baseCapacity === 'number'
-      ? frame._baseCapacity : (reactor ? 60 : 30)) +
-      auraCapacityBonus(ctx, frame, state.aura);
+      ? frame._baseCapacity : (reactor ? 60 : 30)) + auraBonus;
     var slotPols = (frame.Polarities || []).slice(0, slotCount);
     while (slotPols.length < slotCount) slotPols.push(null);
 
@@ -1404,16 +1455,38 @@
     });
 
     // (2) Forma spend, then the Umbra Forma pass (separate budget).
+    // v1.5.3: the aura-match purchase rides this same pass as one
+    // extra candidate (see the header note): its gain is the bonus
+    // increase (2*mag - current bonus), positive exactly when the
+    // innate slot is neutral or mismatched and the aura is not
+    // 'Any'-polarity (those already match for free).
     var budget = (formaBudget === 'any' || formaBudget == null) ? Infinity : formaBudget;
     var regularUsed = 0;
     var formaCands = all.filter(function (c) {
       return !matched[c.name] && polOf(c) && polOf(c) !== 'Umbra' && savingOf(c) > 0;
     }).sort(bySaving);
-    for (var fi = 0; fi < formaCands.length && cost > capacityMax && regularUsed < budget; fi++) {
-      matched[formaCands[fi].name] = true;
-      matchedForma.push(formaCands[fi].name);
+    var spend = formaCands.map(function (c) { return { cand: c, gain: savingOf(c) }; });
+    if (!auraOmni && auraRec && auraRec.polarity !== 'Any' &&
+        auraMag * 2 - auraBonus > 0) {
+      spend.push({ aura: true, gain: auraMag * 2 - auraBonus });
+    }
+    // Stable sort by gain desc: formaCands arrive in bySaving order,
+    // so mods keep their order among themselves, and the aura
+    // candidate (appended last) loses exact ties to mods.
+    spend.sort(function (a, b) { return b.gain - a.gain; });
+    for (var fi = 0; fi < spend.length && cost > capacityMax && regularUsed < budget; fi++) {
+      var sp2 = spend[fi];
+      if (sp2.aura) {
+        capacityMax += sp2.gain;
+        auraBonus = auraMag * 2;
+        auraSlotPolarity = auraRec.polarity;
+        auraFormaUsed = 1;
+      } else {
+        matched[sp2.cand.name] = true;
+        matchedForma.push(sp2.cand.name);
+        cost -= savingOf(sp2.cand);
+      }
       regularUsed++;
-      cost -= savingOf(formaCands[fi]);
     }
     var umbraBudget = umbraForma || 0;
     var umbraUsedCount = 0;
@@ -1499,14 +1572,21 @@
     return {
       capacityUsed: cost,
       capacityMax: capacityMax,
-      formaUsed: regularUsed,
+      // +1 when the Omni toggle is on: the Omni Forma itself (see
+      // the header note) — counted in the total, not in the budget.
+      formaUsed: regularUsed + (auraOmni ? 1 : 0),
       umbraFormaUsed: umbraUsedCount,
       formaPlan: formaPlan,
       valid: cost <= capacityMax,
       assign: assign,
       pols: pols,
       slotInfo: slotInfo,
-      matched: { free: matchedFree, forma: matchedForma, umbra: matchedUmbra }
+      matched: { free: matchedFree, forma: matchedForma, umbra: matchedUmbra },
+      // v1.5.3: the aura slot's outcome (see the header note).
+      auraBonus: auraBonus,
+      auraSlotPolarity: auraSlotPolarity,
+      auraFormaUsed: auraFormaUsed,
+      auraOmni: auraOmni
     };
   }
 
@@ -2123,7 +2203,8 @@
       var sums = contributions(ctx, state, routes, input.supportSetPieces);
       var achieved = achievedFrom(ctx, frame, sums);
       var fit = fitCapacity(ctx, frame, state, input.formaBudget,
-                            input.reactor !== false, input.umbraForma || 0);
+                            input.reactor !== false, input.umbraForma || 0,
+                            input.omniAura ? { omniAura: true } : null);
       var sc = scoreFn(targets, achieved, fit, state, scoreOpts);
       return { state: state, achieved: achieved, fit: fit, score: sc.score,
                shortfall: sc.shortfall, closestDist: sc.closestDist || 0 };
@@ -2709,6 +2790,10 @@
         tome: keptTome, helmet: st.helmet || null, subsume: keptSubsume,
         focus: keptFocus,
         conditional: routes.conditional,
+        // v1.5.3: the floor's fit prices the aura slot exactly like
+        // the peak's (same toggle; the purchase discipline re-runs
+        // on the filtered state).
+        omniAura: !!input.omniAura,
         formaBudget: input.formaBudget, umbraForma: input.umbraForma || 0,
         reactor: input.reactor, itemKind: input.itemKind,
         companionEntry: input.companionEntry, ownerStats: input.ownerStats,
@@ -2862,13 +2947,19 @@
       var slots = [];
       if (kind === 'warframe') {
         var aRec = st.aura ? ctx.auraByName[st.aura] : null;
+        // v1.5.3: the aura cell reports the fit's outcome — a Forma
+        // purchase stamps its polarity + flag; the Omni toggle keeps
+        // the stored polarity at innate and rides as omniApplied
+        // (the toggle itself is build-level state, not cell state).
         slots.push({
           kind: 'aura', fitSlot: null, mod: st.aura || null,
           rank: aRec ? aRec.maxRank : null,
-          slotPolarity: frame.AuraPolarity || null,
+          slotPolarity: evRes.fit.auraFormaUsed
+            ? evRes.fit.auraSlotPolarity : (frame.AuraPolarity || null),
           innatePolarity: frame.AuraPolarity || null,
-          formaApplied: false, umbraFormaApplied: false,
-          effectiveDrain: st.aura ? -auraCapacityBonus(ctx, frame, st.aura) : 0,
+          formaApplied: !!evRes.fit.auraFormaUsed, umbraFormaApplied: false,
+          omniApplied: !!evRes.fit.auraOmni && !!st.aura,
+          effectiveDrain: st.aura ? -evRes.fit.auraBonus : 0,
           origin: org ? org.aura : 'target'
         });
       }
@@ -3123,9 +3214,14 @@
     var warnings = [];
     var st = emptyState(null);
     st._helmetFrame = frameName;
+    // v1.5.3: the aura slot entry may carry a stamped `polarity`
+    // (a Forma purchase made in the editor); pieces.omniAura is the
+    // build's Omni Forma toggle. Both price the aura bonus in the
+    // capacity block below — identically to fitCapacity.
+    var auraEntry = null;
     (pieces.slots || []).forEach(function (s) {
       if (!s || !s.mod) return;
-      if (s.kind === 'aura') { st.aura = s.mod; return; }
+      if (s.kind === 'aura') { st.aura = s.mod; auraEntry = s; return; }
       var rec = ctx.modByName[s.mod];
       if (!rec) {
         warnings.push('Unknown mod "' + s.mod + '" ignored — not in the ' +
@@ -3183,12 +3279,20 @@
     // v1.5.1: GIVEN-polarity mode. When any non-aura slot entry carries
     // a `polarity` property, the board's arrangement is scored as-is:
     // drain halves where the slot polarity matches the mod (a
-    // 'Universal' slot matches everything), and the forma count comes
-    // from the pool formula — polarized non-aura slots minus the
-    // multiset intersection of assigned vs innate polarities, with the
-    // Umbra excess reported separately. Without polarities the optimal
-    // pool fit runs instead, and its matched plan is returned for the
-    // editor's Re-Forma tool.
+    // 'Universal' slot matches everything EXCEPT Umbra — v1.5.3,
+    // Tacusin's ruling: only an Umbra Forma slot halves an Umbra mod;
+    // the weapon evaluator has priced it this way since v1.5.2), and
+    // the forma count comes from the pool formula — polarized
+    // non-aura slots minus the multiset intersection of assigned vs
+    // innate polarities, with the Umbra excess reported separately
+    // (an Umbra match in that accounting comes only from a slot
+    // whose polarity IS 'Umbra' — a 'Universal' slot never counts).
+    // Without polarities the optimal pool fit runs instead, and its
+    // matched plan is returned for the editor's Re-Forma tool.
+    // v1.5.3: the aura slot prices through auraCapacityBonus with
+    // the EFFECTIVE slot polarity — pieces.omniAura (the toggle) >
+    // the aura entry's stamped polarity (an editor Forma purchase,
+    // counted as 1 forma when it differs from innate) > innate.
     var anyGiven = (pieces.slots || []).some(function (s) {
       return s && s.kind !== 'aura' && ('polarity' in s);
     });
@@ -3222,21 +3326,51 @@
           var d = rec.baseDrain + rank;
           var rp = (rec.polarity && rec.polarity !== 'None') ? rec.polarity : null;
           var sp = polAt[nameIdx[name]];
-          gUsed += (sp && rp && (sp === rp || sp === 'Universal'))
+          gUsed += (sp && rp && (sp === rp ||
+                    (sp === 'Universal' && rp !== 'Umbra')))
             ? Math.ceil(d / 2) : d;
         });
+      // v1.5.3: aura pricing with the effective slot polarity. The
+      // Omni state — pieces.omniAura (the app's toggle), or a
+      // stamped polarity of 'Universal' reached by hand — is a
+      // universal match, and the Omni Forma counts 1 in formaUsed
+      // (Tacusin's correction: it is still a Forma), though never
+      // against a budget (given mode has none). Any other stamped
+      // polarity that differs from innate is a regular Forma
+      // purchase and counts 1 via gAuraForma.
+      var gAuraSlotPol = null, gAuraForma = 0;
+      if (st.aura) {
+        if (pieces.omniAura) gAuraSlotPol = 'Omni';
+        else if (auraEntry && ('polarity' in auraEntry) &&
+                 auraEntry.polarity != null) {
+          gAuraSlotPol = auraEntry.polarity;
+          if (gAuraSlotPol !== 'Universal' &&
+              gAuraSlotPol !== (frame.AuraPolarity || null)) gAuraForma = 1;
+        }
+      }
+      var gOmniForma = (st.aura &&
+        (pieces.omniAura || gAuraSlotPol === 'Universal')) ? 1 : 0;
+      var gAuraBonus = auraCapacityBonus(ctx, frame, st.aura,
+        gAuraSlotPol === null ? undefined : gAuraSlotPol);
       var gMax = (typeof frame._baseCapacity === 'number'
         ? frame._baseCapacity : (pieces.reactor !== false ? 60 : 30)) +
-        auraCapacityBonus(ctx, frame, st.aura);
+        gAuraBonus;
       fit = {
         capacityUsed: gUsed, capacityMax: gMax,
-        formaUsed: (polarized - inter) - gUmbra, umbraFormaUsed: gUmbra,
-        valid: gUsed <= gMax
+        formaUsed: (polarized - inter) - gUmbra + gAuraForma + gOmniForma,
+        umbraFormaUsed: gUmbra,
+        valid: gUsed <= gMax,
+        auraBonus: gAuraBonus,
+        auraSlotPolarity: gAuraSlotPol === null
+          ? (frame.AuraPolarity || null) : gAuraSlotPol,
+        auraFormaUsed: gAuraForma,
+        auraOmni: !!pieces.omniAura && !!st.aura
       };
     } else {
       fit = fitCapacity(ctx, frame, st,
         pieces.formaBudget != null ? pieces.formaBudget : 'any',
-        pieces.reactor !== false, pieces.umbraForma || 0);
+        pieces.reactor !== false, pieces.umbraForma || 0,
+        pieces.omniAura ? { omniAura: true } : null);
       plan = fit.matched || null;
     }
     if (!fit.valid) {
@@ -3267,7 +3401,13 @@
       umbraFormaUsed: fit.umbraFormaUsed || 0,
       valid: fit.valid,
       warnings: warnings,
-      plan: plan
+      plan: plan,
+      // v1.5.3: the aura slot's outcome, both modes (the editor's
+      // derive path stamps a fit-bought purchase from these).
+      auraBonus: fit.auraBonus || 0,
+      auraSlotPolarity: fit.auraSlotPolarity || null,
+      auraFormaUsed: fit.auraFormaUsed || 0,
+      auraOmni: !!fit.auraOmni
     };
   }
 
