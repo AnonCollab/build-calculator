@@ -13,8 +13,13 @@
  *    (site/data/registry.json, built by
  *    pipeline/build_index_registry.py). An ID never changes and is
  *    never reused, so a code decodes to the same build forever.
- *  - Schema v1: a 4-bit version field leads the payload. Decoders
- *    refuse other versions loudly.
+ *  - Schema: a 4-bit version field leads the payload. The encoder
+ *    writes v2; decoders accept v1 and v2 and refuse anything else
+ *    loudly. v2 (v1.5.2) widens two v1 layouts: board slots carry
+ *    the polarity/forma bits on normal+exilus slots of WEAPON
+ *    boards too (v1 wrote them for frame boards only), and weapon
+ *    board extras gain a trailing optional overRankForma (u3,
+ *    appended after the v1 fields so the v1 prefix is untouched).
  *  - Checksum: a digit-polynomial over the base62 body
  *    (h = (h*33 + digit) mod 3844 = 62^2), rendered as the final 2
  *    base62 chars and verified BEFORE any field is parsed — a
@@ -53,7 +58,7 @@
   'use strict';
 
   var B62 = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
-  var SCHEMA_VERSION = 1;
+  var SCHEMA_VERSION = 2;
 
   // Fixed enums (mirror site/js/app.js — the category order is the
   // app's CATEGORIES order; stat lists are the app's target stores).
@@ -115,7 +120,8 @@
     'subsume', 'focus', 'conditional', 'formaBudget', 'umbraForma',
     'itemKind', 'companionEntry', 'ownerStats', 'supportSetPieces'];
   var WEAPON_EXTRAS_KEYS = ['arcane', 'conditional', 'formaBudget',
-    'umbraForma', 'stance', 'progenitor', 'attackIndex', 'weaponName'];
+    'umbraForma', 'stance', 'progenitor', 'attackIndex', 'weaponName',
+    'overRankForma'];
 
   function CodecError(msg) { var e = new Error(msg); e.codec = true; return e; }
 
@@ -508,8 +514,17 @@
           return selections[catId] || null;
         });
       }
+      // v2: trailing over-rank level (absent on pre-v1.5.2 boards).
+      var orf = x.overRankForma == null ? null : x.overRankForma;
+      w.wBool(orf != null);
+      if (orf != null) {
+        if (!Number.isInteger(orf) || orf < 0 || orf > 5) {
+          throw CodecError('board overRankForma outside the schema domain: ' + orf);
+        }
+        w.w(orf, 3);
+      }
     }
-    function rWeaponExtras(r, catId, selections, parts) {
+    function rWeaponExtras(r, catId, selections, parts, version) {
       var x = {};
       x.arcane = r.rBool() ? r.rIndex('arcanes') : null;
       x.conditional = r.rBool();
@@ -528,6 +543,9 @@
         if (kind !== 'weapon' && kind !== 'companion') return null;
         return selections[catId] || null;
       }) : null;
+      if (version >= 2) {
+        x.overRankForma = r.rBool() ? r.r(3) : null;
+      }
       return x;
     }
     function wBoard(w, board, selections, parts) {
@@ -561,7 +579,8 @@
             w.w(s.rank, 4);
           }
         }
-        if (board.kind === 'frame' && (s.kind === 'normal' || s.kind === 'exilus')) {
+        // v1: frame boards only. v2: weapon boards too (v1.5.2).
+        if (s.kind === 'normal' || s.kind === 'exilus') {
           var hasPol = Object.prototype.hasOwnProperty.call(s, 'pol');
           w.wBool(hasPol);
           if (hasPol) {
@@ -577,7 +596,7 @@
       if (board.kind === 'frame') wFrameExtras(w, extras);
       else wWeaponExtras(w, extras, catId, selections, parts);
     }
-    function rBoard(r, selections, parts) {
+    function rBoard(r, selections, parts, version) {
       if (!r.rBool()) return null;
       var kind = r.rBool() ? 'weapon' : 'frame';
       var catId = CATEGORIES[r.r(4)];
@@ -592,7 +611,9 @@
           slot.mod = r.rIndex(sk === 'aura' ? 'auras' : 'mods');
           slot.rank = r.rBool() ? r.r(4) : null;
         }
-        if (kind === 'frame' && (sk === 'normal' || sk === 'exilus')) {
+        // v1 codes carry these bits on frame boards only; v2 on both.
+        if ((version >= 2 || kind === 'frame') &&
+            (sk === 'normal' || sk === 'exilus')) {
           if (r.rBool()) slot.pol = POLARITIES[r.r(4)];
           if (r.rBool()) slot.f = true;
           if (r.rBool()) slot.uf = true;
@@ -600,7 +621,7 @@
         slots.push(slot);
       }
       var extras = kind === 'frame' ? rFrameExtras(r) :
-        rWeaponExtras(r, catId, selections, parts);
+        rWeaponExtras(r, catId, selections, parts, version);
       return { kind: kind, catId: catId, itemKey: itemKey, slots: slots, extras: extras };
     }
 
@@ -760,7 +781,7 @@
 
     function decodeState(r) {
       var version = r.r(4);
-      if (version !== SCHEMA_VERSION) {
+      if (version !== 1 && version !== SCHEMA_VERSION) {
         throw CodecError('unsupported share code version ' + version);
       }
       var st = { version: 9 };
@@ -825,7 +846,7 @@
         exc.push(r.rBool() ? r.rIndex('sets') : r.rIndex('mods'));
       }
       st.crossGear = { on: cgOn, include: inc, exclude: exc };
-      st.board = rBoard(r, st.selections, st.parts);
+      st.board = rBoard(r, st.selections, st.parts, version);
       st.routesFrame = {};
       ROUTES_FRAME_KEYS.forEach(function (k) { st.routesFrame[k] = r.rBool(); });
       st.routesWeapon = {};
