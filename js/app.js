@@ -397,7 +397,20 @@
       if (s.mod != null && typeof s.mod !== 'string') return null;
       var r = s.rank == null ? null : parseInt(s.rank, 10);
       if (r != null && (!Number.isInteger(r) || r < 0)) return null;
-      slots.push({ kind: s.kind, mod: s.mod || null, rank: r });
+      var slot = { kind: s.kind, mod: s.mod || null, rank: r };
+      // v1.5.2: a board's polarity plan rides the merge too. (In
+      // v1.5.1 this rebuild dropped pol/f/uf, so a saved/shared
+      // board silently lost its manual polarities on restore —
+      // invisible then because restored boards fell back to innate
+      // polarities, which coincide for solver-produced plans.)
+      if (s.kind === 'normal' || s.kind === 'exilus') {
+        var POLS = ['Madurai', 'Naramon', 'Vazarin', 'Zenurik',
+          'Penjaga', 'Unairu', 'Umbra', 'Universal'];
+        if ('pol' in s) slot.pol = (s.pol == null || POLS.indexOf(s.pol) >= 0) ? (s.pol || null) : null;
+        if (s.f) slot.f = 1;
+        if (s.uf) slot.uf = 1;
+      }
+      slots.push(slot);
     }
     return {
       kind: saved.kind, catId: saved.catId, itemKey: saved.itemKey,
@@ -2573,7 +2586,10 @@
       stance: !(lastInput && lastInput.routes && lastInput.routes.stance === false),
       progenitor: (lastInput && lastInput.progenitor) || null,
       attackIndex: (lastInput && lastInput.attackIndex) || 0,
-      weaponName: lastInput && lastInput.weaponName
+      weaponName: lastInput && lastInput.weaponName,
+      // v1.5.2: the solve's over-rank level rides the board so the
+      // given-polarity evaluator prices capacity on the same level.
+      overRankForma: (res.arrangement && res.arrangement.overRankForma) || 0
     };
   }
 
@@ -2604,7 +2620,9 @@
         // v1.5.1: frame boards carry a slot's polarity when it differs
         // from the innate fallback, plus its forma flags; old links
         // lack the keys and restore exactly as before.
-        if (boardKind === 'frame' && (s.kind === 'normal' || s.kind === 'exilus')) {
+        // v1.5.2: weapon boards too (fitWeapon runs the pool model).
+        if ((boardKind === 'frame' || boardKind === 'weapon') &&
+            (s.kind === 'normal' || s.kind === 'exilus')) {
           if ((s.slotPolarity || null) !== (s.innatePolarity || null)) out.pol = s.slotPolarity || null;
           if (s.formaApplied) out.f = 1;
           if (s.umbraFormaApplied) out.uf = 1;
@@ -2627,6 +2645,11 @@
       // v1.5.1: frame boards score their arrangement as-is — the
       // evaluator's given-polarity mode prices it via the pool formula.
       if (boardKind === 'frame' && s.kind !== 'aura' && s.kind !== 'stance') {
+        out.polarity = s.slotPolarity || null;
+      }
+      // v1.5.2: weapon non-stance cells too (evaluateWeapon's given
+      // mode is the mirror of evaluateFrame's).
+      if (boardKind === 'weapon' && s.kind !== 'stance') {
         out.polarity = s.slotPolarity || null;
       }
       return out;
@@ -2653,6 +2676,10 @@
         conditional: we.conditional,
         formaBudget: we.formaBudget, umbraForma: we.umbraForma || 0,
         stance: we.stance !== false,
+        // v1.5.2: the board's exilus cell joins the given-mode pool;
+        // capacity rides the board's over-rank level.
+        exilusSlot: boardCur.slots.some(function (s) { return s.kind === 'exilus'; }),
+        overRankForma: we.overRankForma || 0,
         extraModRecords: ex
       }, we.progenitor || null);
   }
@@ -2706,8 +2733,11 @@
     if (!rec) return typeof s.effectiveDrain === 'number'
       ? { eff: s.effectiveDrain, granted: false, matched: false } : null;
     var base = (rec.baseDrain || 0) + (s.rank || 0);
+    // v1.5.2: a 'Universal' slot is the Omni wildcard — it matches
+    // any mod except Umbra (wiki "Omni Forma"), not Umbra too.
     var matched = !!(s.slotPolarity && rec.polarity &&
-      (s.slotPolarity === rec.polarity || s.slotPolarity === 'Universal'));
+      (s.slotPolarity === rec.polarity ||
+       (s.slotPolarity === 'Universal' && rec.polarity !== 'Umbra')));
     return {
       eff: matched ? Math.ceil(base / 2) : base,
       granted: false, matched: matched
@@ -2832,7 +2862,9 @@
     $('btn-cell-ban').textContent = s.mod && isExcludedMod(boardCatId || state.category, s.mod)
       ? 'Banned' : 'Ban this mod';
     // v1.5.1: per-slot polarity picker (frame boards, non-aura cells).
-    var showPol = boardKind === 'frame' && s.kind !== 'aura';
+    // v1.5.2: weapon boards too (the bar itself never opens for the
+    // stance cell — see the early return above).
+    var showPol = (boardKind === 'frame' || boardKind === 'weapon') && s.kind !== 'aura';
     $('cell-polarity-field').hidden = !showPol;
     if (showPol) $('sel-cell-polarity').value = s.slotPolarity || '';
   }
@@ -2993,7 +3025,8 @@
       return;
     }
     panel.hidden = false;
-    $('btn-board-reforma').hidden = boardKind !== 'frame';
+    // v1.5.2: Re-Forma works on weapon boards too (pool fit parity).
+    $('btn-board-reforma').hidden = boardKind !== 'frame' && boardKind !== 'weapon';
     var ev = null, err = null;
     try { ev = evalBoard(); } catch (e) { err = e; }
     renderBoardGrid();
@@ -3136,10 +3169,15 @@
   // flagged forma (Umbra: umbra forma). The evaluator's pool formula
   // counts the same total, so the flags and the capacity line agree.
   function attributeFormaFlags() {
-    if (!boardCur || boardKind !== 'frame') return;
+    if (!boardCur || (boardKind !== 'frame' && boardKind !== 'weapon')) return;
     var remaining = {};
     boardCur.slots.forEach(function (s) {
       if (s.kind === 'normal' && s.innatePolarity) {
+        remaining[s.innatePolarity] = (remaining[s.innatePolarity] || 0) + 1;
+      }
+      // v1.5.2: on weapon boards the Exilus slot's innate polarity is
+      // part of the pool too (the slot is pinned; its polarity swaps).
+      if (boardKind === 'weapon' && s.kind === 'exilus' && s.innatePolarity) {
         remaining[s.innatePolarity] = (remaining[s.innatePolarity] || 0) + 1;
       }
     });
@@ -3168,30 +3206,14 @@
   // cells take their mod's polarity (innate-covered, no flag),
   // forma-matched cells take it plus the flag; innate polarities not
   // consumed by free matches land on the remaining unmatched normal
-  // cells in board order; an unmatched exilus cell clears to None.
-  function boardReForma() {
-    if (!boardCur || boardKind !== 'frame') return;
-    var names = boardCur.slots.map(function (s) { return s.mod; }).filter(Boolean);
-    var e = boardCur.extras;
-    var res = window.Solver.evaluateFrame(evalBundle(), boardItemName, {
-      slots: boardCur.slots.map(function (s) {
-        return { kind: s.kind, mod: s.mod, rank: s.rank };
-      }),
-      arcanes: e.arcanes || [], shards: e.shards || [],
-      tome: e.tome, helmet: e.helmet, subsume: e.subsume,
-      focus: e.focus || null,
-      conditional: e.conditional,
-      formaBudget: 'any', umbraForma: 99,
-      reactor: true, itemKind: e.itemKind,
-      companionEntry: e.companionEntry, ownerStats: e.ownerStats,
-      supportSetPieces: e.supportSetPieces,
-      extraModRecords: extraRecordsFor(names)
-    });
-    if (!res || !res.plan) return;
+  // cells in board order; an unmatched exilus cell clears to None on
+  // frame boards (no innate there) and takes a leftover unit on
+  // weapon boards (its innate polarity is part of the weapon pool).
+  function applyFormaPlan(plan, weaponPool) {
     var free = {}, forma = {}, umbra = {};
-    res.plan.free.forEach(function (n) { free[n] = 1; });
-    res.plan.forma.forEach(function (n) { forma[n] = 1; });
-    res.plan.umbra.forEach(function (n) { umbra[n] = 1; });
+    plan.free.forEach(function (n) { free[n] = 1; });
+    plan.forma.forEach(function (n) { forma[n] = 1; });
+    plan.umbra.forEach(function (n) { umbra[n] = 1; });
     function modPol(s) {
       var rec = s.mod ? (modRecord(s.mod) || modpoolRec(s.mod)) : null;
       return (rec && rec.polarity && rec.polarity !== 'None') ? rec.polarity : null;
@@ -3202,9 +3224,15 @@
       if (s.kind === 'normal' && s.innatePolarity) {
         rest[s.innatePolarity] = (rest[s.innatePolarity] || 0) + 1;
       }
+      if (weaponPool && s.kind === 'exilus' && s.innatePolarity) {
+        rest[s.innatePolarity] = (rest[s.innatePolarity] || 0) + 1;
+      }
     });
     boardCur.slots.forEach(function (s) {
-      if (s.kind === 'normal' && s.mod && free[s.mod]) {
+      // A free-matched exilus mod consumes a pool unit too (weapon
+      // pool only — frame exilus matches are covered by its own flag).
+      if ((s.kind === 'normal' || (weaponPool && s.kind === 'exilus')) &&
+          s.mod && free[s.mod]) {
         var p = modPol(s);
         if (p && rest[p] > 0) rest[p]--;
       }
@@ -3221,9 +3249,59 @@
       else if (s.mod && forma[s.mod]) { s.slotPolarity = modPol(s); s.formaApplied = true; }
       else if (s.mod && free[s.mod]) { s.slotPolarity = modPol(s); }
       else if (s.kind === 'normal') { s.slotPolarity = restQueue.length ? restQueue.shift() : null; }
+      else if (weaponPool && s.kind === 'exilus') { s.slotPolarity = restQueue.length ? restQueue.shift() : null; }
       else { s.slotPolarity = null; }
     });
-    afterBoardEdit();
+  }
+
+  // Run the kind's pool fit over the board's CURRENT mods/ranks and
+  // stamp the optimal plan into the cells (mods never move; the
+  // stance cell is never touched). Shared by Re-Forma and by the
+  // BOARD-AS-STATE load fallback for boards that carry no polarity
+  // information of their own. Returns true when a plan was stamped.
+  function deriveBoardPlan() {
+    if (!boardCur) return false;
+    var names = boardCur.slots.map(function (s) { return s.mod; }).filter(Boolean);
+    var e = boardCur.extras;
+    var slots = boardCur.slots.map(function (s) {
+      return { kind: s.kind, mod: s.mod, rank: s.rank };
+    });
+    if (boardKind === 'weapon') {
+      var resW = window.WeaponSolver.evaluateWeapon(evalBundle(), e.weaponName,
+        e.attackIndex || 0, {
+          slots: slots,
+          arcane: e.arcane, conditional: e.conditional,
+          formaBudget: 'any', umbraForma: 99, stance: e.stance !== false,
+          extraModRecords: extraRecordsFor(names)
+        }, e.progenitor || null);
+      if (!resW || !resW.plan) return false;
+      applyFormaPlan(resW.plan, true);
+      // The fit's capacity rides on its own over-rank level — keep
+      // it on the board so the given-mode line prices the same.
+      boardCur.extras.overRankForma = resW.overRankForma || 0;
+      return true;
+    }
+    if (boardKind !== 'frame') return false;
+    var res = window.Solver.evaluateFrame(evalBundle(), boardItemName, {
+      slots: slots,
+      arcanes: e.arcanes || [], shards: e.shards || [],
+      tome: e.tome, helmet: e.helmet, subsume: e.subsume,
+      focus: e.focus || null,
+      conditional: e.conditional,
+      formaBudget: 'any', umbraForma: 99,
+      reactor: true, itemKind: e.itemKind,
+      companionEntry: e.companionEntry, ownerStats: e.ownerStats,
+      supportSetPieces: e.supportSetPieces,
+      extraModRecords: extraRecordsFor(names)
+    });
+    if (!res || !res.plan) return false;
+    applyFormaPlan(res.plan, false);
+    return true;
+  }
+
+  function boardReForma() {
+    if (!boardCur) return;
+    if (deriveBoardPlan()) afterBoardEdit();
   }
 
   function boardReset() {
@@ -3236,8 +3314,12 @@
 
   // Restore a board carried by state (share link / save) WITHOUT
   // running the solver: the board renders and is scored by the
-  // evaluator only. Slot polarity meta falls back to the item's
-  // innate polarities (a shared board carries no Forma plan).
+  // evaluator only. BOARD-AS-STATE (v1.5.2): a board carrying
+  // polarity information (pol/f/uf keys on any normal/exilus slot)
+  // restores VERBATIM — manual choices are never re-derived over.
+  // A board carrying NONE (legacy links, pre-v1.5.1 saves) gets the
+  // kind's pool fit run once here and the optimal plan stamped in,
+  // so the board on screen is always the full build.
   function restoreBoardFromState() {
     var b = state.board;
     if (!b || b.catId !== state.category) return;
@@ -3262,6 +3344,7 @@
     if (!boardItemName) { boardCur = null; return; }
     var innate = innatePolaritiesForBoard();
     var n = 0;
+    var sawPolInfo = false;
     var slots = b.slots.map(function (s) {
       var slot = {
         kind: s.kind, mod: s.mod, rank: s.rank,
@@ -3275,7 +3358,10 @@
       else { slot.slotPolarity = slot.innatePolarity = innate.normals[n] || null; n++; }
       // v1.5.1: a saved polarity/forma plan (frame boards) wins over
       // the innate fallback; links without the keys restore as before.
-      if (b.kind === 'frame' && (s.kind === 'normal' || s.kind === 'exilus')) {
+      // v1.5.2: weapon boards carry the same keys.
+      if ((b.kind === 'frame' || b.kind === 'weapon') &&
+          (s.kind === 'normal' || s.kind === 'exilus')) {
+        if ('pol' in s || s.f || s.uf) sawPolInfo = true;
         if ('pol' in s) slot.slotPolarity = s.pol || null;
         if (s.f) slot.formaApplied = true;
         if (s.uf) slot.umbraFormaApplied = true;
@@ -3295,8 +3381,26 @@
       }
       return slot;
     });
-    boardSolved = { slots: cloneSlots(slots), extras: deepClone(b.extras), achieved: null, unmetTargets: [] };
     boardCur = { slots: cloneSlots(slots), extras: deepClone(b.extras) };
+    // BOARD-AS-STATE load fallback: no polarity information anywhere
+    // on the board -> derive the optimal plan once and stamp it in
+    // (the solved snapshot below keeps it, so Reset restores the
+    // derived plan too, and the next save/share carries it). Any
+    // derivation failure degrades to the verbatim innate restore.
+    var derived = false;
+    if (!sawPolInfo) {
+      try { derived = deriveBoardPlan(); } catch (e4) { derived = false; }
+    }
+    if (derived) {
+      boardCur.slots.forEach(function (s) {
+        if (s.kind !== 'aura' && s.kind !== 'stance') {
+          var d = slotDrainInfo(s);
+          s.effectiveDrain = d ? d.eff : 0;
+        }
+      });
+      syncBoardState();
+    }
+    boardSolved = { slots: cloneSlots(boardCur.slots), extras: deepClone(boardCur.extras), achieved: null, unmetTargets: [] };
     boardSel = -1;
     var ev = null;
     try { ev = evalBoard(); } catch (e3) { ev = null; }
@@ -3325,9 +3429,13 @@
       if (boardKind === 'weapon') {
         var w = currentWeapon();
         if (w) {
-          out.normals = (w.entry.Polarities || []).slice();
-          out.stance = w.entry.StancePolarity || null;
-          out.exilus = w.entry.ExilusPolarity || null;
+          // v1.5.2: slot-data 'Universal'/'None' mean NO innate
+          // polarity (Haalvu's exilus, Dual Heat Swords' stance) —
+          // normalize so restores don't show a phantom match.
+          var np = function (p) { return (p && p !== 'None' && p !== 'Universal') ? p : null; };
+          out.normals = (w.entry.Polarities || []).map(np);
+          out.stance = np(w.entry.StancePolarity);
+          out.exilus = np(w.entry.ExilusPolarity);
         }
       } else if (cat.kind === 'frame') {
         var f = SITE.frames.warframes[state.selections.Warframe];
