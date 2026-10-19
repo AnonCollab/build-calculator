@@ -42,6 +42,16 @@
  * Helminth choice (eligibility follows the ability, live). Hybrid
  * intent joins the intent selects with a burst-allowance select;
  * state v6 carries routes.augments + hybridAllowance.
+ *
+ * v1.5 (site): channel upkeep — frames with a channeled ability
+ * (shipped data/channels.json) gain a "Channel upkeep" target row in
+ * the frame targets table (At least reads "at or below" — drain is
+ * lower-better; no Maximize) with the Prefer Efficiency / Prefer
+ * Duration dropdown in its priority cell, plus one muted formula
+ * footnote. Results show the achieved drain/sec in the achieved
+ * table (with its breakdown chain). State v7 carries
+ * channelPreference + the frameTargets.channelDrain entry; v6 saves
+ * migrate with the 'efficiency' default.
  */
 (function () {
   'use strict';
@@ -90,6 +100,28 @@
   function statLabel(stats, key) {
     for (var i = 0; i < stats.length; i++) if (stats[i].key === key) return stats[i].label;
     return key;
+  }
+  // v1.5 channel upkeep: the tracked channel mirrors the solver's
+  // rule — the HIGHEST-drain channeled ability among the frame's
+  // native abilities (shipped channels.json is keyed by ability).
+  function channelTrackForFrame(frameName) {
+    if (!frameName || !SITE || !SITE.channels) return null;
+    var abilities = (SITE.frames.warframes[frameName] || {}).abilities || [];
+    var byAbility = SITE.channels.abilities || {};
+    var best = null;
+    abilities.forEach(function (name) {
+      var rec = byAbility[name];
+      if (rec && typeof rec.baseDrainPerSec === 'number' &&
+          (!best || rec.baseDrainPerSec > best.baseDrainPerSec)) {
+        best = { ability: name, baseDrainPerSec: rec.baseDrainPerSec,
+                 resource: rec.resource || 'energy', note: rec.note || null };
+      }
+    });
+    return best;
+  }
+  function channelStatDef(track) {
+    return { key: 'channelDrain', lowerBetter: true,
+             label: 'Channel drain — ' + track.ability + ' (/s)' };
   }
   var FRAME_LABEL = {};
   FRAME_STATS.forEach(function (s) { FRAME_LABEL[s.key] = s.label; });
@@ -185,7 +217,9 @@
       companions: { Companions: site.frames.companions },
       weapons: site.weapons,
       legacyHelmets: site.helmets,
-      conditionalClasses: site.conditionalClasses
+      conditionalClasses: site.conditionalClasses,
+      channels: site.channels,
+      focus: site.focus
     };
   }
   function modularData() {
@@ -212,12 +246,15 @@
     ROUTES_FRAME.forEach(function (r) { routesFrame[r.key] = r.def; });
     ROUTES_WEAPON.forEach(function (r) { routesWeapon[r.key] = r.def; });
     return {
-      version: 6,
+      version: 8,
       category: 'Warframe',
       intent: 'window',
       // v1.4: Hybrid burst allowance (1 | 2). routesFrame.augments
       // (the Augments route) rides with the other route toggles.
       hybridAllowance: 1,
+      // v1.5: channel preference ('efficiency' | 'duration') — the
+      // solver's ordering bias while a channelDrain target is active.
+      channelPreference: 'efficiency',
       selections: {
         Warframe: null, Necramech: null, Companion: null,
         Primary: null, Secondary: null, Melee: null, Archgun: null,
@@ -231,7 +268,12 @@
         hound: { model: 'Hec', core: 'Garmr', bracket: 'Zubb', stabilizer: 'Frak' }
       },
       attackByItem: {},
-      frameTargets: emptyTargets(FRAME_STATS),
+      frameTargets: Object.assign(emptyTargets(FRAME_STATS), {
+        // v1.5: the channelDrain target entry rides the frame target
+        // store (merged/applied by the generic target plumbing; the
+        // row itself is built + shown only for channel frames).
+        channelDrain: { mode: 'dontcare', value: '', priority: '' }
+      }),
       weaponTargets: emptyTargets(WEAPON_STATS),
       dmgTargets: emptyTargets(DMG_STATS),
       ampTargets: emptyTargets(AMP_STATS),
@@ -245,6 +287,10 @@
       // 'auto' (solver chooses) | 'choose' (player pins the donor).
       helminthMode: 'auto',
       helminthChoice: { donor: '', replacesIndex: 0 },
+      // v1.5: Focus school pick (one school per build, like the
+      // Helminth choice) — null = no school. Rides state v8; v7 and
+      // older saves migrate to null in mergeState.
+      focusSchool: null,
       // v1.2: prescriptive cross-gear planning. on = the route
       // toggle; include = [{mod}] forced into the plan; exclude =
       // [setOrModName] kept out of it. (The v1.0–v1.1 support
@@ -360,7 +406,7 @@
   function mergeState(base, saved) {
     if (!saved || typeof saved !== 'object') return base;
     try {
-      if (saved.version === 2 || saved.version === 3 || saved.version === 4 || saved.version === 5 || saved.version === 6) {
+      if (saved.version === 2 || saved.version === 3 || saved.version === 4 || saved.version === 5 || saved.version === 6 || saved.version === 7 || saved.version === 8) {
         if (catOf(saved.category).id === saved.category) base.category = saved.category;
         // v1.3: intent arrived in state v5; v2–v4 saves keep the
         // default 'window' (the engines' unset behaviour). v1.4:
@@ -370,6 +416,12 @@
         // saves keep the default 1. routes.augments needs no line
         // here — mergeRoutes below carries it (default off).
         if (saved.hybridAllowance === 2) base.hybridAllowance = 2;
+        // v1.5: channelPreference arrived in state v7; v6 and older
+        // saves keep the 'efficiency' default.
+        if (saved.channelPreference === 'duration' ||
+            saved.channelPreference === 'efficiency') {
+          base.channelPreference = saved.channelPreference;
+        }
         if (saved.selections) {
           Object.keys(base.selections).forEach(function (k) {
             if (typeof saved.selections[k] === 'string') base.selections[k] = saved.selections[k];
@@ -408,6 +460,9 @@
           if (Number.isInteger(hri) && hri >= 0 && hri <= 3) {
             base.helminthChoice.replacesIndex = hri;
           }
+        }
+        if (typeof saved.focusSchool === 'string' && saved.focusSchool) {
+          base.focusSchool = saved.focusSchool;
         }
         mergeCrossGear(base.crossGear, saved.crossGear);
         base.board = mergeBoard(saved.board);
@@ -659,6 +714,31 @@
       tbody.appendChild(tr);
     });
   }
+  // v1.5: the channel row is STATIC markup in index.html (the
+  // site-data ID contract requires every literal id lookup to exist
+  // in the page) with the same id scheme as the generic target rows
+  // (ftgt-mode-channelDrain / ftgt-val-channelDrain), so the generic
+  // apply/read plumbing carries the target; buildControls moves the
+  // row below the stat rows. syncChannelRow shows it (plus the
+  // formula footnote) only for frames with a tracked channel.
+  function syncChannelRow() {
+    var cat = currentCat();
+    var track = cat.kind === 'frame'
+      ? channelTrackForFrame(state.selections.Warframe) : null;
+    var row = $('channel-row'), foot = $('channel-footnote');
+    if (row) row.hidden = !track;
+    if (foot) foot.hidden = !track;
+    if (track) {
+      var lbl = $('channel-ability-label');
+      if (lbl) {
+        lbl.textContent = '(' + track.ability + ' — ' +
+          track.baseDrainPerSec + ' ' +
+          (track.resource === 'shield' ? 'shields' : 'energy') + '/s base)';
+      }
+      var pref = $('channel-preference');
+      if (pref) pref.value = state.channelPreference;
+    }
+  }
   function buildRouteChecks(container, routes, prefix, subsetOnly) {
     routes.forEach(function (r) {
       if (subsetOnly && subsetOnly.indexOf(r.key) < 0) return;
@@ -673,6 +753,9 @@
   }
   function buildControls() {
     buildTargetRows($('targets-frame-table').querySelector('tbody'), FRAME_STATS, 'ftgt');
+    // v1.5: the static channel row ships first in the tbody; move it
+    // below the generated stat rows (appendChild re-parents).
+    $('targets-frame-table').querySelector('tbody').appendChild($('channel-row'));
     buildTargetRows($('targets-weapon-table').querySelector('tbody'), WEAPON_STATS, 'wtgt');
     buildTargetRows($('targets-damage-table').querySelector('tbody'), DMG_STATS, 'dtgt');
     buildTargetRows($('targets-amp-table').querySelector('tbody'), AMP_STATS, 'atgt');
@@ -904,6 +987,12 @@
       var av = parseInt(allowSel.value, 10);
       if (av === 1 || av === 2) state.hybridAllowance = av;
     }
+    // v1.5: channel preference (the select lives in the channel
+    // target row; read whenever it exists).
+    var prefSel = $('channel-preference');
+    if (prefSel && (prefSel.value === 'efficiency' || prefSel.value === 'duration')) {
+      state.channelPreference = prefSel.value;
+    }
     // Ability locks for the currently selected frame
     if (cat.kind === 'frame') {
       var frame = state.selections.Warframe;
@@ -939,6 +1028,12 @@
     if (hRep && hRep.options.length) {
       var hri2 = parseInt(hRep.value, 10);
       if (Number.isInteger(hri2)) state.helminthChoice.replacesIndex = hri2;
+    }
+    // v1.5 Focus school pick (frame category; read whenever the
+    // control exists — an unknown value normalises to no school).
+    var fSel = $('sel-focus-school');
+    if (fSel && fSel.options.length) {
+      state.focusSchool = fSel.value || null;
     }
     state.ownerStats.health = $('inp-owner-health').value;
     state.ownerStats.shield = $('inp-owner-shield').value;
@@ -1224,6 +1319,7 @@
 
   function refreshTargets() {
     var cat = currentCat();
+    syncChannelRow();
     $('targets-frame-wrap').hidden = !isFrameKind(cat.kind);
     $('targets-weapon-wrap').hidden = !isWeaponKind(cat.kind);
     $('targets-damage-wrap').hidden = !isWeaponKind(cat.kind);
@@ -1278,6 +1374,10 @@
         buildLockChecks();
         buildHelminthChooser();
       }
+      // v1.5: the Focus school picker is a frame-category route of
+      // its own (no separate toggle — the pick IS the route).
+      $('focus-block').hidden = cat.kind !== 'frame';
+      if (cat.kind === 'frame') buildFocusChooser();
     }
   }
 
@@ -1804,6 +1904,41 @@
     }
     $('helm-note').textContent = note;
   }
+  // v1.5: Focus school picker — the five schools from the shipped
+  // focus data (+ the static "No school" option in the markup). The
+  // note line names the picked school's stat-modelled nodes so the
+  // player sees what the pick can actually move before solving.
+  function buildFocusChooser() {
+    var sel = $('sel-focus-school');
+    if (!sel || !SITE.focus) return;
+    var cur = state.focusSchool || '';
+    sel.innerHTML = '';
+    var none = document.createElement('option');
+    none.value = ''; none.textContent = 'No school';
+    sel.appendChild(none);
+    (SITE.focus.schools || []).forEach(function (s) {
+      var o = document.createElement('option');
+      o.value = s.name; o.textContent = s.name;
+      sel.appendChild(o);
+    });
+    var known = (SITE.focus.schools || []).some(function (s) { return s.name === cur; });
+    sel.value = known ? cur : '';
+    var note = $('focus-note');
+    if (note) {
+      if (!known || !cur) {
+        note.textContent = '';
+      } else {
+        var modelled = (SITE.focus.nodes || []).filter(function (n) {
+          return n.school === cur && n.status === 'modelled';
+        }).map(function (n) { return n.name; });
+        note.textContent = modelled.length
+          ? 'Stat-modelled nodes: ' + modelled.join(', ') + '.'
+          : 'This school has no stat-modelled nodes — its nodes are ' +
+            'mechanic or Operator effects (listed in the Focus audit).';
+      }
+    }
+  }
+
   // The forced choice to pass on a solve, or undefined: only in
   // "I'll choose" mode with the route on and a donor that is legal
   // for the CURRENT frame (a stale own-family pick is dropped, not
@@ -2055,8 +2190,25 @@
         intent: state.intent,
         hybridAllowance: state.hybridAllowance
       };
+      // v1.5: channel upkeep target + preference — only for frames
+      // with a tracked channel (the row is hidden elsewhere; a stale
+      // entry in the store is ignored here too).
+      if (channelTrackForFrame(frame)) {
+        var cdt = state.frameTargets.channelDrain;
+        if (cdt && (cdt.mode === 'atleast' || cdt.mode === 'closest')) {
+          var cdv = parseFloat(cdt.value);
+          if (!isNaN(cdv)) {
+            finput.targets.channelDrain = { mode: cdt.mode, value: cdv, lowerBetter: true };
+          }
+        }
+        finput.channelPreference = state.channelPreference;
+      }
       var hc = currentHelminthChoice();
       if (hc) finput.helminthChoice = hc;
+      // v1.5: Focus school route — routes.focus = {school}, the
+      // Helminth-choice shape. No pick = the key stays off the
+      // request and the solve is focus-free.
+      if (state.focusSchool) routes.focus = { school: state.focusSchool };
       var fcg = crossGearInput();
       if (fcg) finput.crossGear = fcg;
       applyLocksToInput(finput);
@@ -2324,6 +2476,9 @@
         }),
         tome: arr.tome || null, helmet: arr.helmet || null,
         subsume: arr.subsume || null,
+        // v1.5: the build's Focus pick (kept nodes, post intent) —
+        // board evaluations re-apply exactly this set.
+        focus: arr.focus || null,
         conditional: !!(lastInput && lastInput.routes && lastInput.routes.conditional),
         formaBudget: lastInput ? lastInput.formaBudget : 'any',
         umbraForma: (lastInput && lastInput.umbraForma) || 0,
@@ -2390,6 +2545,7 @@
         slots: slots,
         arcanes: e.arcanes || [], shards: e.shards || [],
         tome: e.tome, helmet: e.helmet, subsume: e.subsume,
+        focus: e.focus || null,
         conditional: e.conditional,
         formaBudget: e.formaBudget, umbraForma: e.umbraForma || 0,
         reactor: true, itemKind: e.itemKind,
@@ -2414,10 +2570,14 @@
       return { defs: WEAPON_STATS.concat(DMG_STATS), store: weaponTargetStore() };
     }
     var cat = catOf(boardCatId || state.category);
-    return {
-      defs: cat.kind === 'companion' ? COMPANION_STATS : FRAME_STATS,
-      store: state.frameTargets
-    };
+    var defs = cat.kind === 'companion' ? COMPANION_STATS : FRAME_STATS;
+    // v1.5: board evaluations carry channelDrain for channel
+    // frames — show it (live) alongside the other stats.
+    if (cat.kind === 'frame') {
+      var track = channelTrackForFrame(state.selections.Warframe);
+      if (track) defs = defs.concat([channelStatDef(track)]);
+    }
+    return { defs: defs, store: state.frameTargets };
   }
   // At-least floors broken by a given achieved set — computed from the
   // target store (the solvers' unmetTargets describe the SOLVED build;
@@ -3020,6 +3180,19 @@
           (arr.subsumeReplaces || arr.subsume.replacedAbility)
       ]);
     }
+    if (arr.focus) {
+      groupInto(box, 'Focus school — ' + arr.focus.school,
+        (arr.focus.nodes || []).map(function (n) {
+          var rec = ((SITE.focus && SITE.focus.nodes) || [])
+            .filter(function (x) { return x.name === n; })[0];
+          var eff = rec ? (rec.effects || []).map(function (e) {
+            return '+' + fmt(e.value) + (e.unit === 'flat' ? '' : '%') +
+              ' ' + (FRAME_LABEL[e.stat] || e.stat);
+          }).join(', ') : '';
+          return n + (eff ? ' — ' + eff : '') +
+            (rec && rec.conditional ? ' (conditional)' : '');
+        }));
+    }
     groupInto(box, 'Set bonuses (focus + support + planned cross-gear)', setBonusLines(res.setBonuses));
     if (collect) {
       normal.forEach(function (m) { collect.push({ name: m.name, kind: 'Mod' }); });
@@ -3032,6 +3205,9 @@
       if (arr.helmet) collect.push({ name: arr.helmet, kind: 'Legacy Arcane Helmet' });
       if (arr.tome) collect.push({ name: arr.tome, kind: 'Tome mod (cross-gear)' });
       if (arr.subsume) collect.push({ name: arr.subsume.ability, kind: 'Subsumed ability (from ' + arr.subsume.fromFrame + ')' });
+      if (arr.focus) (arr.focus.nodes || []).forEach(function (n) {
+        collect.push({ name: n, kind: 'Focus · ' + arr.focus.school });
+      });
     }
   }
 
@@ -3124,10 +3300,14 @@
   }
   function resultStatsStore(kind) {
     if (kind === 'frame') {
-      return {
-        stats: currentCat().kind === 'companion' ? COMPANION_STATS : FRAME_STATS,
-        store: state.frameTargets
-      };
+      var stats = currentCat().kind === 'companion' ? COMPANION_STATS : FRAME_STATS;
+      // v1.5: the sustained floor line includes the drain when the
+      // frame tracks a channel and drain was targeted.
+      if (currentCat().kind === 'frame') {
+        var track = channelTrackForFrame(state.selections.Warframe);
+        if (track) stats = stats.concat([channelStatDef(track)]);
+      }
+      return { stats: stats, store: state.frameTargets };
     }
     return { stats: WEAPON_STATS.concat(DMG_STATS), store: weaponTargetStore() };
   }
@@ -3162,6 +3342,12 @@
   var GROWING_POWER_NOTE = "Procs from your weapons' status effects — incl. companion weapons and Hunter Munitions; not from allies, ability status, or Syndicate radials.";
   function pieceDescription(name) {
     var rec = null;
+    // v1.5: Focus nodes describe themselves with their source text.
+    var fnode = null;
+    ((SITE.focus && SITE.focus.nodes) || []).some(function (a) {
+      if (a.name === name) { fnode = a; return true; } return false;
+    });
+    if (fnode) return fnode.text;
     (SITE.arcanes.arcanes || []).some(function (a) { if (a.name === name) { rec = a; return true; } return false; });
     if (!rec) (SITE.tomes.mods || []).some(function (a) { if (a.name === name) { rec = a; return true; } return false; });
     if (!rec) rec = modRecord(name);
@@ -3184,6 +3370,7 @@
       (e.arcanes || []).forEach(push);
       if (e.tome) push(e.tome);
       if (e.subsume) push(e.subsume.ability);
+      if (e.focus && e.focus.nodes) e.focus.nodes.forEach(push);
     } else if (boardKind === 'weapon') {
       if (e.arcane) push(e.arcane);
     }
@@ -3316,6 +3503,9 @@
     dmg.innerHTML = '';
     if (kind === 'frame') {
       var stats = cat.kind === 'companion' ? COMPANION_STATS : FRAME_STATS;
+      // v1.5: the achieved drain joins the table (with its
+      // breakdown chain) when the solve tracked a channel.
+      if (res.channel) stats = stats.concat([channelStatDef(res.channel)]);
       achievedTable(stats, state.frameTargets, res.achieved, res.unmetTargets, false, res.breakdown);
       renderFrameArrangement(box, res, false, lastPieces);
       $('capacity-line').textContent =
@@ -3505,14 +3695,16 @@
       fetchJSON('data/modular.json'), fetchJSON('data/helminth.json'),
       fetchJSON('data/set_bonuses.json'), fetchJSON('data/links.json'),
       fetchJSON('data/acquisition.json'), fetchJSON('data/modpool.json'),
-      fetchJSON('data/conditional_classes.json')
+      fetchJSON('data/conditional_classes.json'), fetchJSON('data/channels.json'),
+      fetchJSON('data/focus.json')
     ]).then(function (parts) {
       SITE = {
         frames: parts[0], weapons: parts[1], mods: parts[2], arcanes: parts[3],
         tomes: parts[4], auras: parts[5], shards: parts[6], helmets: parts[7],
         modular: parts[8], helminth: parts[9], setBonuses: parts[10],
         links: parts[11], acquisition: parts[12], modpool: parts[13],
-        conditionalClasses: parts[14]
+        conditionalClasses: parts[14], channels: parts[15],
+        focus: parts[16]
       };
       SITE.modpoolByName = {};
       (SITE.modpool.mods || []).forEach(function (m) { SITE.modpoolByName[m.name] = m; });
