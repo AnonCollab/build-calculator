@@ -23,6 +23,9 @@
 <div class="toolbar">
   <button type="button" id="btn-calc" class="primary">Calculate</button>
   <button type="button" id="btn-share">Copy share link</button>
+  <button type="button" id="btn-download">Download build</button>
+  <button type="button" id="btn-load">Load build file</button>
+  <input type="file" id="file-load" accept=".json,application/json" hidden>
   <span id="calc-status" class="muted"></span>
 </div>
 
@@ -202,6 +205,15 @@
       <h2>Routes</h2>
       <div class="checks" id="route-checks-frame"></div>
       <p class="muted" id="augments-caption">Augments are mechanic mods — the solver won't pick them for stats; turn on Ability augments to lock the ones your build uses. An augment appears in the pickers only for a frame that has its ability (natively, or subsumed in via Helminth).</p>
+      <div id="spare-shards-block">
+        <div class="checks">
+          <label class="check">
+            <input type="checkbox" id="chk-spare-shards">
+            <span>Spare the shards</span>
+          </label>
+        </div>
+        <p class="muted">Prefer spending Forma (up to your budget) over Archon Shards for stat targets.</p>
+      </div>
       <div id="intent-block">
         <label class="field">
           <span>Build intent (applies when Conditional buffs is on)</span>
@@ -382,7 +394,7 @@
     <div id="results-body" hidden>
       <div class="panel" id="board-panel" hidden>
         <h2>Build board</h2>
-        <p class="muted">The solved build in slot order. Click a slot to select it, click a second slot to swap them (or drag), step its rank, remove it, or swap in another mod — every edit re-evaluates live and is compared against the solved build. Edits warn, never block.</p>
+        <p class="muted">The solved build in slot order. Click a slot to select it, click a second slot to swap them (or drag), step its rank, set its slot polarity, remove it, or swap in another mod — every edit re-evaluates live and is compared against the solved build. Edits warn, never block. Re-Forma re-plans the board's forma optimally without moving any mod.</p>
         <div id="board"></div>
         <p id="board-capacity"></p>
         <p id="board-seq" class="muted"></p>
@@ -394,6 +406,20 @@
           <button type="button" id="btn-cell-swap">Swap in…</button>
           <button type="button" id="btn-cell-pin">📌 Pin as lock</button>
           <button type="button" id="btn-cell-ban">Ban this mod</button>
+          <label class="field" id="cell-polarity-field" hidden>
+            <span>Slot polarity</span>
+            <select id="sel-cell-polarity">
+              <option value="">None</option>
+              <option>Madurai</option>
+              <option>Naramon</option>
+              <option>Vazarin</option>
+              <option>Zenurik</option>
+              <option>Penjaga</option>
+              <option>Unairu</option>
+              <option>Umbra</option>
+              <option>Universal</option>
+            </select>
+          </label>
         </div>
         <div id="board-swap" hidden>
           <label class="field">
@@ -409,6 +435,7 @@
           <div id="board-delta-body"></div>
         </div>
         <ul id="board-warnings" class="notes"></ul>
+        <button type="button" id="btn-board-reforma">Re-Forma</button>
         <button type="button" id="btn-board-reset">Reset to solved build</button>
       </div>
       <div class="panel">
@@ -474,6 +501,7 @@
 <script src="js/solver.js"></script>
 <script src="js/weaponSolver.js"></script>
 <script src="js/modular.js"></script>
+<script src="js/share_codec.js"></script>
 <script src="js/app.js"></script>
 </body>
 </html>
