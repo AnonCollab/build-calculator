@@ -140,9 +140,29 @@
       <div class="tablewrap">
         <table class="grid" id="targets-frame-table">
           <thead><tr><th>Stat</th><th>Mode</th><th>Target</th><th>Priority</th></tr></thead>
-          <tbody></tbody>
+          <tbody>
+            <!-- v1.5 channel upkeep row: static markup (the site-data
+                 ID contract requires every $('id') in app.js to exist
+                 here); buildControls moves it below the stat rows.
+                 Shown only for frames with a channeled ability. No
+                 Maximize mode — raising a drain is meaningless. -->
+            <tr id="channel-row" hidden>
+              <td>Channel upkeep <span class="muted" id="channel-ability-label"></span></td>
+              <td><select id="ftgt-mode-channelDrain">
+                <option value="dontcare">Don't care</option>
+                <option value="closest">Closest</option>
+                <option value="atleast">At least</option>
+              </select></td>
+              <td><input type="number" id="ftgt-val-channelDrain" step="any" title="Target drain per second (At least reads as 'at or below')"></td>
+              <td><select id="channel-preference" title="When both roads reach the drain target, prefer spending on this stat">
+                <option value="efficiency">Prefer Efficiency</option>
+                <option value="duration">Prefer Duration</option>
+              </select></td>
+            </tr>
+          </tbody>
         </table>
       </div>
+      <p class="muted" id="channel-footnote" hidden>Channel upkeep: drain per second scales with Ability Efficiency and Duration — base × (200 − Efficiency) / Duration — and never drops below 25% of the ability's base drain (wiki: Ability Efficiency, Channeled Abilities).</p>
     </div>
     <div class="panel" id="targets-weapon-wrap" hidden>
       <h2>Target stats</h2>
@@ -228,6 +248,17 @@
         <h3>Helminth ability locks</h3>
         <p class="muted">A locked ability is never replaced by a subsume. Unlocked slots are fair game; the solver picks at most one subsume, at diminished Helminth values.</p>
         <div class="checks" id="lock-checks"></div>
+      </div>
+      <div id="focus-block" hidden>
+        <h3>Focus school</h3>
+        <p class="muted">One school per build, picked like a Helminth choice. The school's stat-modelled nodes apply as build pieces — conditional ones count only when Conditional buffs is on and obey build intent (burst actives are pruned under Upkeep). Its other nodes are mechanic or Operator effects: they are listed in the results notes, never invented as stats.</p>
+        <label class="field">
+          <span>Active school</span>
+          <select id="sel-focus-school">
+            <option value="">No school</option>
+          </select>
+        </label>
+        <p class="muted" id="focus-note"></p>
       </div>
     </div>
     <div class="panel" id="routes-weapon-panel" hidden>
