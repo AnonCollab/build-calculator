@@ -58,6 +58,17 @@
  * prefers spending Forma (up to the budget) over Archon Shards for
  * stat targets (input.spareShards). State v9 carries `spareShards`;
  * v8 and older saves migrate to false.
+ *
+ * v1.5.3 (site): aura-slot polarity — an "Use an Omni Forma on the
+ * Aura slot" toggle in the Forma panel (Warframe category only;
+ * input.omniAura; state v10 carries `omniAura`) makes the aura slot
+ * a universal match; the Omni Forma counts as 1 in the build's
+ * Forma total but is not charged against the Forma budget. Without
+ * it, the solver may
+ * buy the match with 1 regular Forma, and the board's aura cell can
+ * be Forma'd to a specific polarity from its picker (picking
+ * 'Universal' there IS the toggle). The aura mismatch bonus is the
+ * wiki's 80% rounded down (was: halved — a bug).
  */
 (function () {
   'use strict';
@@ -252,7 +263,7 @@
     ROUTES_FRAME.forEach(function (r) { routesFrame[r.key] = r.def; });
     ROUTES_WEAPON.forEach(function (r) { routesWeapon[r.key] = r.def; });
     return {
-      version: 9,
+      version: 10,
       category: 'Warframe',
       intent: 'window',
       // v1.4: Hybrid burst allowance (1 | 2). routesFrame.augments
@@ -265,6 +276,11 @@
       // toggle (state v9); the solver input flag input.spareShards.
       // v8 and older saves migrate to false in mergeState.
       spareShards: false,
+      // v1.5.3: Omni Forma on the aura slot — a yes/no build toggle
+      // (state v10), NOT a numeric pool: one forma on one slot makes
+      // it a universal match for any aura. The solver input flag is
+      // input.omniAura; v9 and older saves migrate to false.
+      omniAura: false,
       selections: {
         Warframe: null, Necramech: null, Companion: null,
         Primary: null, Secondary: null, Melee: null, Archgun: null,
@@ -403,7 +419,8 @@
       // board silently lost its manual polarities on restore —
       // invisible then because restored boards fell back to innate
       // polarities, which coincide for solver-produced plans.)
-      if (s.kind === 'normal' || s.kind === 'exilus') {
+      // v1.5.3: the aura cell's Forma purchase (pol/f) rides too.
+      if (s.kind === 'normal' || s.kind === 'exilus' || s.kind === 'aura') {
         var POLS = ['Madurai', 'Naramon', 'Vazarin', 'Zenurik',
           'Penjaga', 'Unairu', 'Umbra', 'Universal'];
         if ('pol' in s) slot.pol = (s.pol == null || POLS.indexOf(s.pol) >= 0) ? (s.pol || null) : null;
@@ -429,7 +446,7 @@
   function mergeState(base, saved) {
     if (!saved || typeof saved !== 'object') return base;
     try {
-      if (saved.version === 2 || saved.version === 3 || saved.version === 4 || saved.version === 5 || saved.version === 6 || saved.version === 7 || saved.version === 8 || saved.version === 9) {
+      if (saved.version === 2 || saved.version === 3 || saved.version === 4 || saved.version === 5 || saved.version === 6 || saved.version === 7 || saved.version === 8 || saved.version === 9 || saved.version === 10) {
         if (catOf(saved.category).id === saved.category) base.category = saved.category;
         // v1.3: intent arrived in state v5; v2–v4 saves keep the
         // default 'window' (the engines' unset behaviour). v1.4:
@@ -532,6 +549,9 @@
       // v1.5.1: spareShards arrived in state v9; v8 and older saves
       // keep the false default.
       if (typeof saved.spareShards === 'boolean') base.spareShards = saved.spareShards;
+      // v1.5.3: omniAura arrived in state v10; older saves keep the
+      // false default.
+      if (typeof saved.omniAura === 'boolean') base.omniAura = saved.omniAura;
       if (saved.forma === 'any' || (Number.isInteger(saved.forma) && saved.forma >= 0 && saved.forma <= 10)) {
         base.forma = saved.forma;
       }
@@ -993,6 +1013,7 @@
     });
     $('chk-coalescent').checked = !!state.canFuseCoalescent;
     $('chk-spare-shards').checked = !!state.spareShards;
+    $('chk-omni-aura').checked = !!state.omniAura;
     $('sel-forma').value = state.forma === 'any' ? 'any' : String(state.forma);
     $('inp-umbra').value = state.umbraForma;
     $('inp-owner-health').value = state.ownerStats.health;
@@ -1095,6 +1116,8 @@
     state.canFuseCoalescent = $('chk-coalescent').checked;
     // v1.5.1: spare-the-shards toggle (frame routes panel).
     state.spareShards = $('chk-spare-shards').checked;
+    // v1.5.3: Omni Forma aura toggle (Forma panel).
+    state.omniAura = $('chk-omni-aura').checked;
     var fv = $('sel-forma').value;
     state.forma = fv === 'any' ? 'any' : parseInt(fv, 10);
     state.umbraForma = Math.max(0, parseInt($('inp-umbra').value, 10) || 0);
@@ -1464,6 +1487,9 @@
       // v1.5.1: spare-the-shards prices a frame-only route (Archon
       // Shards); the toggle shows for the Warframe category only.
       $('spare-shards-block').hidden = cat.kind !== 'frame';
+      // v1.5.3: the Omni Aura toggle likewise (only Warframes have
+      // an aura slot).
+      $('omni-aura-block').hidden = cat.kind !== 'frame';
       if (cat.kind === 'frame') buildFocusChooser();
     }
   }
@@ -2293,6 +2319,9 @@
       // v1.5.1: spare-the-shards preference (frame category only —
       // the solver flag is inert for the other kinds anyway).
       if (state.spareShards) finput.spareShards = true;
+      // v1.5.3: Omni Forma on the aura slot (frame category only —
+      // the other kinds have no aura slot).
+      if (state.omniAura) finput.omniAura = true;
       var hc = currentHelminthChoice();
       if (hc) finput.helminthChoice = hc;
       // v1.5: Focus school route — routes.focus = {school}, the
@@ -2550,6 +2579,9 @@
         kind: s.kind, mod: s.mod, rank: s.rank,
         slotPolarity: s.slotPolarity, innatePolarity: s.innatePolarity,
         formaApplied: !!s.formaApplied, umbraFormaApplied: !!s.umbraFormaApplied,
+        // v1.5.3: solver-stamped Omni state on the aura cell (the
+        // toggle itself stays build-level state; this is display).
+        omniApplied: !!s.omniApplied,
         effectiveDrain: s.effectiveDrain, origin: s.origin || 'target'
       };
     });
@@ -2621,8 +2653,11 @@
         // from the innate fallback, plus its forma flags; old links
         // lack the keys and restore exactly as before.
         // v1.5.2: weapon boards too (fitWeapon runs the pool model).
+        // v1.5.3: the aura cell's Forma purchase (frame boards) too —
+        // the Omni state is NOT cell state; it rides the top-level
+        // omniAura toggle.
         if ((boardKind === 'frame' || boardKind === 'weapon') &&
-            (s.kind === 'normal' || s.kind === 'exilus')) {
+            (s.kind === 'normal' || s.kind === 'exilus' || s.kind === 'aura')) {
           if ((s.slotPolarity || null) !== (s.innatePolarity || null)) out.pol = s.slotPolarity || null;
           if (s.formaApplied) out.f = 1;
           if (s.umbraFormaApplied) out.uf = 1;
@@ -2647,6 +2682,12 @@
       if (boardKind === 'frame' && s.kind !== 'aura' && s.kind !== 'stance') {
         out.polarity = s.slotPolarity || null;
       }
+      // v1.5.3: a Forma'd aura cell passes its stamped polarity (the
+      // evaluator counts the purchase); the Omni toggle rides the
+      // pieces below, never the cell.
+      if (boardKind === 'frame' && s.kind === 'aura' && s.formaApplied) {
+        out.polarity = s.slotPolarity || null;
+      }
       // v1.5.2: weapon non-stance cells too (evaluateWeapon's given
       // mode is the mirror of evaluateFrame's).
       if (boardKind === 'weapon' && s.kind !== 'stance') {
@@ -2662,6 +2703,10 @@
         tome: e.tome, helmet: e.helmet, subsume: e.subsume,
         focus: e.focus || null,
         conditional: e.conditional,
+        // v1.5.3: the build's Omni Forma toggle prices the board's
+        // aura slot too (universal match; the Omni Forma itself
+        // counts in the board's Forma total).
+        omniAura: !!state.omniAura,
         formaBudget: e.formaBudget, umbraForma: e.umbraForma || 0,
         reactor: true, itemKind: e.itemKind,
         companionEntry: e.companionEntry, ownerStats: e.ownerStats,
@@ -2724,6 +2769,25 @@
     var lm = ((SITE.links && SITE.links.mods) || []).filter(function (m) { return m.name === name; })[0];
     return lm ? lm.maxRank : null;
   }
+  // v1.5.3: an aura cell's live capacity grant — the display mirror
+  // of the solver's auraCapacityBonus (the evaluator behind the
+  // capacity line stays the authority): magnitude |baseDrain| +
+  // maxRank, x2 on a match / 'Any' aura / Omni slot, x1 in an
+  // unpolarized slot, floor(80%) on a mismatch. Effective slot
+  // polarity: the Omni toggle > a Forma'd stamp > innate.
+  function auraGrantFor(s) {
+    if (!s.mod) return 0;
+    var rec = modRecord(s.mod) || modpoolRec(s.mod);
+    if (!rec) return typeof s.effectiveDrain === 'number' ? -s.effectiveDrain : 0;
+    var mag = Math.abs(rec.baseDrain || 0) + (rec.maxRank || 0);
+    if (rec.polarity === 'Any') return mag * 2;
+    var pol = state.omniAura ? 'Omni'
+      : (s.formaApplied ? (s.slotPolarity || null) : (s.innatePolarity || null));
+    if (pol === 'Omni' || pol === 'Universal') return mag * 2;
+    if (pol && rec.polarity === pol) return mag * 2;
+    if (!pol || pol === 'None') return mag;
+    return Math.floor(mag * 0.8);
+  }
   function slotDrainInfo(s) {
     if (!s.mod) return null;
     if (s.kind === 'aura' || s.kind === 'stance') {
@@ -2767,16 +2831,28 @@
       if (s.mod) {
         var maxR = slotMaxRank(s.mod, s.kind);
         var metaBits = ['r' + s.rank + '/' + (maxR == null ? '?' : maxR)];
-        if (s.slotPolarity) metaBits.push(s.slotPolarity);
+        // v1.5.3: the aura cell shows its EFFECTIVE polarity state —
+        // Omni while the toggle is on, else the stored polarity
+        // (innate, or a Forma purchase's — which also gets the
+        // Forma badge below). The toggle is the single source: a
+        // slot's omniApplied stamp is the solver's record of the
+        // solve, never a second switch (they must never disagree).
+        var isOmniAura = s.kind === 'aura' && boardKind === 'frame' &&
+          !!state.omniAura;
+        if (isOmniAura) metaBits.push('Omni');
+        else if (s.slotPolarity) metaBits.push(s.slotPolarity);
         cell.appendChild(el('span', 'slot-meta', metaBits.join(' · ')));
-        var d = slotDrainInfo(s);
+        var d = (s.kind === 'aura' && boardKind === 'frame')
+          ? { eff: -auraGrantFor(s), granted: true, matched: false }
+          : slotDrainInfo(s);
         if (d) {
           var dt = el('span', 'slot-meta' + (d.matched ? ' matched-drain' : ''),
             d.granted ? 'grants ' + Math.abs(d.eff) + ' capacity'
                       : 'drain ' + d.eff + (d.matched ? ' (polarity match)' : ''));
           cell.appendChild(dt);
         }
-        if (s.umbraFormaApplied) cell.appendChild(el('span', 'badge', 'Umbra Forma'));
+        if (isOmniAura) cell.appendChild(el('span', 'badge', 'Omni Forma'));
+        else if (s.umbraFormaApplied) cell.appendChild(el('span', 'badge', 'Umbra Forma'));
         else if (s.formaApplied) cell.appendChild(el('span', 'badge', 'Forma'));
         if (s.origin === 'fill') cell.appendChild(el('span', 'tag-fill', 'fill'));
         if (s.origin === 'edited') cell.appendChild(el('span', 'badge', 'edited'));
@@ -2864,9 +2940,16 @@
     // v1.5.1: per-slot polarity picker (frame boards, non-aura cells).
     // v1.5.2: weapon boards too (the bar itself never opens for the
     // stance cell — see the early return above).
-    var showPol = (boardKind === 'frame' || boardKind === 'weapon') && s.kind !== 'aura';
+    // v1.5.3: frame boards open it for the AURA cell too — the aura
+    // slot's polarity is purchasable state (see boardPolarityChange);
+    // while the Omni toggle is on the picker reads 'Universal'.
+    var showPol = (boardKind === 'weapon' && s.kind !== 'aura') ||
+                  (boardKind === 'frame');
     $('cell-polarity-field').hidden = !showPol;
-    if (showPol) $('sel-cell-polarity').value = s.slotPolarity || '';
+    if (showPol) {
+      $('sel-cell-polarity').value = (s.kind === 'aura' && state.omniAura)
+        ? 'Universal' : (s.slotPolarity || '');
+    }
   }
 
   function afterBoardEdit() {
@@ -3195,8 +3278,36 @@
   function boardPolarityChange() {
     if (!boardCur || boardSel < 0) return;
     var s = boardCur.slots[boardSel];
-    if (!s || s.kind === 'aura' || s.kind === 'stance') return;
-    s.slotPolarity = $('sel-cell-polarity').value || null;
+    if (!s || s.kind === 'stance') return;
+    var v = $('sel-cell-polarity').value || '';
+    // v1.5.3: the aura cell's polarity is its own little state
+    // machine, kept in lock-step with the top Omni toggle (the two
+    // must never disagree — they are the same slot):
+    //   'Universal' -> toggle ON, any purchase cleared (Omni state);
+    //   ''          -> toggle OFF, back to the innate polarity;
+    //   a polarity -> toggle OFF, that polarity stamped; it counts
+    //                  as a Forma purchase iff it differs from innate.
+    if (s.kind === 'aura') {
+      if (v === 'Universal') {
+        state.omniAura = true;
+        s.slotPolarity = s.innatePolarity || null;
+        s.formaApplied = false;
+      } else if (v === '') {
+        state.omniAura = false;
+        s.slotPolarity = s.innatePolarity || null;
+        s.formaApplied = false;
+      } else {
+        state.omniAura = false;
+        s.slotPolarity = v;
+        s.formaApplied = v !== (s.innatePolarity || null);
+      }
+      s.omniApplied = !!state.omniAura;
+      $('chk-omni-aura').checked = !!state.omniAura;
+      saveState();
+      afterBoardEdit();
+      return;
+    }
+    s.slotPolarity = v || null;
     attributeFormaFlags();
     afterBoardEdit();
   }
@@ -3288,6 +3399,9 @@
       tome: e.tome, helmet: e.helmet, subsume: e.subsume,
       focus: e.focus || null,
       conditional: e.conditional,
+      // v1.5.3: the fit prices the aura slot under the build's
+      // toggle; a purchase it makes is stamped below.
+      omniAura: !!state.omniAura,
       formaBudget: 'any', umbraForma: 99,
       reactor: true, itemKind: e.itemKind,
       companionEntry: e.companionEntry, ownerStats: e.ownerStats,
@@ -3296,6 +3410,20 @@
     });
     if (!res || !res.plan) return false;
     applyFormaPlan(res.plan, false);
+    // v1.5.3: stamp the fit's aura outcome on the aura cell (the
+    // pool plan above never touches it). A purchase stamps its
+    // polarity + flag; no purchase leaves the cell at innate.
+    var auraCell = boardCur.slots.filter(function (x) { return x.kind === 'aura'; })[0];
+    if (auraCell) {
+      if (res.auraFormaUsed) {
+        auraCell.slotPolarity = res.auraSlotPolarity;
+        auraCell.formaApplied = true;
+      } else {
+        auraCell.slotPolarity = auraCell.innatePolarity || null;
+        auraCell.formaApplied = false;
+      }
+      auraCell.omniApplied = !!res.auraOmni;
+    }
     return true;
   }
 
@@ -3359,14 +3487,20 @@
       // v1.5.1: a saved polarity/forma plan (frame boards) wins over
       // the innate fallback; links without the keys restore as before.
       // v1.5.2: weapon boards carry the same keys.
+      // v1.5.3: the aura cell's Forma purchase rides the same keys.
       if ((b.kind === 'frame' || b.kind === 'weapon') &&
-          (s.kind === 'normal' || s.kind === 'exilus')) {
+          (s.kind === 'normal' || s.kind === 'exilus' || s.kind === 'aura')) {
         if ('pol' in s || s.f || s.uf) sawPolInfo = true;
         if ('pol' in s) slot.slotPolarity = s.pol || null;
         if (s.f) slot.formaApplied = true;
         if (s.uf) slot.umbraFormaApplied = true;
       }
-      if ((s.kind === 'aura' || s.kind === 'stance') && s.mod) {
+      if (s.kind === 'aura' && s.mod) {
+        // v1.5.3: the aura grant under the slot's effective polarity
+        // (toggle / purchase / innate) — auraGrantFor is the rule.
+        slot.omniApplied = !!state.omniAura;
+        slot.effectiveDrain = -auraGrantFor(slot);
+      } else if (s.kind === 'stance' && s.mod) {
         // Capacity furniture: magnitude |baseDrain| + maxRank, doubled
         // on a polarity match (the solvers' own bonus rule).
         var rec = modRecord(s.mod);
@@ -4050,6 +4184,13 @@
       $('btn-cell-ban').addEventListener('click', boardBanSelected);
       $('btn-board-reforma').addEventListener('click', boardReForma);
       $('sel-cell-polarity').addEventListener('change', boardPolarityChange);
+      // v1.5.3: the Omni Aura toggle re-prices a live frame board
+      // immediately (the aura cell + capacity line follow it).
+      $('chk-omni-aura').addEventListener('change', function () {
+        state.omniAura = $('chk-omni-aura').checked;
+        saveState();
+        if (boardCur && boardKind === 'frame') refreshBoardUI();
+      });
       $('btn-board-reset').addEventListener('click', boardReset);
       $('btn-share').addEventListener('click', function () {
         readUIFromControls();
