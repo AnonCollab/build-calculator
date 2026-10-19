@@ -162,6 +162,22 @@
  *    locked burst pieces do not consume it (Q1). result.hybridBurst
  *    names the solver-chosen burst pieces; sustained semantics
  *    unchanged. Window / upkeep / unset byte-identical to v1.3.
+ *
+ * v1.5.2 (forma pool parity with solver.js):
+ *  - fitWeapon counts from the polarity POOL (innate polarities of
+ *    the 8 regular slots + the Exilus slot, plus one per Forma)
+ *    instead of a greedy slot assignment — the greedy version let a
+ *    non-matching mod squat on an innate slot and charged a Forma
+ *    for the loss (Phantasma golden in tests/weapon.test.js).
+ *    Wiki-verified scope (BUILD_LOG "v1.5.2 verification"): regular
+ *    + unlocked Exilus slots swap; the STANCE slot never does (fixed
+ *    StancePolarity, Stance Forma is a separate item); slot-data
+ *    'Universal' means NO innate polarity, while a user-chosen
+ *    'Universal' is the Omni wildcard (halves any mod except Umbra).
+ *  - evaluateWeapon gains the GIVEN-polarity mode (a slot entry
+ *    carrying `polarity` switches scoring, mirroring evaluateFrame):
+ *    the board is priced as-is and the result gains `plan` in fit
+ *    mode for the editor's Re-Forma.
  */
 (function () {
   'use strict';
@@ -717,59 +733,94 @@
   }
 
   // ---- capacity fitting ------------------------------------------------------
+  // polMatches(slotPol, modPol): a slot polarity halves a mod's drain
+  // on an exact match, or when the slot carries the Omni-Forma
+  // 'Universal' polarity — which per the wiki ("Omni Forma") halves
+  // any mod EXCLUDING Umbra-polarity ones (an Umbral mod there is not
+  // a mismatch either: full drain, no penalty). NOTE: 'Universal' in
+  // raw weapon SLOT data is a different thing — a sentinel for "no
+  // innate polarity" (Dual Heat Swords' stance per "Stance Forma",
+  // Haalvu's exilus) — slotPolOf normalizes it away before any fit
+  // sees it; only a user-chosen board polarity means the wildcard.
   function polMatches(slotPol, modPol) {
-    return !!slotPol && !!modPol && (slotPol === modPol || slotPol === 'Universal');
+    return !!slotPol && !!modPol &&
+      (slotPol === modPol || (slotPol === 'Universal' && modPol !== 'Umbra'));
+  }
+  function slotPolOf(p) {
+    return (p && p !== 'None' && p !== 'Universal') ? p : null;
   }
   function drainAt(rec, rank) { return rec.baseDrain + rank; }
 
-  function fitWeapon(ctx, weapon, chosen, exilusEntry, stances, formaBudget, umbraForma) {
-    var slotPols = (weapon.Polarities || []).slice(0, 8);
-    while (slotPols.length < 8) slotPols.push(null);
-    var exPol = weapon.ExilusPolarity;
-    if (exPol === 'None' || exPol === '') exPol = null;
-
-    // Stance: capacity-only pick — best polarity match at max rank.
-    var stancePick = null, stanceBonus = 0;
-    stances.forEach(function (s) {
+  // Stance: capacity-only pick — best polarity match at max rank.
+  // The stance slot NEVER joins the polarity pool (v1.5.2 wiki
+  // verification): its polarity cannot be swapped with other slots
+  // (U38.5.3/U38.5.2) and regular Forma cannot target it — Stance
+  // Forma is a separate item, not modelled. Fixed StancePolarity,
+  // bonus = magnitude (|baseDrain| + rank), doubled on a match.
+  function stancePickFor(weapon, stances) {
+    var pick = null, bonus = 0;
+    (stances || []).forEach(function (s) {
       var mag = Math.abs(s.baseDrain) + s.maxRank;
-      var bonus = (weapon.StancePolarity && s.polarity === weapon.StancePolarity) ? mag * 2 : mag;
-      if (!stancePick || bonus > stanceBonus) { stancePick = s; stanceBonus = bonus; }
+      var b = (weapon.StancePolarity && s.polarity === weapon.StancePolarity) ? mag * 2 : mag;
+      if (!pick || b > bonus) { pick = s; bonus = b; }
     });
+    return { name: pick ? pick.name : null, bonus: bonus };
+  }
+
+  // v1.5.2: the fit is counted from the polarity POOL, mirroring
+  // solver.js fitCapacity — the slot-greedy assignment it replaces
+  // let a non-matching mod squat on an innate-polarity slot (Primed
+  // Ravage on the Phantasma's Naramon slot) and charged a Forma for
+  // the loss. Wiki-verified scope (BUILD_LOG "v1.5.2 verification"):
+  // once an item has been polarized, existing polarities rearrange
+  // freely among the regular slots AND the (unlocked) Exilus slot, so
+  // a build owns a pool = those slots' innate polarities + one
+  // polarity per Forma spent. Counting: (1) free matches — per
+  // polarity, the biggest-drain mods of that polarity up to the
+  // innate count (the exilus mod competes in the same pool; only its
+  // SLOT is pinned); (2) Forma spend over the remaining unmatched
+  // mods, biggest saving first, until capacity fits or the budget
+  // runs out; Umbra Forma is the separate budget for Umbra-polarity
+  // mods, as before. The over-rank attempt space (0..5 Forma raising
+  // the rank cap toward MaxRank) and the attempt selection are
+  // unchanged — the pool count runs INSIDE each attempt. Slot
+  // PLACEMENT is derived after the pick (assign/pols/formaPlan keep
+  // their v1.1 shapes; the fit also returns the matched sets for the
+  // editor's Re-Forma).
+  function fitWeapon(ctx, weapon, chosen, exilusEntry, stances, formaBudget, umbraForma) {
+    var slotPols = (Array.isArray(weapon.Polarities) ? weapon.Polarities : [])
+      .slice(0, 8).map(slotPolOf);
+    while (slotPols.length < 8) slotPols.push(null);
+    var exPol = slotPolOf(weapon.ExilusPolarity);
+    var sp = stancePickFor(weapon, stances);
 
     var all = chosen.slice();
     var exSlotIndex = -1;
     if (exilusEntry) {
-      exSlotIndex = slotPols.length;
+      exSlotIndex = slotPols.length; // 8
       slotPols.push(exPol);
       all.push(exilusEntry);
     }
-    // Greedy assignment: largest drain first, prefer polarity match;
-    // the exilus entry is pinned to the exilus slot. (Name tiebreak
-    // keeps the assignment deterministic.)
-    var order = all.slice().sort(function (a, b) {
-      return drainAt(b.rec, b.rank) - drainAt(a.rec, a.rank) ||
-             (a.rec.name < b.rec.name ? -1 : 1);
-    });
-    var free = slotPols.map(function (_, i) { return i; });
-    if (exilusEntry) free.splice(free.indexOf(exSlotIndex), 1);
-    var assign = {};
-    if (exilusEntry) assign[exilusEntry.rec.name] = exSlotIndex;
-    order.forEach(function (c) {
-      if (exilusEntry && c.rec.name === exilusEntry.rec.name) return;
-      var idx = -1;
-      for (var i = 0; i < free.length; i++) {
-        if (polMatches(slotPols[free[i]], c.rec.polarity)) { idx = free[i]; break; }
-      }
-      if (idx < 0) idx = free[0];
-      free.splice(free.indexOf(idx), 1);
-      assign[c.rec.name] = idx;
-    });
-    function costWith(pols) {
-      return all.reduce(function (s, c) {
-        var d = drainAt(c.rec, c.rank);
-        return s + (polMatches(pols[assign[c.rec.name]], c.rec.polarity) ? Math.ceil(d / 2) : d);
-      }, 0);
+    function polOf(c) {
+      var p = c.rec.polarity;
+      return (p && p !== 'None') ? p : null;
     }
+    function savingOf(c) {
+      var d = drainAt(c.rec, c.rank);
+      return d - Math.ceil(d / 2);
+    }
+    // Deterministic candidate order (fitCapacity's convention):
+    // biggest saving, then biggest drain, then name.
+    function bySaving(a, b) {
+      return (savingOf(b) - savingOf(a)) ||
+             (drainAt(b.rec, b.rank) - drainAt(a.rec, a.rank)) ||
+             (a.rec.name < b.rec.name ? -1 : 1);
+    }
+    function byDrain(a, b) {
+      return (drainAt(b.rec, b.rank) - drainAt(a.rec, a.rank)) ||
+             (a.rec.name < b.rec.name ? -1 : 1);
+    }
+
     var maxRankCap = weapon.MaxRank || 30;
     var budgetCap = (formaBudget === 'any' || formaBudget == null) ? Infinity : formaBudget;
     var attempts = [];
@@ -778,56 +829,56 @@
       var rankCap = Math.min(maxRankCap, 30 + 2 * over);
       if (over > 0 && rankCap <= prevRankCap) break;
       prevRankCap = rankCap;
-      var capMax = rankCap * 2 + stanceBonus;
+      var capMax = rankCap * 2 + sp.bonus;
       var remaining = budgetCap - over;
       if (remaining < 0) continue;
-      var pols = slotPols.slice();
-      var cost = costWith(pols);
-      var plan = [];
+      var cost = all.reduce(function (s, c) { return s + drainAt(c.rec, c.rank); }, 0);
+      var matched = {}, matchedFree = [], matchedForma = [], matchedUmbra = [];
+      // (1) Free matches from the innate pool.
+      var units = {};
+      slotPols.forEach(function (p) { if (p) units[p] = (units[p] || 0) + 1; });
+      var byPol = {};
+      all.forEach(function (c) {
+        var p = polOf(c);
+        if (p) (byPol[p] = byPol[p] || []).push(c);
+      });
+      Object.keys(byPol).forEach(function (p) {
+        var list = byPol[p].slice().sort(byDrain);
+        var n = Math.min(units[p] || 0, list.length);
+        for (var i = 0; i < n; i++) {
+          matched[list[i].rec.name] = true;
+          matchedFree.push(list[i].rec.name);
+          cost -= savingOf(list[i]);
+        }
+      });
+      // (2) Forma spend, then the Umbra Forma pass (separate budget).
       var regularUsed = 0;
-      while (cost > capMax && regularUsed < remaining) {
-        var best = null;
-        all.forEach(function (c) {
-          var slot = assign[c.rec.name];
-          if (polMatches(pols[slot], c.rec.polarity)) return;
-          if (c.rec.polarity === 'Umbra' || !c.rec.polarity) return;
-          var d = drainAt(c.rec, c.rank);
-          var saving = d - Math.ceil(d / 2);
-          if (saving > 0 && (!best || saving > best.saving)) best = { slot: slot, polarity: c.rec.polarity, saving: saving };
-        });
-        if (!best) break;
-        pols[best.slot] = best.polarity;
-        plan.push({ slot: best.slot, polarity: best.polarity });
+      var formaCands = all.filter(function (c) {
+        return !matched[c.rec.name] && polOf(c) && polOf(c) !== 'Umbra' && savingOf(c) > 0;
+      }).sort(bySaving);
+      for (var fi = 0; fi < formaCands.length && cost > capMax && regularUsed < remaining; fi++) {
+        matched[formaCands[fi].rec.name] = true;
+        matchedForma.push(formaCands[fi].rec.name);
         regularUsed++;
-        cost = costWith(pols);
+        cost -= savingOf(formaCands[fi]);
       }
-      var umbraBudget = umbraForma || 0;
       var umbraUsedCount = 0;
-      while (cost > capMax && umbraUsedCount < umbraBudget) {
-        var ubest = null;
-        all.forEach(function (c) {
-          if (c.rec.polarity !== 'Umbra') return;
-          var slot = assign[c.rec.name];
-          if (pols[slot] === 'Umbra') return;
-          var d = drainAt(c.rec, c.rank);
-          var saving = d - Math.ceil(d / 2);
-          if (saving > 0 && (!ubest || saving > ubest.saving)) ubest = { slot: slot, saving: saving };
-        });
-        if (!ubest) break;
-        pols[ubest.slot] = 'Umbra';
-        plan.push({ slot: ubest.slot, polarity: 'Umbra', umbra: true });
+      var umbraCands = all.filter(function (c) {
+        return !matched[c.rec.name] && polOf(c) === 'Umbra' && savingOf(c) > 0;
+      }).sort(bySaving);
+      for (var ui = 0; ui < umbraCands.length && cost > capMax && umbraUsedCount < (umbraForma || 0); ui++) {
+        matched[umbraCands[ui].rec.name] = true;
+        matchedUmbra.push(umbraCands[ui].rec.name);
         umbraUsedCount++;
-        cost = costWith(pols);
+        cost -= savingOf(umbraCands[ui]);
       }
       attempts.push({
         overRankForma: over, capacityMax: capMax, capacityUsed: cost,
         formaUsed: regularUsed, umbraFormaUsed: umbraUsedCount,
-        formaPlan: plan, valid: cost <= capMax,
+        valid: cost <= capMax,
         totalForma: over + regularUsed + umbraUsedCount,
-        // v1.1: the slot assignment + final polarities ride along —
-        // the ordered slot list and the elemental-order pass derive
-        // from them (single source of truth for placement).
-        assign: assign, pols: pols
+        matchedFree: matchedFree, matchedForma: matchedForma,
+        matchedUmbra: matchedUmbra
       });
       if (rankCap >= maxRankCap) break;
     }
@@ -843,9 +894,161 @@
                (a.totalForma - b.totalForma);
       })[0];
     }
-    pick.stance = stancePick ? stancePick.name : null;
-    pick.stanceBonus = stanceBonus;
+
+    // (3) Derived placement for the picked attempt, in pick order
+    // (the fitCapacity discipline): each mod takes the first
+    // suitable free slot — free-matched mods prefer a slot whose
+    // innate polarity is theirs (the Exilus slot's unit can serve a
+    // regular mod — a swap — in which case the mod lands on any
+    // free slot and the polarity travels with it); forma'd mods
+    // prefer a free slot with no innate polarity; leftovers ascend
+    // and keep a leftover innate unit. Pick order matters beyond
+    // cosmetics: the elemental fold follows board order, and the
+    // solver's order pass optimized the pick sequence. The exilus
+    // mod stays pinned to the exilus slot; an unmatched exilus slot
+    // shows its own innate unit when it survives, else a leftover
+    // unit, else none. The multiset of shown polarities is always
+    // innate + forma-added, so per-slot drains sum to the count.
+    var byName = {};
+    all.forEach(function (c) { byName[c.rec.name] = c; });
+    var freeSet = {}, formaSet = {}, umbraSet = {};
+    pick.matchedFree.forEach(function (n) { freeSet[n] = true; });
+    pick.matchedForma.forEach(function (n) { formaSet[n] = true; });
+    pick.matchedUmbra.forEach(function (n) { umbraSet[n] = true; });
+    var rest = {}; // innate units not consumed by free matches
+    slotPols.forEach(function (p) { if (p) rest[p] = (rest[p] || 0) + 1; });
+    pick.matchedFree.forEach(function (n) {
+      var p = polOf(byName[n]);
+      if (p && rest[p] > 0) rest[p]--;
+    });
+    var polOrder = [];
+    slotPols.forEach(function (p) { if (p && polOrder.indexOf(p) < 0) polOrder.push(p); });
+    var pols = slotPols.slice(); // empty slots keep showing innate
+    var assign = {}, taken = {};
+    function firstFreeSlot(pred) {
+      for (var i = 0; i < 8; i++) if (!taken[i] && pred(i)) return i;
+      return -1;
+    }
+    function leftoverPol() {
+      for (var i = 0; i < polOrder.length; i++) {
+        if (rest[polOrder[i]] > 0) { rest[polOrder[i]]--; return polOrder[i]; }
+      }
+      return null;
+    }
+    if (exilusEntry) {
+      assign[exilusEntry.rec.name] = exSlotIndex;
+      taken[exSlotIndex] = true;
+      if (freeSet[exilusEntry.rec.name] || formaSet[exilusEntry.rec.name] ||
+          umbraSet[exilusEntry.rec.name]) {
+        pols[exSlotIndex] = polOf(exilusEntry);
+      } else if (exPol && rest[exPol] > 0) {
+        rest[exPol]--;
+        pols[exSlotIndex] = exPol;
+      } else {
+        // Its innate unit may have been swapped away to a free match
+        // elsewhere — the slot then shows a leftover unit, or nothing.
+        // (Never its own innate unconditionally: that would show the
+        // same unit twice and fake a match the counting didn't grant.)
+        pols[exSlotIndex] = leftoverPol();
+      }
+    }
+    all.forEach(function (c) {
+      if (exilusEntry && c === exilusEntry) return;
+      var name = c.rec.name, p = polOf(c), slot = -1;
+      if (freeSet[name]) slot = firstFreeSlot(function (i) { return slotPols[i] === p; });
+      if (slot < 0 && (formaSet[name] || umbraSet[name])) {
+        slot = firstFreeSlot(function (i) { return !slotPols[i]; });
+      }
+      if (slot < 0) slot = firstFreeSlot(function () { return true; });
+      if (slot < 0) return;
+      assign[name] = slot; taken[slot] = true;
+      if (freeSet[name] || formaSet[name] || umbraSet[name]) { pols[slot] = p; return; }
+      var own = slotPols[slot];
+      if (own && rest[own] > 0) { rest[own]--; pols[slot] = own; }
+      else pols[slot] = leftoverPol(); // may be null — see above
+    });
+    var formaPlan = [];
+    pick.matchedForma.forEach(function (name) {
+      if (name in assign) formaPlan.push({ slot: assign[name], polarity: polOf(byName[name]) });
+    });
+    pick.matchedUmbra.forEach(function (name) {
+      if (name in assign) formaPlan.push({ slot: assign[name], polarity: 'Umbra', umbra: true });
+    });
+    pick.formaPlan = formaPlan;
+    // v1.1: the slot assignment + final polarities ride along — the
+    // ordered slot list and the elemental-order pass derive from
+    // them (single source of truth for placement).
+    pick.assign = assign;
+    pick.pols = pols;
+    pick.matched = {
+      free: pick.matchedFree, forma: pick.matchedForma, umbra: pick.matchedUmbra
+    };
+    delete pick.matchedFree; delete pick.matchedForma; delete pick.matchedUmbra;
+    pick.stance = sp.name;
+    pick.stanceBonus = sp.bonus;
     return pick;
+  }
+
+  // v1.5.2: GIVEN-polarity fit for evaluateWeapon — the mirror of
+  // Solver.evaluateFrame's given mode. The board's arrangement is
+  // scored as-is: drain halves where the slot's assigned polarity
+  // matches the mod (a 'Universal' slot matches any mod except
+  // Umbra), and the Forma count comes from the pool formula —
+  // polarized non-stance slots minus the multiset intersection of
+  // assigned vs innate polarities (regular slots + the Exilus slot),
+  // with the Umbra excess reported separately. Slot positions are
+  // positional: normal entries count in board order (empty cells
+  // included), the exilus entry is fit slot 8 — the parse loop in
+  // evaluateWeapon stamps each accepted entry with its fit slot.
+  // Capacity rides on the board's over-rank level
+  // (pieces.overRankForma; derived as the smallest level whose
+  // capacity holds the board when absent, e.g. a pre-v1.5.2 board).
+  function givenFitWeapon(weapon, pieces, normals, exilusEntry, stances) {
+    var sp = stancePickFor(weapon, stances);
+    var innate = (Array.isArray(weapon.Polarities) ? weapon.Polarities : [])
+      .slice(0, 8).map(slotPolOf);
+    while (innate.length < 8) innate.push(null);
+    if (pieces.exilusSlot || exilusEntry) innate.push(slotPolOf(weapon.ExilusPolarity));
+    var polAt = {}, assigned = {}, polarized = 0, ni = 0;
+    (pieces.slots || []).forEach(function (s) {
+      if (!s || s.kind === 'stance') return;
+      var idx = s.kind === 'exilus' ? 8 : ni++;
+      var p = ('polarity' in s) ? (s.polarity || null) : null;
+      polAt[idx] = p;
+      if (p) { assigned[p] = (assigned[p] || 0) + 1; polarized++; }
+    });
+    var innateCounts = {};
+    innate.forEach(function (p) { if (p) innateCounts[p] = (innateCounts[p] || 0) + 1; });
+    var inter = 0;
+    Object.keys(assigned).forEach(function (p) {
+      inter += Math.min(assigned[p], innateCounts[p] || 0);
+    });
+    var gUmbra = Math.max(0, (assigned.Umbra || 0) - (innateCounts.Umbra || 0));
+    var used = 0;
+    normals.concat(exilusEntry ? [exilusEntry] : []).forEach(function (e) {
+      var d = drainAt(e.rec, e.rank);
+      used += polMatches(polAt[e._fitSlot], e.rec.polarity) ? Math.ceil(d / 2) : d;
+    });
+    var maxRankCap = weapon.MaxRank || 30;
+    var over = (Number.isInteger(pieces.overRankForma) &&
+      pieces.overRankForma >= 0 && pieces.overRankForma <= 5)
+      ? pieces.overRankForma : null;
+    if (over === null) {
+      var maxOver = Math.max(0, Math.min(5, Math.ceil((maxRankCap - 30) / 2)));
+      over = maxOver;
+      for (var o = 0; o <= maxOver; o++) {
+        if (used <= Math.min(maxRankCap, 30 + 2 * o) * 2 + sp.bonus) { over = o; break; }
+      }
+    }
+    var capMax = Math.min(maxRankCap, 30 + 2 * over) * 2 + sp.bonus;
+    return {
+      capacityUsed: used, capacityMax: capMax,
+      formaUsed: (polarized - inter) - gUmbra, umbraFormaUsed: gUmbra,
+      overRankForma: over,
+      valid: used <= capMax,
+      stance: sp.name, stanceBonus: sp.bonus,
+      formaPlan: [], assign: {}, pols: innate, matched: null
+    };
   }
 
   // ---- solver ------------------------------------------------------------------
@@ -2255,15 +2458,20 @@
   // exact piece list given and never drop pieces; intent pruning
   // lives in solve() (candidate pools) and in the sustained-floor
   // filter at the buildResult call site. orderedPieces = {
-  //   slots: [{kind: 'stance'|'normal'|'exilus', mod, rank}] in board
-  //     order (the elemental sequence follows this order exactly),
+  //   slots: [{kind: 'stance'|'normal'|'exilus', mod, rank,
+  //     polarity?}] in board order (the elemental sequence follows
+  //     this order exactly; a polarity on any non-stance slot
+  //     switches scoring to GIVEN mode, v1.5.2),
   //   arcane: name | null, arcaneEffects: [...] (optional override),
   //   conditional, formaBudget, umbraForma, stance: false to disable,
+  //   exilusSlot: true when the board carries an (even empty) exilus
+  //     cell — its innate polarity joins the given-mode pool,
+  //   overRankForma: the board's over-rank level (given mode),
   //   supportSetPieces (unused here — set bonuses don't move weapon
   //     paper stats), extraModRecords: {name: record}
   // } -> {achieved (incl. dmg:<Type>), forward, capacityUsed,
   //       capacityMax, formaUsed, overRankForma, umbraFormaUsed,
-  //       valid, warnings}
+  //       valid, warnings, plan (fit mode only)}
   function evaluateWeapon(data, weaponName, attackIndex, orderedPieces, progenitor) {
     orderedPieces = orderedPieces || {};
     var ctx = buildContext(data);
@@ -2286,8 +2494,15 @@
     var warnings = [];
     var normals = [], exilusEntry = null, seq = [];
     var seenNames = {};
+    // v1.5.2: fit-slot positions are positional — every normal entry
+    // (empty cells included) consumes the next fit slot, the exilus
+    // entry is fit slot 8; accepted entries are stamped for the
+    // given-polarity fit.
+    var fitPos = 0;
     (orderedPieces.slots || []).forEach(function (s) {
-      if (!s || !s.mod || s.kind === 'stance') return;
+      if (!s || s.kind === 'stance') return;
+      var myFitSlot = s.kind === 'exilus' ? 8 : fitPos++;
+      if (!s.mod) return;
       var rec = ctx.modByName[s.mod];
       if (!rec) {
         warnings.push('Unknown mod "' + s.mod + '" ignored — not in the ' +
@@ -2301,7 +2516,7 @@
       seenNames[s.mod] = true;
       var rank = (typeof s.rank === 'number')
         ? Math.max(0, Math.min(rec.maxRank, Math.round(s.rank))) : rec.maxRank;
-      var entry = { rec: rec, rank: rank };
+      var entry = { rec: rec, rank: rank, _fitSlot: myFitSlot };
       seq.push(entry); // sequence position = board position
       if (s.kind === 'exilus') {
         if (exilusEntry) {
@@ -2336,10 +2551,24 @@
       progenitor: progenitor || null,
       arcaneEffects: arcaneEffects
     });
-    var fit = fitWeapon(ctx, weapon, normals, exilusEntry,
-      orderedPieces.stance === false ? [] : pool.stances,
-      orderedPieces.formaBudget != null ? orderedPieces.formaBudget : 'any',
-      orderedPieces.umbraForma || 0);
+    // v1.5.2: a polarity on any non-stance slot entry switches to
+    // GIVEN mode (the board's arrangement priced as-is, pool formula
+    // for the count); without polarities the optimal pool fit runs
+    // and its matched plan rides along for Re-Forma.
+    var anyGivenW = (orderedPieces.slots || []).some(function (s) {
+      return s && s.kind !== 'stance' && ('polarity' in s);
+    });
+    var fit = null, plan = null;
+    if (anyGivenW) {
+      fit = givenFitWeapon(weapon, orderedPieces, normals, exilusEntry,
+        orderedPieces.stance === false ? [] : pool.stances);
+    } else {
+      fit = fitWeapon(ctx, weapon, normals, exilusEntry,
+        orderedPieces.stance === false ? [] : pool.stances,
+        orderedPieces.formaBudget != null ? orderedPieces.formaBudget : 'any',
+        orderedPieces.umbraForma || 0);
+      plan = fit.matched || null;
+    }
     if (!fit.valid) {
       warnings.push('Capacity exceeded: ' + fit.capacityUsed +
         ' used / ' + fit.capacityMax + ' max.');
@@ -2371,7 +2600,8 @@
       overRankForma: fit.overRankForma,
       umbraFormaUsed: fit.umbraFormaUsed || 0,
       valid: fit.valid,
-      warnings: warnings
+      warnings: warnings,
+      plan: plan
     };
   }
 
@@ -2384,6 +2614,10 @@
       poolFor: poolFor,
       forwardCalc: forwardCalc,
       fitWeapon: fitWeapon,
+      polMatches: polMatches, // v1.5.2
+      slotPolOf: slotPolOf, // v1.5.2
+      stancePickFor: stancePickFor, // v1.5.2
+      givenFitWeapon: givenFitWeapon, // v1.5.2
       classifyEffect: classifyEffect,
       stanceTypeFor: stanceTypeFor,
       arcaneEffectsForEntry: arcaneEffectsForEntry,
