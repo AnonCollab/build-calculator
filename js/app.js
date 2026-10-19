@@ -1447,11 +1447,30 @@
     (SITE.arcanes.arcanes || []).forEach(function (a) {
       if (w) {
         if (window.WeaponSolver._internal.arcaneTypeMatches(a, w.entry)) out.push(a.name);
+      } else if (cat.kind === 'amp') {
+        // v1.4.1: an Amp build equips Amp + Operator arcanes (13 + 22);
+        // the Warframe set this branch used to fall into fits neither
+        // of the amp solver's arcane slots.
+        if (a.type === 'Amp' || a.type === 'Operator') out.push(a.name);
       } else if (a.type === 'Warframe') {
         out.push(a.name);
       }
     });
     return out.sort();
+  }
+  // v1.4.1: the lock-arcane caption — the picker list IS a filtered
+  // universe (the arcanes equippable on this category of gear), and
+  // until it said so, a correct 64-name Warframe list read as
+  // "not a full list" (Tacusin's report).
+  function arcaneUniverseCaption() {
+    var cat = currentCat();
+    if (cat.kind === 'amp') {
+      return 'Showing Amp and Operator arcanes — the set equippable on this gear.';
+    }
+    if (isWeaponKind(cat.kind)) {
+      return 'Showing the arcanes equippable on the selected weapon.';
+    }
+    return 'Showing Warframe arcanes — the set equippable on this gear.';
   }
   // extraModRecords for the solvers/evaluators: full records for mods
   // the stat pools do not carry (stat-less locks and swap-ins). Records
@@ -1511,26 +1530,34 @@
     if (!mp || !window.Solver.isAugmentRecord(mp)) return '';
     return 'augment' + (mp.augmentsAbility ? ' · ' + mp.augmentsAbility : '');
   }
-  function pickerTag(name) {
-    var b = augmentBadge(name);
-    return (b ? ' · ' + b : '') + classTag(name);
-  }
-  function fillDatalist(dl, names, tagged) {
+  function fillDatalist(dl, names) {
     if (!dl) return;
     dl.innerHTML = '';
     names.forEach(function (n) {
       var o = document.createElement('option');
       o.value = n;
-      if (tagged) o.textContent = pickerTag(n);
+      // v1.4.1 (Tacusin's call, superseding the v1.3 picker tags AND
+      // the first v1.4.1 fix): dropdown rows are the piece NAME ONLY —
+      // no class/augment tags in pickers. v1.3 had set the label to the
+      // tag alone, which rendered nameless "· maintainable 9s" rows
+      // (his screenshot report); class info lives in the guide and
+      // results, not in dropdowns.
+      o.textContent = n;
       dl.appendChild(o);
     });
   }
   function refreshLocksUI() {
     var cat = currentCat();
+    // The locks panel itself stays hidden for Amps (the amp solver
+    // takes no locks — a visible panel would be a dead control), but
+    // the datalists are refilled for EVERY category: returning early
+    // left the previous category's names sitting in them (the Amp
+    // category inherited the Warframe arcane list verbatim).
     $('locks-panel').hidden = cat.kind === 'amp';
-    if (cat.kind === 'amp') return;
-    fillDatalist($('lock-mod-list'), pickerModNames(false), true);
-    fillDatalist($('lock-arcane-list'), arcanePickerNames(), true);
+    fillDatalist($('lock-mod-list'), pickerModNames(false));
+    fillDatalist($('lock-arcane-list'), arcanePickerNames());
+    var cap = $('lock-arcane-caption');
+    if (cap) cap.textContent = arcaneUniverseCaption();
     renderLockLists();
   }
   function renderLockLists() {
@@ -2790,7 +2817,7 @@
         return banned.indexOf(n) < 0;
       });
     }
-    fillDatalist($('swap-list'), swapPoolNames, true);
+    fillDatalist($('swap-list'), swapPoolNames);
     $('swap-search').value = '';
     $('board-swap').hidden = false;
   }
