@@ -172,6 +172,70 @@
  *    solver-chosen burst pieces; the sustained floor is unchanged
  *    (ALL burst pieces stripped, locked included). Window / upkeep
  *    / unset behaviour is byte-identical to v1.3.
+ *
+ * v1.5 (channel drain, frames only):
+ *  - Data: data.channels = {abilities: {name: {frame,
+ *    baseDrainPerSec, resource, note}}} (pipeline/
+ *    extract_channels.py: the channeled set from Module:Ability/
+ *    data's IsChanneled flags; base drains parsed from each
+ *    ability's own wiki page — the store carries no drain field).
+ *    A frame's tracked channel is the HIGHEST-drain channeled
+ *    ability among its native abilities (the conservative choice;
+ *    primes inherit via their own ability lists). Native abilities
+ *    only: a channeled ability gained via Helminth does not confer
+ *    the stat.
+ *  - Formula (wiki pages "Ability Efficiency" + "Channeled
+ *    Abilities", verified Stage C0):
+ *      drain/sec = baseDrain x clamp((200 - Eff%) / Dur%, 0.25, 1.75)
+ *    Eff% is the build's UNCAPPED efficiency (the 175% cast cap
+ *    does not apply to drain); Dur% is its duration. achievedFrom
+ *    emits achieved.channelDrain (+ result.channel names the
+ *    tracked ability) whenever the frame has a tracked channel.
+ *  - Q2 resolution: drain is lower-better, so an 'atleast' target
+ *    on channelDrain reads "at or below" — the per-target
+ *    lowerBetter convention weaponSolver.js already uses (default
+ *    true for this stat), applied in scoreState, the fill guard
+ *    and unmet reporting. Achieved values are always the real
+ *    drain/sec, never an inverted number. Maximize is not offered
+ *    for channelDrain (raising a drain is meaningless); a maximize
+ *    entry is dropped with a result note.
+ *  - Preference: input.channelPreference 'efficiency' | 'duration'
+ *    (default 'efficiency') adds a small ordering bias inside
+ *    scoreState ONLY while a channelDrain target is active — a
+ *    tie-break among builds, never a change to any achieved value.
+ *    No channelDrain target -> no bias -> solves byte-identical to
+ *    v1.4.1.
+ *
+ * v1.5 (Focus schools, frames only):
+ *  - Data: data.focus = {schools: [{name, ...}], nodes: [...]}
+ *    (data/derived/focus.json — Module:Focus/data extraction,
+ *    pipeline/extract_focus.py). Only nodes whose status is
+ *    'modelled' (a stat derivation the source text supports) can be
+ *    pieces; prose / operator-only nodes ship as documentation and
+ *    are never fielded.
+ *  - Route: input.routes.focus = {school: '<name>'} picks ONE
+ *    school per build (Helminth-choice shape). The school's modelled
+ *    nodes apply as FIXED route contributions (the school is the
+ *    player's pick, not a searched choice): unconditional nodes
+ *    always apply; conditional nodes count only under the
+ *    conditional route, like every conditional piece. No pick (or a
+ *    non-warframe kind) -> no focus contributions -> solves
+ *    byte-identical to before. An unknown school name is a hard
+ *    Error (same precedent as an unknown Helminth donor).
+ *  - Intent: modelled conditional nodes carry v1.3 class rows
+ *    (kind 'focus'). Under 'upkeep' a burst-class focus node is
+ *    pruned from the contributions with a result note (Stage F2:
+ *    school actives obey intent exactly like mods/arcanes). Under
+ *    'hybrid' burst focus nodes are KEPT and do NOT consume the
+ *    burst allowance — the allowance counts SOLVER-CHOSEN pieces
+ *    (Q1), and the school is the player's explicit pick, the same
+ *    class as a forced Helminth choice. The sustained floor strips
+ *    burst focus nodes like every burst piece. Contributions land
+ *    in the per-stat breakdown as 'Focus · <School> — <Node>'
+ *    steps, and the kept set is reported as arrangement.focus
+ *    {school, nodes}. evaluateFrame takes pieces.focus in the same
+ *    {school, nodes} shape (nodes omitted = the school's full
+ *    modelled set) for board parity.
  */
 (function () {
   'use strict';
@@ -408,6 +472,45 @@
     // windowSeconds, maxStacks, trigger, evidence}}. Optional bundle
     // key — absent means no intent pruning anywhere.
     ctx.condClasses = (data && data.conditionalClasses) || {};
+
+    // v1.5 channel data: {abilities: {name: {frame, baseDrainPerSec,
+    // resource, note}}}. Optional bundle key — absent means no frame
+    // has a tracked channel and channelDrain never appears.
+    ctx.channelByAbility = (data && data.channels &&
+      data.channels.abilities) || {};
+
+    // v1.5 Focus schools: modelled nodes by school (the only nodes
+    // that can be pieces — effects filtered to the solver's stats,
+    // same discipline as arcanes), plus per-school status counts for
+    // the result notes. ctx.focusActive is the per-solve kept set,
+    // set by solve()/evaluateFrame (never shared state).
+    ctx.focusBySchool = {};
+    ctx.focusCounts = {};
+    ((data && data.focus && data.focus.nodes) || []).forEach(function (n) {
+      if (!n || !n.name || !n.school) return;
+      var c = ctx.focusCounts[n.school] ||
+        (ctx.focusCounts[n.school] = { modelled: 0, prose: 0, operatorOnly: 0 });
+      if (n.status === 'modelled') {
+        c.modelled++;
+        var node = {
+          name: n.name, school: n.school,
+          conditional: !!n.conditional,
+          effects: (n.effects || []).filter(function (e) {
+            return ALL_STATS.indexOf(e.stat) >= 0 &&
+              typeof e.value === 'number';
+          })
+        };
+        if (node.effects.length) {
+          (ctx.focusBySchool[n.school] =
+            ctx.focusBySchool[n.school] || []).push(node);
+        }
+      } else if (n.status === 'operator-only') {
+        c.operatorOnly++;
+      } else {
+        c.prose++;
+      }
+    });
+    ctx.focusActive = null;
 
     var wf = (data.warframes && data.warframes.Warframes) || {};
     ctx.frames = wf;
@@ -802,6 +905,16 @@
         add(e.stat, e.unit, e.value);
       });
     }
+    // Focus school nodes (v1.5): fixed route contributions held on
+    // ctx (per-solve kept set — intent filtering happened where the
+    // set was installed). Conditional nodes count only under the
+    // conditional route, like every conditional piece.
+    if (ctx.focusActive) {
+      ctx.focusActive.forEach(function (node) {
+        if (node.conditional && !routes.conditional) return;
+        node.effects.forEach(function (e) { add(e.stat, e.unit, e.value); });
+      });
+    }
     return sums;
   }
 
@@ -937,15 +1050,30 @@
   function frameBreakdown(ctx, frame, state, routes, supportSetPieces,
                           orderedMods, exilusName, helmetFrame) {
     var chains = {};
-    ALL_STATS.forEach(function (s) { chains[s] = []; });
+    // v1.5: channelDrain joins the chains when the frame tracks a
+    // channel (its chain derives from the same prefix evaluations —
+    // the contributors are the Efficiency/Duration movers).
+    var bdStats = ctx.channelTrack
+      ? ALL_STATS.concat(['channelDrain']) : ALL_STATS;
+    bdStats.forEach(function (s) { chains[s] = []; });
     function achievedOf(st, noSet) {
       return achievedFrom(ctx, frame,
         walkContributions(ctx, st, routes, supportSetPieces, null, noSet));
     }
     var prefix = emptyState(null);
     prefix._helmetFrame = helmetFrame || state._helmetFrame;
+    // v1.5 Focus: contributions ride on ctx, not on the prefix
+    // state, so the chain replays them as explicit steps — start
+    // from none and add one node at a time (restored before the
+    // final full evaluation below; ctx is per-solve, so this is
+    // safe). Conditional focus nodes the route excludes simply
+    // produce no delta and drop out of the chain, like any
+    // conditional piece.
+    var focusAll = ctx.focusActive || [];
+    var focusSoFar = [];
+    ctx.focusActive = [];
     var prev = achievedOf(prefix, true);
-    ALL_STATS.forEach(function (s) {
+    bdStats.forEach(function (s) {
       chains[s].push({ source: 'Base', kind: 'base', cumulative: round2(prev[s]) });
     });
     var steps = [];
@@ -998,10 +1126,19 @@
       steps.push({ source: state.helmet, kind: 'helmet',
         apply: function (p) { p.helmet = state.helmet; } });
     }
+    focusAll.forEach(function (node) {
+      steps.push({ source: 'Focus · ' + node.school + ' — ' + node.name,
+        kind: 'focus', focusNode: node,
+        apply: function (p) { /* focus rides on ctx, see loop */ } });
+    });
     steps.forEach(function (step) {
+      if (step.focusNode) {
+        focusSoFar.push(step.focusNode);
+        ctx.focusActive = focusSoFar.slice();
+      }
       step.apply(prefix);
       var now = achievedOf(prefix, true);
-      ALL_STATS.forEach(function (s) {
+      bdStats.forEach(function (s) {
         if (Math.abs(now[s] - prev[s]) > 1e-9) {
           chains[s].push({ source: step.source, kind: step.kind,
                            cumulative: round2(now[s]) });
@@ -1010,8 +1147,9 @@
       prev = now;
     });
     // Final step: set bonuses land (full contribution walk).
+    ctx.focusActive = focusAll;
     var full = achievedOf(state, false);
-    ALL_STATS.forEach(function (s) {
+    bdStats.forEach(function (s) {
       if (Math.abs(full[s] - prev[s]) > 1e-9) {
         chains[s].push({ source: 'Set bonuses', kind: 'set',
                          cumulative: round2(full[s]) });
@@ -1021,7 +1159,7 @@
     // previous entry (the Base entry's delta is its own value), so
     // the chain reads "+delta -> running total" per source and the
     // deltas sum to the final cumulative.
-    ALL_STATS.forEach(function (s) {
+    bdStats.forEach(function (s) {
       var prevCum = 0;
       chains[s].forEach(function (e, i) {
         e.delta = (i === 0) ? e.cumulative : round2(e.cumulative - prevCum);
@@ -1102,9 +1240,47 @@
     };
   }
 
+  // v1.5: the frame's tracked channel — the HIGHEST-drain channeled
+  // ability among its native abilities (frame.Abilities from the
+  // store), or null. Held per-solve on ctx (never shared state).
+  function channelTrackFor(ctx, frame) {
+    var abilities = (frame && frame.Abilities) || [];
+    var best = null;
+    abilities.forEach(function (name) {
+      var rec = ctx.channelByAbility[name];
+      if (rec && typeof rec.baseDrainPerSec === 'number' &&
+          (!best || rec.baseDrainPerSec > best.baseDrainPerSec)) {
+        best = { ability: name, baseDrainPerSec: rec.baseDrainPerSec,
+                 resource: rec.resource || 'energy',
+                 note: rec.note || null };
+      }
+    });
+    return best;
+  }
+
+  // v1.5: the modelled Focus nodes of one school (ctx.focusBySchool
+  // order = dataset order), optionally narrowed to a kept-name list.
+  // null when the school has no modelled nodes at all.
+  function focusActiveFor(ctx, school, keepNames) {
+    var nodes = ctx.focusBySchool[school] || null;
+    if (!nodes) return null;
+    if (!keepNames) return nodes.slice();
+    return nodes.filter(function (n) { return keepNames.indexOf(n.name) >= 0; });
+  }
+
   function achievedFrom(ctx, frame, sums) {
     var out = {};
     ABILITY_STATS.forEach(function (k) { out[k] = 100 + sums[k].percent; });
+    // v1.5 channel drain (see header): the formula reads the TRUE
+    // efficiency BEFORE the cast cap below is applied, and the
+    // build's duration; multiplier clamped to [0.25, 1.75] of base.
+    if (ctx.channelTrack) {
+      var effRaw = out.abilityEfficiency;
+      var durPct = out.abilityDuration;
+      var mult = durPct > 0 ? (200 - effRaw) / durPct : 1.75;
+      mult = Math.max(0.25, Math.min(1.75, mult));
+      out.channelDrain = ctx.channelTrack.baseDrainPerSec * mult;
+    }
     out.abilityEfficiency = Math.min(EFFICIENCY_CAP, out.abilityEfficiency);
     POOL_STATS.forEach(function (k) {
       var baseKey = { health: 'Health', shield: 'Shield', armor: 'Armor', energyMax: 'Energy' }[k];
@@ -1265,14 +1441,20 @@
   }
 
   // ---- scoring ------------------------------------------------------------------
-  function scoreState(targets, achieved, fit, state) {
+  function scoreState(targets, achieved, fit, state, opts) {
     var shortfall = 0, closestDist = 0;
     Object.keys(targets).forEach(function (stat) {
       var t = targets[stat];
       if (!t || t.mode === 'dontcare' || typeof t.value !== 'number') return;
       var a = achieved[stat];
       if (t.mode === 'atleast') {
-        if (a < t.value) shortfall += (t.value - a) / t.value;
+        // v1.5 Q2: channelDrain is lower-better — 'atleast' reads
+        // "at or below" (lowerBetter convention, as weaponSolver).
+        if (stat === 'channelDrain' && t.lowerBetter !== false) {
+          if (a > t.value) {
+            shortfall += (a - t.value) / Math.max(1, Math.abs(t.value));
+          }
+        } else if (a < t.value) shortfall += (t.value - a) / t.value;
       } else if (t.mode === 'closest') {
         closestDist += Math.abs(a - t.value) / Math.max(1, Math.abs(t.value));
       }
@@ -1283,6 +1465,13 @@
     var tertiary = modCount(state) * 0.01 +
                    fit.formaUsed * 0.01 + pieces * 0.002 + state.fusions.length * 0.002;
     var score = shortfall * 10000 + closestDist * 100 + tertiary;
+    // v1.5 channel preference: an ORDERING bias only (see header) —
+    // present solely while a channelDrain target is scored, sized to
+    // outrank the tertiary economy term but never a target term.
+    if (opts && opts.prefStat && targets.channelDrain &&
+        typeof targets.channelDrain.value === 'number') {
+      score -= (achieved[opts.prefStat] || 0) * 0.001;
+    }
     if (!fit.valid) score += 20000; // search must prefer valid arrangements
     return { score: score, shortfall: shortfall, closestDist: closestDist };
   }
@@ -1386,6 +1575,115 @@
     var targetedStats = Object.keys(targets).filter(function (s) {
       return targets[s] && targets[s].mode !== 'dontcare' && typeof targets[s].value === 'number';
     });
+
+    // ---- v1.5 channel drain -----------------------------------------
+    // Tracked channel for THIS frame (warframe kind only; native
+    // abilities only — see header). ctx.channelTrack feeds
+    // achievedFrom, so evaluateWith / breakdown / sustained all see
+    // channelDrain with no further plumbing.
+    ctx.channelTrack = kind === 'warframe' ? channelTrackFor(ctx, frame) : null;
+    var channelNotes = [];
+    if (!ctx.channelTrack && targets.channelDrain) {
+      // A drain target on a frame with no tracked channel is dropped
+      // with a note (warn-never-block): there is no drain to solve
+      // toward. (The site never offers the control there.)
+      delete targets.channelDrain;
+      targetedStats = targetedStats.filter(function (s) {
+        return s !== 'channelDrain';
+      });
+      channelNotes.push('Channel drain target ignored: ' + input.frameName +
+        ' has no channeled ability with a documented per-second drain.');
+    }
+    if (maximizeList.some(function (m) { return m.stat === 'channelDrain'; })) {
+      // Maximize on a drain is meaningless (lower is better) and is
+      // not offered by the site; drop it with a note rather than let
+      // the fill phase RAISE a drain.
+      maximizeList = maximizeList.filter(function (m) {
+        return m.stat !== 'channelDrain';
+      });
+      channelNotes.push('Maximize is not supported for Channel drain ' +
+        '(lower is better); the entry was ignored.');
+    }
+    var channelTargeted = !!ctx.channelTrack &&
+      targetedStats.indexOf('channelDrain') >= 0;
+    var channelPreference = input.channelPreference === 'duration'
+      ? 'duration' : 'efficiency';
+    // Q2 (see header): 'atleast' on channelDrain reads "at or below"
+    // — the lowerBetter convention from weaponSolver.js, defaulting
+    // true for this stat, overridable per target.
+    function lowerBetter(stat) {
+      if (stat !== 'channelDrain') return false;
+      var t = targets[stat];
+      if (t && typeof t.lowerBetter === 'boolean') return t.lowerBetter;
+      return true;
+    }
+    // Preference bias plumbing for scoreState: non-null ONLY while
+    // a channelDrain target is active (invariance contract).
+    var scoreOpts = channelTargeted ? {
+      prefStat: channelPreference === 'duration'
+        ? 'abilityDuration' : 'abilityEfficiency'
+    } : null;
+
+    // ---- v1.5 Focus school route --------------------------------
+    // input.routes.focus = {school} picks ONE school (warframe kind
+    // only). Its modelled nodes become fixed route contributions on
+    // ctx.focusActive (see header): unconditional nodes always
+    // apply; conditional nodes count under the conditional route.
+    // Intent: burst-class focus nodes are PRUNED under upkeep
+    // (noted), KEPT under hybrid without consuming the allowance
+    // (the school is the player's explicit pick — Q1's player-pinned
+    // class), and stripped again for the sustained floor.
+    var focusNotes = [];
+    var focusSchoolApplied = null;
+    var focusKeptNodes = [];
+    var focusPick = (kind === 'warframe' && routesIn.focus &&
+      typeof routesIn.focus === 'object' &&
+      typeof routesIn.focus.school === 'string' && routesIn.focus.school)
+      ? routesIn.focus.school : null;
+    if (focusPick) {
+      var focusKnown = !!ctx.focusCounts[focusPick] ||
+        (data.focus && (data.focus.schools || []).some(function (s) {
+          return s && s.name === focusPick;
+        }));
+      if (!focusKnown) {
+        throw new Error('Unknown focus school: ' + focusPick +
+          ' (dataset schools: ' +
+          Object.keys(ctx.focusCounts).sort().join(', ') + ')');
+      }
+      focusSchoolApplied = focusPick;
+      var focusAllNodes = focusActiveFor(ctx, focusPick) || [];
+      var focusKept = focusAllNodes;
+      if (pruneBurst) {
+        focusKept = focusAllNodes.filter(function (n) {
+          if (isBurst(n.name)) {
+            focusNotes.push('Focus node ' + n.name + ' (' + focusPick +
+              ') is a burst piece and is excluded from an upkeep build.');
+            return false;
+          }
+          return true;
+        });
+      } else if (hybrid) {
+        focusAllNodes.forEach(function (n) {
+          if (isBurst(n.name)) {
+            focusNotes.push('Focus node ' + n.name + ' (' + focusPick +
+              ') is a burst piece kept under Hybrid — the school is ' +
+              'your explicit pick, so it does not consume the burst ' +
+              'allowance.');
+          }
+        });
+      }
+      ctx.focusActive = focusKept;
+      focusKeptNodes = focusKept.map(function (n) { return n.name; });
+      var fc = ctx.focusCounts[focusPick] || { modelled: 0, prose: 0, operatorOnly: 0 };
+      focusNotes.push('Focus school: ' + focusPick + ' — ' +
+        (focusKeptNodes.length
+          ? 'modelled nodes applied: ' + focusKeptNodes.join(', ') +
+            ' (conditional ones count under the Conditional route).'
+          : 'no stat-modelled nodes are active for this school.') +
+        ' The school\'s other ' + (fc.prose + fc.operatorOnly) +
+        ' nodes are mechanic or Operator effects and are not ' +
+        'stat-modelled (see the Focus audit).');
+    }
 
     // ---- v1.2 excludes ---------------------------------------------------
     // input.excludedMods / input.excludedArcanes ban pieces from
@@ -1686,7 +1984,18 @@
       return { mods: mods, arcanes: arcanes, subsumes: subsumes, tomes: tomes,
                auras: auras, shardPicks: shardPicks, helmets: helmets, byName: byName };
     }
-    var HARD = buildCandidates(targetedStats, candidateRanks, true);
+    // v1.5: a channelDrain target admits the pieces that FEED the
+    // drain — Efficiency and Duration movers — into the hard pool
+    // even when those stats are not themselves targeted (admission
+    // is by targeted stat; candidateRanks gives the feeders
+    // max-rank candidates, which is what drain solving wants).
+    var hardStatSet = targetedStats.slice();
+    if (channelTargeted) {
+      ['abilityEfficiency', 'abilityDuration'].forEach(function (s) {
+        if (hardStatSet.indexOf(s) < 0) hardStatSet.push(s);
+      });
+    }
+    var HARD = buildCandidates(hardStatSet, candidateRanks, true);
     var FILL = maximizeList.length
       ? buildCandidates(maximizeList.map(function (m) { return m.stat; }), fillRanks, false)
       : null;
@@ -1721,7 +2030,7 @@
       var achieved = achievedFrom(ctx, frame, sums);
       var fit = fitCapacity(ctx, frame, state, input.formaBudget,
                             input.reactor !== false, input.umbraForma || 0);
-      var sc = scoreFn(targets, achieved, fit, state);
+      var sc = scoreFn(targets, achieved, fit, state, scoreOpts);
       return { state: state, achieved: achieved, fit: fit, score: sc.score,
                shortfall: sc.shortfall, closestDist: sc.closestDist || 0 };
     }
@@ -1878,6 +2187,9 @@
         var stat = targetedStats[si];
         var t = targets[stat];
         if (!t || t.mode !== 'atleast') continue;
+        // v1.5: channelDrain sits ABOVE its "floor" by construction
+        // (lower-better) — the below-floor lane logic does not apply.
+        if (stat === 'channelDrain') continue;
         var below = sorted.filter(function (ev) {
           return !picked[sigOf(ev)] && ev.achieved[stat] < t.value - 1e-9;
         });
@@ -2049,7 +2361,13 @@
     function guardOk(evNew, anchor) {
       for (var i = 0; i < targetedStats.length; i++) {
         var stat = targetedStats[i], t = targets[stat];
-        if (t.mode === 'atleast') {
+        if (t.mode === 'atleast' && lowerBetter(stat)) {
+          // v1.5 Q2 mirrored: a met drain cap stays met; an unmet
+          // one never gets worse under fill.
+          if (anchor.achieved[stat] <= t.value + 1e-9) {
+            if (evNew.achieved[stat] > t.value + 1e-9) return false;
+          } else if (evNew.achieved[stat] > anchor.achieved[stat] + 1e-9) return false;
+        } else if (t.mode === 'atleast') {
           if (anchor.achieved[stat] >= t.value - 1e-9) {
             if (evNew.achieved[stat] < t.value - 1e-9) return false;
           } else if (evNew.achieved[stat] < anchor.achieved[stat] - 1e-9) return false;
@@ -2278,6 +2596,16 @@
       var keptTome = (st.tome && keep(st.tome)) ? st.tome : null;
       var keptSubsume = st.subsume || null;
       if (keptSubsume && !keep(keptSubsume.ability)) keptSubsume = null;
+      // v1.5: focus nodes ride outside the slot state — strip the
+      // burst ones the same way (a burst focus node alone is enough
+      // to make the floor meaningful).
+      var keptFocus = null;
+      if (focusSchoolApplied) {
+        keptFocus = {
+          school: focusSchoolApplied,
+          nodes: focusKeptNodes.filter(keep)
+        };
+      }
       if (!hasBurst) return null;
       var ev = evaluateFrame(data, input.frameName, {
         slots: slots, arcanes: keptArcanes,
@@ -2285,6 +2613,7 @@
           return { colour: s.colour, tier: s.tier, stat: s.stat };
         }),
         tome: keptTome, helmet: st.helmet || null, subsume: keptSubsume,
+        focus: keptFocus,
         conditional: routes.conditional,
         formaBudget: input.formaBudget, umbraForma: input.umbraForma || 0,
         reactor: input.reactor, itemKind: input.itemKind,
@@ -2322,11 +2651,21 @@
       }
       var achieved = {};
       ALL_STATS.forEach(function (k) { achieved[k] = round2(evRes.achieved[k]); });
+      // v1.5: the tracked channel's drain joins the reported stats.
+      if (ctx.channelTrack && typeof evRes.achieved.channelDrain === 'number') {
+        achieved.channelDrain = round2(evRes.achieved.channelDrain);
+      }
 
       var unmet = [];
       targetedStats.forEach(function (stat) {
         var t = targets[stat];
-        if (t.mode === 'atleast' && evRes.achieved[stat] < t.value - 1e-9) {
+        if (t.mode !== 'atleast') return;
+        // v1.5 Q2 mirrored: a drain target is unmet when the drain
+        // sits ABOVE the cap.
+        var missed = lowerBetter(stat)
+          ? evRes.achieved[stat] > t.value + 1e-9
+          : evRes.achieved[stat] < t.value - 1e-9;
+        if (missed) {
           unmet.push({ stat: stat, target: t.value, achieved: round2(evRes.achieved[stat]) });
         }
       });
@@ -2503,6 +2842,14 @@
 
       return {
         achieved: achieved,
+        // v1.5: the tracked channel this build's drain belongs to
+        // (null on frames without one).
+        channel: ctx.channelTrack ? {
+          ability: ctx.channelTrack.ability,
+          baseDrainPerSec: ctx.channelTrack.baseDrainPerSec,
+          resource: ctx.channelTrack.resource,
+          note: ctx.channelTrack.note
+        } : null,
         breakdown: breakdown,
         sustained: sustainedFor(st),
         hybridBurst: hybridBurst,
@@ -2522,6 +2869,11 @@
           subsume: arrangementSubsume,
           subsumeReplaces: subsumeReplaces,
           subsumeInstruction: subsumeInstruction,
+          // v1.5: the Focus pick + the modelled nodes this build
+          // actually fields (post intent-pruning); null = no school.
+          focus: focusSchoolApplied ? {
+            school: focusSchoolApplied, nodes: focusKeptNodes.slice()
+          } : null,
           formaUsed: evRes.fit.formaUsed,
           umbraFormaUsed: evRes.fit.umbraFormaUsed || 0,
           formaPlan: evRes.fit.formaPlan,
@@ -2540,9 +2892,15 @@
       result.notes.unshift('No arrangement within the Forma budget fits the mod capacity; showing the best-scoring arrangement, which exceeds capacity.');
     }
     trimNotes.forEach(function (n) { result.notes.push(n); });
+    // v1.5: dropped channel targets (no tracked channel / maximize)
+    // are reported, never silent.
+    channelNotes.forEach(function (n) { result.notes.push(n); });
     // v1.4: augment locks that were dropped (route off / ineligible)
     // are reported, never silent.
     augmentLockNotes.forEach(function (n) { result.notes.push(n); });
+    // v1.5: Focus school notes (applied set / upkeep pruning /
+    // hybrid keeps) ride the same never-silent channel.
+    focusNotes.forEach(function (n) { result.notes.push(n); });
     // v1.3: locked (or explicitly chosen) burst pieces kept in an
     // upkeep build are flagged — the lock/choice overrode pruning.
     if (pruneBurst) {
@@ -2607,7 +2965,8 @@
         totalRankCost: ch.totalRankCost,
         breakdown: ch.breakdown, crossGearPlan: ch.crossGearPlan,
         sustained: ch.sustained,
-        hybridBurst: ch.hybridBurst
+        hybridBurst: ch.hybridBurst,
+        channel: ch.channel
       };
     }
     return result;
@@ -2625,6 +2984,7 @@
   //   slots: [{kind: 'aura'|'normal'|'exilus', mod, rank}],  // board order
   //   arcanes: [name], shards: [{colour, tier, stat}],
   //   tome, helmet, subsume: {ability, fromFrame, replacedAbility},
+  //   focus: {school, nodes?} (v1.5 — nodes omitted = full modelled set),
   //   conditional, formaBudget, umbraForma, reactor,
   //   itemKind, companionEntry, ownerStats, supportSetPieces,
   //   extraModRecords: {name: record}  // stat-less pool mods
@@ -2638,6 +2998,20 @@
       companionEntry: pieces.companionEntry, ownerStats: pieces.ownerStats
     });
     var frame = resolved.frame;
+    // v1.5: board parity — the evaluator tracks the frame's channel
+    // exactly like solve() does, so board edits show live drain.
+    ctx.channelTrack = resolved.kind === 'warframe'
+      ? channelTrackFor(ctx, frame) : null;
+    // v1.5 Focus parity: pieces.focus = {school, nodes?} applies the
+    // school's modelled nodes exactly as solve() installed them
+    // (nodes omitted = the school's full modelled set). The
+    // evaluator stays intent-free: the caller passes the kept set.
+    ctx.focusActive = null;
+    if (resolved.kind === 'warframe' && pieces.focus &&
+        typeof pieces.focus.school === 'string' && pieces.focus.school) {
+      ctx.focusActive = focusActiveFor(ctx, pieces.focus.school,
+        Array.isArray(pieces.focus.nodes) ? pieces.focus.nodes : null);
+    }
     Object.keys(pieces.extraModRecords || {}).forEach(function (name) {
       if (!ctx.modByName[name]) {
         var rec = lockRecordNormalize(pieces.extraModRecords[name], name);
@@ -2721,6 +3095,9 @@
     }
     var achieved = {};
     ALL_STATS.forEach(function (k) { achieved[k] = round2(achievedRaw[k]); });
+    if (ctx.channelTrack && typeof achievedRaw.channelDrain === 'number') {
+      achieved.channelDrain = round2(achievedRaw.channelDrain);
+    }
     // v1.2 breakdown for the board editor: chains follow the board's
     // own slot order (normal slots as listed, exilus after them).
     var evalOrdered = [], evalExilus = null;
