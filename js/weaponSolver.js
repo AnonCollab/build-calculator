@@ -178,6 +178,19 @@
  *    carrying `polarity` switches scoring, mirroring evaluateFrame):
  *    the board is priced as-is and the result gains `plan` in fit
  *    mode for the editor's Re-Forma.
+ *
+ * v1.6.0 (#14 — polarity-mismatch drain penalty):
+ *  - A mod in a slot of a DIFFERENT polarity costs ceil(drain x
+ *    1.25) (wiki "Polarity"), priced everywhere through the shared
+ *    drainInSlotW helper: fitWeapon's pool counting (unit
+ *    accounting — remaining innate units land on empty slots and
+ *    polarity-less leftovers first, so only the smallest polarized
+ *    leftovers that cannot avoid a unit pay it), the elemental
+ *    permutation pass, givenFitWeapon, and the board slot list,
+ *    whose per-slot drains still sum exactly to the counted
+ *    capacityUsed. A 'Universal' slot is NOT a mismatch (and does
+ *    not halve Umbra); slot-data 'Universal' is no polarity at
+ *    all — never a match, never a mismatch.
  */
 (function () {
   'use strict';
@@ -751,6 +764,25 @@
   }
   function drainAt(rec, rank) { return rec.baseDrain + rank; }
 
+  // v1.6.0 (#14): the game's polarity-mismatch drain penalty (wiki
+  // "Polarity"): a mod in a slot of a DIFFERENT polarity costs
+  // ceil(drain * 1.25). polMatches above is the match rule (a
+  // user-chosen 'Universal' slot matches any mod except Umbra —
+  // and an Umbra mod there is NOT a mismatch either: full drain,
+  // no penalty). Slot-data 'Universal'/'None' read as NO polarity
+  // via slotPolOf — never a match, never a mismatch. This helper
+  // prices givenFitWeapon, the permutation pass, and the board
+  // slot list; fitWeapon's counting applies the same rule through
+  // its unit accounting (see there).
+  function drainInSlotW(d, slotPol, modPol) {
+    if (d <= 0) return d;
+    var mp = (modPol && modPol !== 'None') ? modPol : null;
+    if (!mp) return d;
+    if (polMatches(slotPol, mp)) return Math.ceil(d / 2);
+    if (slotPolOf(slotPol)) return Math.ceil(d * 1.25);
+    return d;
+  }
+
   // Stance: capacity-only pick — best polarity match at max rank.
   // The stance slot NEVER joins the polarity pool (v1.5.2 wiki
   // verification): its polarity cannot be swapped with other slots
@@ -832,8 +864,44 @@
       var capMax = rankCap * 2 + sp.bonus;
       var remaining = budgetCap - over;
       if (remaining < 0) continue;
-      var cost = all.reduce(function (s, c) { return s + drainAt(c.rec, c.rank); }, 0);
       var matched = {}, matchedFree = [], matchedForma = [], matchedUmbra = [];
+      // v1.6.0 (#14): the PRICED cost of the current matched sets,
+      // applying drainInSlotW's rule through unit accounting. The
+      // pool's innate units are mobile (the swap model): after the
+      // free matches consume theirs, the remaining units R must be
+      // shown somewhere — on empty slots first, then on
+      // polarity-less leftovers (never penalised), and only the
+      // smallest polarized leftovers that still cannot avoid a
+      // unit pay ceil(drain * 1.25) instead of drain. (A remaining
+      // unit's polarity never equals a leftover mod's polarity —
+      // every mod of that polarity was free-matched first — so
+      // any unit a polarized leftover shows is a genuine
+      // mismatch.) The Exilus seat is part of slotPols here, as
+      // in the pool itself.
+      var polarizedSeats = 0;
+      slotPols.forEach(function (p) { if (p) polarizedSeats++; });
+      function pricedCost() {
+        var total = 0, saved = 0;
+        all.forEach(function (c) {
+          total += drainAt(c.rec, c.rank);
+          if (matched[c.rec.name]) saved += savingOf(c);
+        });
+        var lp = [], lz = 0;
+        all.forEach(function (c) {
+          if (matched[c.rec.name]) return;
+          if (polOf(c)) lp.push(drainAt(c.rec, c.rank)); else lz++;
+        });
+        lp.sort(function (a, b) { return a - b; });
+        var restUnits = polarizedSeats - matchedFree.length;
+        var emptyCount = slotPols.length - all.length;
+        var penCount = Math.min(lp.length,
+          Math.max(0, restUnits - emptyCount - lz));
+        var extra = 0;
+        for (var pi = 0; pi < penCount; pi++) {
+          extra += Math.ceil(lp[pi] * 1.25) - lp[pi];
+        }
+        return total - saved + extra;
+      }
       // (1) Free matches from the innate pool.
       var units = {};
       slotPols.forEach(function (p) { if (p) units[p] = (units[p] || 0) + 1; });
@@ -848,7 +916,6 @@
         for (var i = 0; i < n; i++) {
           matched[list[i].rec.name] = true;
           matchedFree.push(list[i].rec.name);
-          cost -= savingOf(list[i]);
         }
       });
       // (2) Forma spend, then the Umbra Forma pass (separate budget).
@@ -856,26 +923,25 @@
       var formaCands = all.filter(function (c) {
         return !matched[c.rec.name] && polOf(c) && polOf(c) !== 'Umbra' && savingOf(c) > 0;
       }).sort(bySaving);
-      for (var fi = 0; fi < formaCands.length && cost > capMax && regularUsed < remaining; fi++) {
+      for (var fi = 0; fi < formaCands.length && pricedCost() > capMax && regularUsed < remaining; fi++) {
         matched[formaCands[fi].rec.name] = true;
         matchedForma.push(formaCands[fi].rec.name);
         regularUsed++;
-        cost -= savingOf(formaCands[fi]);
       }
       var umbraUsedCount = 0;
       var umbraCands = all.filter(function (c) {
         return !matched[c.rec.name] && polOf(c) === 'Umbra' && savingOf(c) > 0;
       }).sort(bySaving);
-      for (var ui = 0; ui < umbraCands.length && cost > capMax && umbraUsedCount < (umbraForma || 0); ui++) {
+      for (var ui = 0; ui < umbraCands.length && pricedCost() > capMax && umbraUsedCount < (umbraForma || 0); ui++) {
         matched[umbraCands[ui].rec.name] = true;
         matchedUmbra.push(umbraCands[ui].rec.name);
         umbraUsedCount++;
-        cost -= savingOf(umbraCands[ui]);
       }
+      var priced = pricedCost();
       attempts.push({
-        overRankForma: over, capacityMax: capMax, capacityUsed: cost,
+        overRankForma: over, capacityMax: capMax, capacityUsed: priced,
         formaUsed: regularUsed, umbraFormaUsed: umbraUsedCount,
-        valid: cost <= capMax,
+        valid: priced <= capMax,
         totalForma: over + regularUsed + umbraUsedCount,
         matchedFree: matchedFree, matchedForma: matchedForma,
         matchedUmbra: matchedUmbra
@@ -901,14 +967,18 @@
     // innate polarity is theirs (the Exilus slot's unit can serve a
     // regular mod — a swap — in which case the mod lands on any
     // free slot and the polarity travels with it); forma'd mods
-    // prefer a free slot with no innate polarity; leftovers ascend
-    // and keep a leftover innate unit. Pick order matters beyond
-    // cosmetics: the elemental fold follows board order, and the
-    // solver's order pass optimized the pick sequence. The exilus
-    // mod stays pinned to the exilus slot; an unmatched exilus slot
-    // shows its own innate unit when it survives, else a leftover
-    // unit, else none. The multiset of shown polarities is always
-    // innate + forma-added, so per-slot drains sum to the count.
+    // prefer a free slot with no innate polarity; leftovers ascend.
+    // Pick order matters beyond cosmetics: the elemental fold
+    // follows board order, and the solver's order pass optimized
+    // the pick sequence. The exilus mod stays pinned to the exilus
+    // slot. v1.6.0: the SHOWN polarities of the non-matched slots
+    // are then distributed to mirror pricedCost's arrangement —
+    // the remaining innate units land on empty slots first, then
+    // on polarity-less leftovers (never penalised), and only the
+    // smallest polarized leftovers still holding a unit are the
+    // penalised set; the other polarized leftovers show none. The
+    // multiset of shown polarities is always innate + forma-added,
+    // so per-slot drains sum to the count.
     var byName = {};
     all.forEach(function (c) { byName[c.rec.name] = c; });
     var freeSet = {}, formaSet = {}, umbraSet = {};
@@ -929,27 +999,12 @@
       for (var i = 0; i < 8; i++) if (!taken[i] && pred(i)) return i;
       return -1;
     }
-    function leftoverPol() {
-      for (var i = 0; i < polOrder.length; i++) {
-        if (rest[polOrder[i]] > 0) { rest[polOrder[i]]--; return polOrder[i]; }
-      }
-      return null;
-    }
     if (exilusEntry) {
       assign[exilusEntry.rec.name] = exSlotIndex;
       taken[exSlotIndex] = true;
       if (freeSet[exilusEntry.rec.name] || formaSet[exilusEntry.rec.name] ||
           umbraSet[exilusEntry.rec.name]) {
         pols[exSlotIndex] = polOf(exilusEntry);
-      } else if (exPol && rest[exPol] > 0) {
-        rest[exPol]--;
-        pols[exSlotIndex] = exPol;
-      } else {
-        // Its innate unit may have been swapped away to a free match
-        // elsewhere — the slot then shows a leftover unit, or nothing.
-        // (Never its own innate unconditionally: that would show the
-        // same unit twice and fake a match the counting didn't grant.)
-        pols[exSlotIndex] = leftoverPol();
       }
     }
     all.forEach(function (c) {
@@ -962,10 +1017,34 @@
       if (slot < 0) slot = firstFreeSlot(function () { return true; });
       if (slot < 0) return;
       assign[name] = slot; taken[slot] = true;
-      if (freeSet[name] || formaSet[name] || umbraSet[name]) { pols[slot] = p; return; }
-      var own = slotPols[slot];
-      if (own && rest[own] > 0) { rest[own]--; pols[slot] = own; }
-      else pols[slot] = leftoverPol(); // may be null — see above
+      if (freeSet[name] || formaSet[name] || umbraSet[name]) pols[slot] = p;
+    });
+    // v1.6.0: distribute the remaining innate units (rest) over the
+    // non-matched slots in pricedCost's arrangement order (see the
+    // header comment): empty slots, then polarity-less leftovers,
+    // then the smallest polarized leftovers; any slot past the
+    // available units shows none, and units past the available
+    // slots are simply not shown (a unit is a slot's polarity, not
+    // a token that must appear).
+    var restUnits = [];
+    polOrder.forEach(function (p) {
+      for (var k = 0; k < (rest[p] || 0); k++) restUnits.push(p);
+    });
+    var bySlotName = {};
+    Object.keys(assign).forEach(function (n) { bySlotName[assign[n]] = n; });
+    var emptySlots = [], lzSlots = [], lpSlots = [];
+    for (var si = 0; si < slotPols.length; si++) {
+      if (!(si in bySlotName)) { emptySlots.push(si); continue; }
+      var cn = bySlotName[si];
+      if (freeSet[cn] || formaSet[cn] || umbraSet[cn]) continue;
+      if (polOf(byName[cn])) lpSlots.push(si); else lzSlots.push(si);
+    }
+    lpSlots.sort(function (a, b) {
+      var ca = byName[bySlotName[a]], cb = byName[bySlotName[b]];
+      return (drainAt(ca.rec, ca.rank) - drainAt(cb.rec, cb.rank)) || (a - b);
+    });
+    emptySlots.concat(lzSlots, lpSlots).forEach(function (slot, idx) {
+      pols[slot] = idx < restUnits.length ? restUnits[idx] : null;
     });
     var formaPlan = [];
     pick.matchedForma.forEach(function (name) {
@@ -1026,8 +1105,7 @@
     var gUmbra = Math.max(0, (assigned.Umbra || 0) - (innateCounts.Umbra || 0));
     var used = 0;
     normals.concat(exilusEntry ? [exilusEntry] : []).forEach(function (e) {
-      var d = drainAt(e.rec, e.rank);
-      used += polMatches(polAt[e._fitSlot], e.rec.polarity) ? Math.ceil(d / 2) : d;
+      used += drainInSlotW(drainAt(e.rec, e.rank), polAt[e._fitSlot], e.rec.polarity);
     });
     var maxRankCap = weapon.MaxRank || 30;
     var over = (Number.isInteger(pieces.overRankForma) &&
@@ -1938,9 +2016,8 @@
         if (exIdx >= 0 && !cand[exIdx].rec.exilus) return null;
         var cost = 0;
         cand.forEach(function (p, i) {
-          var d = drainAt(p.rec, p.rank);
-          cost += polMatches(fit.pols[physSlot[i]], p.rec.polarity)
-            ? Math.ceil(d / 2) : d;
+          cost += drainInSlotW(drainAt(p.rec, p.rank),
+            fit.pols[physSlot[i]], p.rec.polarity);
         });
         if (cost > fit.capacityMax) return null;
         var opts = fwdOpts;
@@ -2317,10 +2394,7 @@
       });
       var pol = evRes.fit.pols ? evRes.fit.pols[fitSlot] : null;
       var drain = 0;
-      if (pp) {
-        var d = drainAt(pp.rec, pp.rank);
-        drain = polMatches(pol, pp.rec.polarity) ? Math.ceil(d / 2) : d;
-      }
+      if (pp) drain = drainInSlotW(drainAt(pp.rec, pp.rank), pol, pp.rec.polarity);
       return {
         kind: kind, fitSlot: fitSlot, mod: name || null,
         rank: pp ? pp.rank : null,

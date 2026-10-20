@@ -2802,9 +2802,17 @@
     var matched = !!(s.slotPolarity && rec.polarity &&
       (s.slotPolarity === rec.polarity ||
        (s.slotPolarity === 'Universal' && rec.polarity !== 'Umbra')));
+    // v1.6.0: the game's mismatch penalty (wiki "Polarity") — a mod
+    // in a slot of a different polarity costs ceil(drain x 1.25).
+    // A 'Universal' slot is never a mismatch (an Umbra mod there is
+    // full drain, no penalty), and a slot with no polarity prices
+    // at full drain, as do mods with no polarity of their own.
+    var mismatched = !!(s.slotPolarity && s.slotPolarity !== 'None' &&
+      rec.polarity && !matched && s.slotPolarity !== 'Universal');
     return {
-      eff: matched ? Math.ceil(base / 2) : base,
-      granted: false, matched: matched
+      eff: matched ? Math.ceil(base / 2)
+        : mismatched ? Math.ceil(base * 1.25) : base,
+      granted: false, matched: matched, mismatched: mismatched
     };
   }
   function slotKindLabel(s, normalIdx) {
@@ -2848,7 +2856,8 @@
         if (d) {
           var dt = el('span', 'slot-meta' + (d.matched ? ' matched-drain' : ''),
             d.granted ? 'grants ' + Math.abs(d.eff) + ' capacity'
-                      : 'drain ' + d.eff + (d.matched ? ' (polarity match)' : ''));
+                      : 'drain ' + d.eff + (d.matched ? ' (polarity match)'
+                        : d.mismatched ? ' (polarity mismatch)' : ''));
           cell.appendChild(dt);
         }
         if (isOmniAura) cell.appendChild(el('span', 'badge', 'Omni Forma'));
@@ -3330,12 +3339,16 @@
       return (rec && rec.polarity && rec.polarity !== 'None') ? rec.polarity : null;
     }
     // Innate multiset left over after the free matches take theirs.
+    // v1.6.0: the weapon Exilus seat's innate unit is part of the
+    // pool only when an Exilus mod is actually fit (fitWeapon's
+    // rule) — counting it for an empty Exilus cell let a phantom
+    // unit migrate onto a leftover mod and price it as a mismatch.
     var rest = {};
     boardCur.slots.forEach(function (s) {
       if (s.kind === 'normal' && s.innatePolarity) {
         rest[s.innatePolarity] = (rest[s.innatePolarity] || 0) + 1;
       }
-      if (weaponPool && s.kind === 'exilus' && s.innatePolarity) {
+      if (weaponPool && s.kind === 'exilus' && s.mod && s.innatePolarity) {
         rest[s.innatePolarity] = (rest[s.innatePolarity] || 0) + 1;
       }
     });
@@ -3352,6 +3365,7 @@
     Object.keys(rest).forEach(function (p) {
       for (var i = 0; i < rest[p]; i++) restQueue.push(p);
     });
+    var open = [];
     boardCur.slots.forEach(function (s) {
       if (s.kind === 'aura' || s.kind === 'stance') return;
       s.formaApplied = false;
@@ -3359,9 +3373,25 @@
       if (s.mod && umbra[s.mod]) { s.slotPolarity = 'Umbra'; s.umbraFormaApplied = true; }
       else if (s.mod && forma[s.mod]) { s.slotPolarity = modPol(s); s.formaApplied = true; }
       else if (s.mod && free[s.mod]) { s.slotPolarity = modPol(s); }
-      else if (s.kind === 'normal') { s.slotPolarity = restQueue.length ? restQueue.shift() : null; }
-      else if (weaponPool && s.kind === 'exilus') { s.slotPolarity = restQueue.length ? restQueue.shift() : null; }
+      else if (s.kind === 'normal' || (weaponPool && s.kind === 'exilus')) { open.push(s); }
       else { s.slotPolarity = null; }
+    });
+    // v1.6.0: the leftover units land in the solvers' arrangement
+    // order, not board order — empty slots first, then slots
+    // holding polarity-less mods, then the smallest polarized
+    // leftovers (the penalised set); other polarized leftovers
+    // show none, so a derived plan never invents a mismatch the
+    // fit did not price.
+    function slotDrain(s) {
+      var rec = s.mod ? (modRecord(s.mod) || modpoolRec(s.mod)) : null;
+      return rec ? (rec.baseDrain || 0) + (s.rank || 0) : 0;
+    }
+    var openOrdered = open.filter(function (s) { return !s.mod; })
+      .concat(open.filter(function (s) { return s.mod && !modPol(s); }))
+      .concat(open.filter(function (s) { return s.mod && modPol(s); })
+        .sort(function (a, b) { return slotDrain(a) - slotDrain(b); }));
+    openOrdered.forEach(function (s) {
+      s.slotPolarity = restQueue.length ? restQueue.shift() : null;
     });
   }
 
