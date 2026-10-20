@@ -272,6 +272,19 @@
  *    regular Forma (see fitCapacity's header note for the purchase
  *    discipline), and the aura mismatch bonus is the wiki's 80%
  *    rounded down (see auraCapacityBonus).
+ *
+ * v1.6.0 (#14 — polarity-mismatch drain penalty):
+ *  - A mod in a slot of a DIFFERENT polarity costs ceil(drain x
+ *    1.25) (wiki "Polarity"), priced everywhere through the shared
+ *    drainInSlot helper: fitCapacity's pool counting (seat
+ *    accounting — leftover mods arrange to minimise the penalty,
+ *    so only the smallest polarized leftovers that cannot avoid a
+ *    polarized seat pay it), evaluateFrame's given mode, and the
+ *    slot list's per-slot drains, which still sum exactly to the
+ *    counted capacityUsed. A 'Universal' slot is NOT a mismatch
+ *    (and does not halve Umbra — #17); a no-polarity slot is full
+ *    drain, no penalty. The aura bonus rule above is a separate
+ *    rule and is untouched.
  */
 (function () {
   'use strict';
@@ -1355,6 +1368,27 @@
 
   function modDrainAt(mod, rank) { return mod.baseDrain + rank; }
 
+  // v1.6.0 (#14): the game's polarity-mismatch drain penalty (wiki
+  // "Polarity"): a mod in a slot of a DIFFERENT polarity costs
+  // ceil(drain * 1.25). A match halves (ceil(drain/2)) — a
+  // 'Universal' (Omni Forma) slot matches everything EXCEPT Umbra,
+  // and an Umbra mod there is NOT a mismatch either (full drain,
+  // no penalty; the #17 ruling). No slot polarity and no mod
+  // polarity both price at full drain. This helper is the single
+  // pricing rule for fit slotInfo and evaluateFrame's given mode;
+  // fitCapacity's counting applies the same rule through its seat
+  // accounting (see there).
+  function drainInSlot(d, slotPol, modPol) {
+    if (d <= 0) return d;
+    var sp = (slotPol && slotPol !== 'None') ? slotPol : null;
+    var mp = (modPol && modPol !== 'None') ? modPol : null;
+    if (sp && mp && (sp === mp || (sp === 'Universal' && mp !== 'Umbra'))) {
+      return Math.ceil(d / 2);
+    }
+    if (sp && mp && sp !== 'Universal') return Math.ceil(d * 1.25);
+    return d;
+  }
+
   // Fit chosen mods to the frame's capacity under the POLARITY POOL
   // model (v1.5.1, Tacusin's mechanic): once a slot is forma'd its
   // polarity is freely swappable among the non-aura slots, so a build
@@ -1388,6 +1422,12 @@
   // keep mods first (the aura candidate is appended last and the sort
   // is stable). The outcome rides the return as auraBonus /
   // auraSlotPolarity / auraFormaUsed / auraOmni.
+  // v1.6.0 (#14): the fit's cost is PRICED, not summed — see
+  // pricedCost below. Unmatched mods are no longer automatically
+  // full drain: arranged optimally over the remaining seats, a
+  // polarized leftover that cannot avoid a polarized seat pays the
+  // game's +25% mismatch penalty (drainInSlot). The spend loops
+  // therefore run on pricedCost(), recomputed after every spend.
   function fitCapacity(ctx, frame, state, formaBudget, reactor, umbraForma, auraOpts) {
     // Necramech/Companion items carry _slotCount/_baseCapacity markers
     // (set in solve): their capacity is rank-cap based, not reactor based.
@@ -1432,9 +1472,55 @@
       return (drainOf(b) - drainOf(a)) || (a.name < b.name ? -1 : 1);
     }
 
-    var cost = all.reduce(function (s, c) { return s + drainOf(c); }, 0);
     var matched = {};                       // modName -> true
     var matchedFree = [], matchedForma = [], matchedUmbra = [];
+
+    // v1.6.0 (#14): the PRICED cost of the current matched sets,
+    // applying drainInSlot's rule through seat accounting. Seats
+    // (normal slots only — the exilus mod is pinned to its own
+    // unpolarized slot and can only match there via Forma): the
+    // innate polarized seats and the null seats are both finite.
+    // Free matches consume polarized seats; Forma/Umbra matches
+    // consume seats null-first (the placement's preference).
+    // Leftover mods then arrange to minimise the penalty:
+    // polarity-less leftovers take polarized seats, the biggest
+    // polarized leftovers take the remaining null seats, and only
+    // the smallest polarized leftovers that cannot avoid a
+    // polarized seat pay ceil(drain * 1.25) instead of drain.
+    // (A remaining polarized seat's polarity never equals a
+    // leftover mod's polarity — every mod of that polarity was
+    // free-matched first — so any polarized seat a polarized
+    // leftover takes is a genuine mismatch.)
+    var polarizedSeats = 0;
+    slotPols.forEach(function (p) { if (p && p !== 'None') polarizedSeats++; });
+    var nullSeats = slotCount - polarizedSeats;
+    function pricedCost() {
+      var total = 0, saved = 0;
+      all.forEach(function (c) {
+        total += drainOf(c);
+        if (matched[c.name]) saved += savingOf(c);
+      });
+      var fSeat = 0;
+      matchedForma.concat(matchedUmbra).forEach(function (n) {
+        if (!exEntry || n !== exEntry.name) fSeat++;
+      });
+      var nullAfter = nullSeats - Math.min(fSeat, nullSeats);
+      var polAfter = polarizedSeats - matchedFree.length -
+        Math.max(0, fSeat - nullSeats);
+      var lp = [], lz = 0;
+      chosen.forEach(function (c) {
+        if (matched[c.name]) return;
+        if (polOf(c)) lp.push(drainOf(c)); else lz++;
+      });
+      lp.sort(function (a, b) { return a - b; });
+      var safeNull = nullAfter - Math.max(0, lz - polAfter);
+      var penCount = Math.max(0, lp.length - Math.max(0, safeNull));
+      var extra = 0;
+      for (var pi = 0; pi < penCount; pi++) {
+        extra += Math.ceil(lp[pi] * 1.25) - lp[pi];
+      }
+      return total - saved + extra;
+    }
 
     // (1) Free matches from the innate pool (normal slots only).
     var pool = {};
@@ -1450,7 +1536,6 @@
       for (var i = 0; i < n; i++) {
         matched[list[i].name] = true;
         matchedFree.push(list[i].name);
-        cost -= savingOf(list[i]);
       }
     });
 
@@ -1474,7 +1559,7 @@
     // so mods keep their order among themselves, and the aura
     // candidate (appended last) loses exact ties to mods.
     spend.sort(function (a, b) { return b.gain - a.gain; });
-    for (var fi = 0; fi < spend.length && cost > capacityMax && regularUsed < budget; fi++) {
+    for (var fi = 0; fi < spend.length && pricedCost() > capacityMax && regularUsed < budget; fi++) {
       var sp2 = spend[fi];
       if (sp2.aura) {
         capacityMax += sp2.gain;
@@ -1484,7 +1569,6 @@
       } else {
         matched[sp2.cand.name] = true;
         matchedForma.push(sp2.cand.name);
-        cost -= savingOf(sp2.cand);
       }
       regularUsed++;
     }
@@ -1493,11 +1577,10 @@
     var umbraCands = all.filter(function (c) {
       return !matched[c.name] && polOf(c) === 'Umbra' && savingOf(c) > 0;
     }).sort(bySaving);
-    for (var ui = 0; ui < umbraCands.length && cost > capacityMax && umbraUsedCount < umbraBudget; ui++) {
+    for (var ui = 0; ui < umbraCands.length && pricedCost() > capacityMax && umbraUsedCount < umbraBudget; ui++) {
       matched[umbraCands[ui].name] = true;
       matchedUmbra.push(umbraCands[ui].name);
       umbraUsedCount++;
-      cost -= savingOf(umbraCands[ui]);
     }
 
     // (3) Derived placement. Slot indices: 0..slotCount-1 normal, plus
@@ -1534,12 +1617,25 @@
         pols[slots[0]] = polOf(c);
       }
     });
-    // Leftover mods into the remaining slots, ascending.
-    all.forEach(function (c) {
-      if (c.name in assign) return;
-      var slots = freeSlots(function () { return true; });
+    // Leftover mods into the remaining slots, arranged to minimise
+    // the v1.6.0 mismatch penalty (mirrors pricedCost's accounting):
+    // polarity-less leftovers take polarized seats, the biggest
+    // polarized leftovers take the remaining unpolarized seats, and
+    // only the smallest polarized leftovers end up in polarized
+    // seats — the penalised set. The exilus mod is already pinned.
+    var leftovers = all.filter(function (c) { return !(c.name in assign); });
+    function takeSlot(c, pred) {
+      var slots = freeSlots(pred);
+      if (!slots.length) slots = freeSlots(function () { return true; });
       if (slots.length) { assign[c.name] = slots[0]; taken[slots[0]] = true; }
+    }
+    leftovers.filter(function (c) { return !polOf(c); }).forEach(function (c) {
+      takeSlot(c, function (i) { return !!innatePols[i]; });
     });
+    leftovers.filter(function (c) { return polOf(c); }).sort(byDrain)
+      .forEach(function (c) {
+        takeSlot(c, function (i) { return !innatePols[i]; });
+      });
 
     var formaPlan = [];
     matchedForma.forEach(function (name) {
@@ -1566,18 +1662,19 @@
         innatePolarity: innate,
         formaApplied: !!planEntry,
         umbraFormaApplied: !!(planEntry && planEntry.umbra),
-        effectiveDrain: c ? (matched[c.name] ? Math.ceil(drainOf(c) / 2) : drainOf(c)) : 0
+        effectiveDrain: c ? drainInSlot(drainOf(c), pols[i], polOf(c)) : 0
       };
     });
+    var finalCost = pricedCost();
     return {
-      capacityUsed: cost,
+      capacityUsed: finalCost,
       capacityMax: capacityMax,
       // +1 when the Omni toggle is on: the Omni Forma itself (see
       // the header note) — counted in the total, not in the budget.
       formaUsed: regularUsed + (auraOmni ? 1 : 0),
       umbraFormaUsed: umbraUsedCount,
       formaPlan: formaPlan,
-      valid: cost <= capacityMax,
+      valid: finalCost <= capacityMax,
       assign: assign,
       pols: pols,
       slotInfo: slotInfo,
@@ -3278,8 +3375,9 @@
     var achievedRaw = achievedFrom(ctx, frame, sums);
     // v1.5.1: GIVEN-polarity mode. When any non-aura slot entry carries
     // a `polarity` property, the board's arrangement is scored as-is:
-    // drain halves where the slot polarity matches the mod (a
-    // 'Universal' slot matches everything EXCEPT Umbra — v1.5.3,
+    // drain halves where the slot polarity matches the mod, and a
+    // slot of a different polarity costs +25% (v1.6.0, drainInSlot;
+    // a 'Universal' slot matches everything EXCEPT Umbra — v1.5.3,
     // Tacusin's ruling: only an Umbra Forma slot halves an Umbra mod;
     // the weapon evaluator has priced it this way since v1.5.2), and
     // the forma count comes from the pool formula — polarized
@@ -3326,9 +3424,9 @@
           var d = rec.baseDrain + rank;
           var rp = (rec.polarity && rec.polarity !== 'None') ? rec.polarity : null;
           var sp = polAt[nameIdx[name]];
-          gUsed += (sp && rp && (sp === rp ||
-                    (sp === 'Universal' && rp !== 'Umbra')))
-            ? Math.ceil(d / 2) : d;
+          // v1.6.0 (#14): priced by the shared helper — a slot of a
+          // different polarity costs +25%, not full drain.
+          gUsed += drainInSlot(d, sp, rp);
         });
       // v1.5.3: aura pricing with the effective slot polarity. The
       // Omni state — pieces.omniAura (the app's toggle), or a
