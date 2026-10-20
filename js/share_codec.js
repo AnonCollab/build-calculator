@@ -14,8 +14,8 @@
  *    pipeline/build_index_registry.py). An ID never changes and is
  *    never reused, so a code decodes to the same build forever.
  *  - Schema: a 4-bit version field leads the payload. The encoder
- *    writes v3; decoders accept v1, v2 and v3 and refuse anything
- *    else loudly. v2 (v1.5.2) widens two v1 layouts: board slots
+ *    writes v4; decoders accept v1, v2, v3 and v4 and refuse
+ *    anything else loudly. v2 (v1.5.2) widens two v1 layouts: board slots
  *    carry the polarity/forma bits on normal+exilus slots of WEAPON
  *    boards too (v1 wrote them for frame boards only), and weapon
  *    board extras gain a trailing optional overRankForma (u3,
@@ -24,6 +24,12 @@
  *    v1/v2 payloads parse bit-identically: the state-level omniAura
  *    toggle (1 bit, after spareShards) and polarity/forma bits on
  *    AURA slots (an aura Forma purchase; previously unrepresentable).
+ *    v4 (v1.7.0) appends three frame target keys (parkourVelocity,
+ *    aimGlide, sprintSpeed) to FRAME_STAT_KEYS — appended, so the
+ *    v1–v3 key indices are unchanged and board-shard stat indices
+ *    in old codes still read correctly; since targets are
+ *    positional with no count, decoders read the 9-key list for
+ *    v≤3 payloads and the 12-key list for v4.
  *  - Checksum: a digit-polynomial over the base62 body
  *    (h = (h*33 + digit) mod 3844 = 62^2), rendered as the final 2
  *    base62 chars and verified BEFORE any field is parsed — a
@@ -38,8 +44,9 @@
  *    otherwise vanish).
  *  - Canonical form: fields at their defaults cost only their flag /
  *    mode bits (dontcare targets, empty wallet colours, absent board,
- *    ...). The decoder re-expands everything to a full v10 state
- *    (v1/v2 payloads gain the v10 defaults: omniAura false).
+ *    ...). The decoder re-expands everything to a full v11 state
+ *    (older payloads gain the later defaults: omniAura false,
+ *    movement targets dontcare).
  *  - encode() returns null (never throws, never guesses) when a state
  *    carries something the schema cannot name — the app then falls
  *    back to the legacy long link. Documented refusals: names absent
@@ -63,7 +70,7 @@
   'use strict';
 
   var B62 = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
-  var SCHEMA_VERSION = 3;
+  var SCHEMA_VERSION = 4;
 
   // Fixed enums (mirror site/js/app.js — the category order is the
   // app's CATEGORIES order; stat lists are the app's target stores).
@@ -100,7 +107,14 @@
   ];
   var FRAME_STAT_KEYS = ['abilityStrength', 'abilityDuration',
     'abilityRange', 'abilityEfficiency', 'health', 'shield', 'armor',
-    'energyMax', 'channelDrain'];
+    'energyMax', 'channelDrain',
+    // v4 (v1.7.0): movement target keys, APPENDED — the indices of
+    // the v1–v3 keys are unchanged, so board-shard stat indices in
+    // old codes still read correctly. Targets are positional with
+    // no count, so decoders gate the list on the code's version:
+    // v≤3 payloads carry only the first 9 keys.
+    'parkourVelocity', 'aimGlide', 'sprintSpeed'];
+  var FRAME_STAT_KEYS_V3 = FRAME_STAT_KEYS.slice(0, 9);
   var WEAPON_STAT_KEYS = ['totalDamagePerShot', 'critChance',
     'critMultiplier', 'statusChance', 'fireRate', 'multishot',
     'magazine', 'reload', 'punchThrough'];
@@ -794,7 +808,7 @@
       if (version < 1 || version > SCHEMA_VERSION) {
         throw CodecError('unsupported share code version ' + version);
       }
-      var st = { version: 10 };
+      var st = { version: 11 };
       st.category = CATEGORIES[r.r(4)];
       var intent = r.r(2);
       st.intent = intent === 1 ? 'upkeep' : intent === 2 ? 'hybrid' : 'window';
@@ -831,7 +845,8 @@
         } else throw CodecError('share code is malformed (attack key mode)');
         st.attackByItem[key] = r.r(5);
       }
-      st.frameTargets = rTargets(r, FRAME_STAT_KEYS);
+      // v4 gate: v≤3 payloads carry the 9-key target list only.
+      st.frameTargets = rTargets(r, version >= 4 ? FRAME_STAT_KEYS : FRAME_STAT_KEYS_V3);
       st.weaponTargets = rTargets(r, WEAPON_STAT_KEYS);
       st.dmgTargets = rTargets(r, DMG_STAT_KEYS);
       st.ampTargets = rTargets(r, AMP_STAT_KEYS);
