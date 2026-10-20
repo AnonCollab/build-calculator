@@ -82,7 +82,14 @@
     { key: 'health', label: 'Health', pct: false },
     { key: 'shield', label: 'Shield', pct: false },
     { key: 'armor', label: 'Armor', pct: false },
-    { key: 'energyMax', label: 'Energy', pct: false }
+    { key: 'energyMax', label: 'Energy', pct: false },
+    // v1.7.0 (#23): movement targets. Sprint Speed's value is the
+    // game's multiplier (base per frame, e.g. 0.95), shown plain;
+    // Parkour Velocity and Aim Glide / Wall Latch are percentages
+    // over a base of 100, like the ability stats.
+    { key: 'sprintSpeed', label: 'Sprint Speed', pct: false },
+    { key: 'parkourVelocity', label: 'Parkour Velocity', pct: true },
+    { key: 'aimGlide', label: 'Aim Glide / Wall Latch', pct: true }
   ];
   var COMPANION_STATS = FRAME_STATS.filter(function (s) {
     return ['health', 'shield', 'armor', 'energyMax'].indexOf(s.key) >= 0;
@@ -217,6 +224,7 @@
       var f = site.frames.warframes[name];
       warframes[name] = {
         Health: f.health, Shield: f.shield, Armor: f.armor, Energy: f.energy,
+        Sprint: f.sprintSpeed,
         Polarities: f.polarities, AuraPolarity: f.auraPolarity,
         Abilities: f.abilities
       };
@@ -263,7 +271,10 @@
     ROUTES_FRAME.forEach(function (r) { routesFrame[r.key] = r.def; });
     ROUTES_WEAPON.forEach(function (r) { routesWeapon[r.key] = r.def; });
     return {
-      version: 10,
+      // v1.7.0: state v11 — the movement target keys (sprintSpeed,
+      // parkourVelocity, aimGlide) join frameTargets; older saves
+      // pick up the dontcare defaults via mergeTargets.
+      version: 11,
       category: 'Warframe',
       intent: 'window',
       // v1.4: Hybrid burst allowance (1 | 2). routesFrame.augments
@@ -446,7 +457,7 @@
   function mergeState(base, saved) {
     if (!saved || typeof saved !== 'object') return base;
     try {
-      if (saved.version === 2 || saved.version === 3 || saved.version === 4 || saved.version === 5 || saved.version === 6 || saved.version === 7 || saved.version === 8 || saved.version === 9 || saved.version === 10) {
+      if (saved.version === 2 || saved.version === 3 || saved.version === 4 || saved.version === 5 || saved.version === 6 || saved.version === 7 || saved.version === 8 || saved.version === 9 || saved.version === 10 || saved.version === 11) {
         if (catOf(saved.category).id === saved.category) base.category = saved.category;
         // v1.3: intent arrived in state v5; v2–v4 saves keep the
         // default 'window' (the engines' unset behaviour). v1.4:
