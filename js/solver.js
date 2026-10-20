@@ -70,11 +70,14 @@
  *    cross-gear support pieces passed in as input.supportSetPieces.
  *    Parsed bonuses that map to a solver stat are applied; the rest are
  *    counted and reported in result.setBonuses. Sets whose bonus text
- *    is prose (incl. the Umbral/Sacrificial "Enhance mods in this set."
- *    — the enhancement percentage is NOT in the source data) are never
- *    applied; using 2+ pieces of one earns an explicit "not modelled"
- *    note. The Umbral-enhancement scaling code path exists and activates
- *    only if a future dataset actually publishes enhanceModsPercent.
+ *    is prose are never applied; using 2+ pieces of one earns an
+ *    explicit "not modelled" note. Umbral / Sacrificial enhancement
+ *    (v1.6.2) IS modelled: the dataset carries a per-mod table
+ *    (enhanceByMod, sourced from the wiki's per-mod pages — the set
+ *    descriptions themselves print no number), and a set mod's own
+ *    effects scale by its table entry for the number of set pieces
+ *    on THIS item (focus count only — support / cross-gear pieces
+ *    never enhance, unlike the counted sets above).
  *  - Tome Canticles are excluded: the derived data does not mark their
  *    target (e.g. Jahu reduces ENEMY armor — pairing it to the player's
  *    armor would corrupt results). Only stacking Invocations are used.
@@ -757,17 +760,18 @@
 
     // Set bonuses (data/derived/set_bonuses.json, optional): per-piece
     // values parsed from the sets' bonus descriptions by
-    // pipeline/extract_set_bonuses.py. 'prose' / 'prose-enhance' sets
-    // carry no usable number and are never applied — only counted and
-    // reported (see setBonusReport in solve()).
+    // pipeline/extract_set_bonuses.py. 'prose' sets carry no usable
+    // number and are never applied — only counted and reported (see
+    // setBonusReport in solve()). 'enhance' sets (Umbral/Sacrificial)
+    // carry the per-mod enhanceByMod table instead of perPiece.
     ctx.setBonuses = {};
     var sbData = (data.setBonuses && data.setBonuses.sets) || {};
     Object.keys(sbData).forEach(function (name) {
       var s = sbData[name] || {};
       ctx.setBonuses[name] = {
         perPiece: Array.isArray(s.perPiece) ? s.perPiece : null,
-        enhanceModsPercent: (typeof s.enhanceModsPercent === 'number')
-          ? s.enhanceModsPercent : null,
+        enhanceByMod: (s.enhanceByMod && typeof s.enhanceByMod === 'object')
+          ? s.enhanceByMod : null,
         parseStatus: s.parseStatus || 'prose',
         sourceText: s.sourceText || '',
         numUpgradesInSet: s.numUpgradesInSet || null,
@@ -937,17 +941,19 @@
     }
     function addModEffects(mod, rank) {
       if (!mod) return;
-      // Umbral/Sacrificial-style enhancement: IF the dataset ever
-      // publishes enhanceModsPercent, a set mod's own effects scale by
-      // (1 + enhance% x (pieces-1)). With the current extraction the
-      // value is null (the source text is prose), so this is inert and
-      // such sets surface via the "not modelled" note instead.
+      // Umbral/Sacrificial enhancement (v1.6.2): the dataset's
+      // per-mod table (enhanceByMod, keyed by piece count) scales
+      // the mod's own effects. Pieces are the FOCUS count of the
+      // mod's set — enhancement is per item, so support/cross-gear
+      // pieces never count here (they still count for the
+      // per-piece bonuses below and the report).
       var scale = 1;
       var sb = mod.set ? ctx.setBonuses[mod.set] : null;
-      if (!noSetBonuses && sb && typeof sb.enhanceModsPercent === 'number') {
+      if (!noSetBonuses && sb && sb.enhanceByMod) {
+        var table = sb.enhanceByMod[mod.name];
         var c = counts[mod.set];
-        var pieces = c ? c.focus + c.support : 0;
-        if (pieces > 1) scale = 1 + sb.enhanceModsPercent * (pieces - 1) / 100;
+        var pct = table ? table[c ? c.focus : 0] : null;
+        if (typeof pct === 'number') scale = 1 + pct / 100;
       }
       mod.effects.forEach(function (e) {
         if (e.condition && !routes.conditional) return;
@@ -2940,7 +2946,7 @@
         }
         var applied = !!(sb.perPiece && sb.perPiece.some(function (pp) {
           return !!UT_TO_STAT[pp.upgradeType];
-        }));
+        })) || !!(sb.enhanceByMod && c.focus >= 2);
         out.push({
           set: set, pieces: pieces, focusPieces: c.focus,
           supportPieces: c.support, plannedPieces: planned,
@@ -3134,7 +3140,7 @@
       cg.notes.forEach(function (n) { rNotes.push(n); });
       var report = setBonusReport(pieceCounts, cg.plannedBySet);
       report.forEach(function (r) {
-        if (r.pieces >= 2 && r.parseStatus !== 'parsed' && r.parseStatus !== 'unknown') {
+        if (r.pieces >= 2 && !r.applied && r.parseStatus !== 'parsed' && r.parseStatus !== 'unknown') {
           rNotes.push('Set bonus for ' + r.set + ' not modelled (prose effect)' +
                       (r.sourceText ? ': "' + r.sourceText + '"' : '') + '.');
         }
