@@ -411,6 +411,8 @@
       var s = sbData[name] || {};
       ctx.setBonuses[name] = {
         perPiece: Array.isArray(s.perPiece) ? s.perPiece : null,
+        enhanceByMod: (s.enhanceByMod && typeof s.enhanceByMod === 'object')
+          ? s.enhanceByMod : null,
         parseStatus: s.parseStatus || 'prose',
         sourceText: s.sourceText || '',
         numUpgradesInSet: s.numUpgradesInSet || null,
@@ -588,14 +590,30 @@
         case 'faction': acc.faction *= value; break;
       }
     }
+    // Umbral/Sacrificial enhancement (v1.6.2): the dataset's
+    // per-mod table (enhanceByMod, keyed by piece count) scales a
+    // set mod's own effects when enough pieces of its set are
+    // placed on THIS weapon. The faction kind scales its computed
+    // per-rank multiplier as a whole.
+    var placedSetCounts = {};
+    placed.forEach(function (p) {
+      if (p.rec.set) placedSetCounts[p.rec.set] = (placedSetCounts[p.rec.set] || 0) + 1;
+    });
     function applyMod(rec, rank) {
+      var enhScale = 1;
+      if (rec.set) {
+        var sbw = ctx.setBonuses[rec.set];
+        var tbl = sbw && sbw.enhanceByMod && sbw.enhanceByMod[rec.name];
+        var pct = tbl ? tbl[placedSetCounts[rec.set] || 0] : null;
+        if (typeof pct === 'number') enhScale = 1 + pct / 100;
+      }
       rec.effects.forEach(function (eff) {
         if (eff.conditional && !opts.conditional) return;
         if (eff.kind === 'faction') {
           var frac = (rank + 1) / ((eff.maxRank || 0) + 1);
-          applyEffect(eff, 1 + (eff.maxValue - 1) * frac);
+          applyEffect(eff, (1 + (eff.maxValue - 1) * frac) * enhScale);
         } else {
-          applyEffect(eff, eff.valuePerRank * (rank + 1));
+          applyEffect(eff, eff.valuePerRank * (rank + 1) * enhScale);
         }
       });
     }
@@ -2313,6 +2331,7 @@
       var cc = counts[set] || { focus: 0, support: 0 };
       var planned = cgW.plannedBySet[set] || 0;
       var pieces = cc.focus + cc.support + planned;
+      var appliedW = !!(sb && sb.enhanceByMod && cc.focus >= 2);
       setBonuses.push({
         set: set, pieces: pieces, focusPieces: cc.focus,
         supportPieces: cc.support, plannedPieces: planned,
@@ -2321,10 +2340,10 @@
         totalValue: (sb && sb.perPiece && sb.perPiece.length === 1 &&
                      typeof sb.perPiece[0].value === 'number')
           ? sb.perPiece[0].value * pieces : null,
-        applied: false,
+        applied: appliedW,
         sourceText: sb ? sb.sourceText : ''
       });
-      if (pieces >= 2 && sb && sb.parseStatus !== 'parsed') {
+      if (pieces >= 2 && sb && !appliedW && sb.parseStatus !== 'parsed') {
         notes.push('Set bonus for ' + set + ' not modelled (prose effect)' +
                    (sb.sourceText ? ': "' + sb.sourceText + '"' : '') + '.');
       }
