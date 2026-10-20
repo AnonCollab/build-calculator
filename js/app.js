@@ -2471,7 +2471,8 @@
           ' per piece' + (sb.totalValue != null ? ' → ' + fmt(sb.totalValue) + ' total' : '');
       }
       if (sb.applied) line += ' — applied';
-      else if (sb.parseStatus && sb.parseStatus !== 'parsed') line += ' — not modelled (prose effect)';
+      else if (sb.parseStatus && sb.parseStatus !== 'parsed' &&
+               sb.parseStatus.indexOf('prose') === 0) line += ' — not modelled (prose effect)';
       return line;
     });
   }
