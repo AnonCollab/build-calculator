@@ -273,6 +273,30 @@
  *    discipline), and the aura mismatch bonus is the wiki's 80%
  *    rounded down (see auraCapacityBonus).
  *
+ * v1.6.1 (#22 — Arcane Sculptor):
+ *  - Sculptor's effect is a LOCK, not a sum: the curated layer
+ *    encodes it as {kind: 'lock', value: 175, lockByRank:
+ *    [125,135,145,155,165,175]} (wiki "Arcane Sculptor": Ability
+ *    Efficiency is "locked at (not increased by)" the value;
+ *    the table is sourced data, never derived). While the
+ *    effect applies (Conditional route, like every conditional
+ *    arcane), achievedFrom sets abilityEfficiency to the lock
+ *    value BEFORE the channel-drain read and the 175 cap — so
+ *    the uncapped efficiency the drain formula reads IS the
+ *    lock value, and a lock below a build's summed efficiency
+ *    (below-max rank, or a >175% sum at max rank) reduces it.
+ *    The solver fields arcanes at max rank only (global design);
+ *    the mechanism is rank-agnostic.
+ *  - Eligibility is ability-gated (the augment rule): the entry
+ *    carries validAbilities (the wiki's Valid Objects list).
+ *    solve() fields a gated arcane only when the frame's
+ *    EFFECTIVE abilities (native, minus the subsume's replaced
+ *    ability, plus the subsume's donor ability) include a
+ *    listed one — enforced on arcane-add and subsume-add moves
+ *    in expand(), and on locked arcanes (an ineligible lock is
+ *    dropped with a note, the augment-lock precedent).
+ *    evaluateFrame stays intent-free and does not gate.
+ *
  * v1.6.0 (#14 — polarity-mismatch drain penalty):
  *  - A mod in a slot of a DIFFERENT polarity costs ceil(drain x
  *    1.25) (wiki "Polarity"), priced everywhere through the shared
@@ -505,6 +529,39 @@
     return baseFrameName(rec.restrictedTo) === baseFrameName(frameName);
   }
 
+  // ---- v1.6.1: ability-gated arcanes (Arcane Sculptor) -------------
+  // The entry carries validAbilities (the wiki's Valid Objects
+  // whitelist). Eligibility follows the ABILITY — the augment rule
+  // above: the frame's EFFECTIVE abilities (native, minus the
+  // subsume's replaced ability, plus the subsume's donor ability)
+  // must include a listed one. Ungated entries are always eligible.
+  function effectiveAbilities(frameAbilities, subsume) {
+    var eff = (Array.isArray(frameAbilities) ? frameAbilities : []).slice();
+    if (subsume) {
+      eff = eff.filter(function (a) { return a !== subsume.replacedAbility; });
+      if (subsume.ability) eff.push(subsume.ability);
+    }
+    return eff;
+  }
+  function arcaneEligibleOn(entry, abilities) {
+    if (!entry || !entry.validAbilities) return true;
+    return entry.validAbilities.some(function (a) {
+      return abilities.indexOf(a) >= 0;
+    });
+  }
+  // Eligibility of a gated arcane against a forced Helminth choice
+  // ({donor, replacesIndex} shape, as augmentEligible takes it).
+  function arcaneEligibleChoice(entry, helminthChoice, frameAbilities) {
+    if (!entry || !entry.validAbilities) return true;
+    if (!helminthChoice) {
+      return arcaneEligibleOn(entry, frameAbilities);
+    }
+    var eff = (Array.isArray(frameAbilities) ? frameAbilities : [])
+      .filter(function (_, i) { return i !== helminthChoice.replacesIndex; });
+    if (helminthChoice.donor) eff.push(helminthChoice.donor);
+    return arcaneEligibleOn(entry, eff);
+  }
+
   // v1.4 hybrid allowance: input.hybridAllowance (1 | 2, default 1);
   // input.burstAllowance is accepted as an alias (the site state
   // names it that). Anything that is not exactly 2 means 1.
@@ -622,11 +679,26 @@
       return {
         name: a.name,
         conditional: !!a.conditional,
+        maxRank: typeof a.maxRank === 'number' ? a.maxRank : null,
+        // v1.6.1: ability whitelist for gated arcanes (the wiki's
+        // Valid Objects list for Arcane Sculptor); null = ungated.
+        validAbilities: Array.isArray(a.validAbilities) ? a.validAbilities : null,
         effects: (a.effects || []).filter(function (e) {
           return ALL_STATS.indexOf(e.stat) >= 0 && typeof e.value === 'number';
+        }).map(function (e) {
+          // v1.6.1: a 'lock' effect SETS its stat to the value
+          // (per-rank table rides through as sourced data); the
+          // original effect shape is otherwise preserved verbatim.
+          var out = {};
+          Object.keys(e).forEach(function (k) { out[k] = e[k]; });
+          out.kind = e.kind || null;
+          out.lockByRank = Array.isArray(e.lockByRank) ? e.lockByRank : null;
+          return out;
         })
       };
     }).filter(function (a) { return a.effects.length; });
+    ctx.arcaneByName = {};
+    ctx.arcanes.forEach(function (a) { ctx.arcaneByName[a.name] = a; });
 
     // Tome mods: stacking Invocations only (see header note on Canticles).
     ctx.tomes = [];
@@ -892,7 +964,12 @@
       var a = ctx.arcanes.filter(function (x) { return x.name === name; })[0];
       if (!a) return;
       if (a.conditional && !routes.conditional) return;
-      a.effects.forEach(function (e) { add(e.stat, e.unit, e.value); });
+      a.effects.forEach(function (e) {
+        // v1.6.1: a lock effect SETS its stat (achievedFrom reads
+        // sums[stat].lock) — it never adds to the percent sum.
+        if (e.kind === 'lock') { sums[e.stat].lock = e.value; return; }
+        add(e.stat, e.unit, e.value);
+      });
     });
     if (state.tome) {
       var t = ctx.tomes.filter(function (x) { return x.name === state.tome; })[0];
@@ -1320,6 +1397,14 @@
   function achievedFrom(ctx, frame, sums) {
     var out = {};
     ABILITY_STATS.forEach(function (k) { out[k] = 100 + sums[k].percent; });
+    // v1.6.1: a lock effect (Arcane Sculptor) SETS the efficiency
+    // outright — before the channel read and the cap below, so
+    // the uncapped efficiency the drain formula reads IS the
+    // lock value (which can be BELOW the summed value: the lock
+    // reduces such a build, it does not add to it).
+    if (typeof sums.abilityEfficiency.lock === 'number') {
+      out.abilityEfficiency = sums.abilityEfficiency.lock;
+    }
     // v1.5 channel drain (see header): the formula reads the TRUE
     // efficiency BEFORE the cast cap below is applied, and the
     // build's duration; multiplier clamped to [0.25, 1.75] of base.
@@ -2082,6 +2167,7 @@
         ? Math.max(0, Math.min(rec.maxRank, Math.round(L.rank))) : rec.maxRank;
     });
     var lockedArcaneNames = [];
+    var gatedArcaneNotes = [];
     (Array.isArray(input.lockedArcanes) ? input.lockedArcanes : []).forEach(function (name) {
       if (excludedArcaneSet[name]) {
         throw new Error('Arcane ' + name + ' is both locked and excluded.');
@@ -2094,6 +2180,19 @@
       }
       if (ctx.arcaneNames.length && ctx.arcaneNames.indexOf(name) < 0) {
         throw new Error('Unknown locked arcane: ' + name);
+      }
+      // v1.6.1: an ability-gated arcane (Arcane Sculptor) locked
+      // onto a frame whose effective abilities — native plus the
+      // forced Helminth choice, the augment-lock precedent — hold
+      // no listed ability is dropped with a note, never fielded.
+      var gatedEntry = ctx.arcaneByName[name];
+      if (kind === 'warframe' && gatedEntry && gatedEntry.validAbilities &&
+          !arcaneEligibleChoice(gatedEntry, eligChoice, frameAbilitiesEarly)) {
+        gatedArcaneNotes.push('Locked ' + name + ' is ability-gated: ' +
+          input.frameName + ' does not currently have any of its ' +
+          'qualifying abilities (native or subsumed). The lock was ' +
+          'not applied.');
+        return;
       }
       lockedArcaneNames.push(name);
     });
@@ -2346,6 +2445,11 @@
       if (state.arcanes.length < 2) {
         cand.arcanes.forEach(function (a) {
           if (state.arcanes.indexOf(a.name) >= 0) return;
+          // v1.6.1: a gated arcane (Arcane Sculptor) can only be
+          // fielded while the state's effective abilities —
+          // including a subsume already chosen in this state —
+          // include one of its listed abilities.
+          if (!arcaneEligibleOn(a, effectiveAbilities(frameAbilities, state.subsume))) return;
           var ns = clone(state); ns.arcanes.push(a.name); out.push(ns);
         });
       }
@@ -2377,6 +2481,16 @@
         cand.subsumes.forEach(function (e) {
           frameAbilities.forEach(function (ab, idx) {
             if (abilityLocks[idx]) return;
+            // v1.6.1: a subsume that replaces the only qualifying
+            // ability would orphan a gated arcane already held in
+            // this state (Arcane Sculptor) — reject the move.
+            var orphansGate = state.arcanes.some(function (n) {
+              var ga = ctx.arcaneByName[n];
+              return ga && ga.validAbilities &&
+                !arcaneEligibleOn(ga, effectiveAbilities(frameAbilities,
+                  { ability: e.ability, replacedAbility: ab }));
+            });
+            if (orphansGate) return;
             var ns = clone(state);
             ns.subsume = { ability: e.ability, fromFrame: e.frame, replacedAbility: ab };
             out.push(ns);
@@ -2985,6 +3099,21 @@
       })) {
         rNotes.push('Conditional arcane effects are counted at full stacks for the whole build (paper stats).');
       }
+      // v1.6.1: a fielded lock-effect arcane (Arcane Sculptor)
+      // SETS its stat rather than adding to it — name the lock
+      // value and the first-cast trap beside the conditional note.
+      st.arcanes.forEach(function (n) {
+        var la = ctx.arcaneByName[n];
+        if (!la) return;
+        la.effects.forEach(function (e) {
+          if (e.kind !== 'lock') return;
+          rNotes.push(n + ': Ability Efficiency is locked at ' + e.value +
+            '% while its effect is active — it does not add to other ' +
+            'Efficiency sources, and it lowers a build whose summed ' +
+            'Efficiency is higher. The cast that creates the object ' +
+            'gains no benefit unless the object spawns instantly.');
+        });
+      });
       // v1.2 cross-gear plan for THIS finished build (main and
       // cheapest each plan from their own final state).
       var pieceCounts = setPieceCounts(ctx, st, input.supportSetPieces);
@@ -3180,6 +3309,9 @@
     // v1.4: augment locks that were dropped (route off / ineligible)
     // are reported, never silent.
     augmentLockNotes.forEach(function (n) { result.notes.push(n); });
+    // v1.6.1: ability-gated arcane locks dropped as ineligible
+    // ride the same never-silent channel.
+    gatedArcaneNotes.forEach(function (n) { result.notes.push(n); });
     // v1.5: Focus school notes (applied set / upkeep pruning /
     // hybrid keeps) ride the same never-silent channel.
     focusNotes.forEach(function (n) { result.notes.push(n); });
