@@ -300,6 +300,42 @@
  *    dropped with a note, the augment-lock precedent).
  *    evaluateFrame stays intent-free and does not gate.
  *
+ * v1.7.0 (#23 — parkour / movement stats as solver targets):
+ *  - Three new frame stats, all fed by extracted upgrade types
+ *    through UT_TO_STAT: parkourVelocity (AVATAR_PARKOUR_BOOST —
+ *    ONE target for the type's three source wordings, Parkour
+ *    Velocity / Bullet Jump / Mobility; the data carries one
+ *    upgrade type under all three and no split is invented),
+ *    aimGlide (AVATAR_PARKOUR_GLIDE — Aim Glide / Wall Latch
+ *    Duration), sprintSpeed (AVATAR_SPRINT_SPEED). The first two
+ *    are PERCENT_STATS: percent points over a base of 100, the
+ *    unmodified value — the extracted data has no per-frame
+ *    parkour field (per-frame differences are passive-driven;
+ *    see the boundary below) and the glide data exists only as
+ *    +% duration, no base seconds are invented. sprintSpeed is
+ *    a pool stat over the frame's extracted per-frame Sprint
+ *    base (a wide spread in the data: 0.9 to 1.5, only 40 of
+ *    126 frames at 1.0). Amber shards join via SHARD_STAT_MAP
+ *    ('Parkour Velocity', +15% / +22.5% Tauforged). The Sprint
+ *    Boost aura rides the same mapping through the aura pool.
+ *  - PASSIVE BOUNDARY (named, not silent): frame passives are
+ *    outside this stat model for every stat, and the movement
+ *    ones are: Loki / Loki Prime (wall latch lasts 10x longer —
+ *    a latch-only multiplier; folding it into the COMBINED
+ *    glide/latch target would misstate Loki's aim glide, so it
+ *    is NOT carried in aimGlide's base), Zephyr / Zephyr Prime
+ *    (faster, falls slower while airborne — no number in the
+ *    extracted text, none invented), Chroma / Chroma Prime (an
+ *    additional jump and bullet jump — a jump-count mechanic,
+ *    not a percentage), Khora / Khora Prime (+15% speed only
+ *    while Venari is active — a conditional companion state,
+ *    not a base). Trigger-only passives (Oraxia's latch
+ *    invisibility, Wisp's airborne invisibility) are not stats.
+ *  - NOT modelled (deferred, by the inventory's call): Slide
+ *    (boost + friction are a pair; a single % would mislead),
+ *    Gravity while Aim Gliding, dodge/roll speed — those
+ *    upgrade types stay unmapped, like before.
+ *
  * v1.6.0 (#14 — polarity-mismatch drain penalty):
  *  - A mod in a slot of a DIFFERENT polarity costs ceil(drain x
  *    1.25) (wiki "Polarity"), priced everywhere through the shared
@@ -330,11 +366,24 @@
     AVATAR_ARMOUR: 'armor',   // spelling used by the wiki data
     AVATAR_ARMOR: 'armor',    // defensive: US spelling, not present in data
     AVATAR_POWER_MAX: 'energyMax',   // energy max in the wiki enums
-    AVATAR_ENERGY_MAX: 'energyMax'   // defensive: not present in data
+    AVATAR_ENERGY_MAX: 'energyMax',   // defensive: not present in data
+    AVATAR_PARKOUR_BOOST: 'parkourVelocity',   // v1.7.0 (#23)
+    AVATAR_PARKOUR_GLIDE: 'aimGlide',          // v1.7.0 (#23)
+    AVATAR_SPRINT_SPEED: 'sprintSpeed'         // v1.7.0 (#23)
   };
   var ABILITY_STATS = ['abilityStrength', 'abilityDuration', 'abilityRange', 'abilityEfficiency'];
-  var POOL_STATS = ['health', 'shield', 'armor', 'energyMax'];
-  var ALL_STATS = ABILITY_STATS.concat(POOL_STATS);
+  var POOL_STATS = ['health', 'shield', 'armor', 'energyMax', 'sprintSpeed'];
+  // v1.7.0 (#23): percent stats over a base of 100, like the ability
+  // stats — Parkour Velocity and Aim Glide / Wall Latch Duration.
+  // The extracted data carries NO per-frame parkour field, so 100
+  // is the unmodified value the extracted percentages modify;
+  // per-frame parkour differences live in passives, which this
+  // stat model does not carry for ANY stat (see the header note:
+  // Loki's wall-latch x10 is the named boundary). The glide data
+  // likewise exists only as +% duration — no base-seconds value
+  // is in the store and none is invented.
+  var PERCENT_STATS = ['parkourVelocity', 'aimGlide'];
+  var ALL_STATS = ABILITY_STATS.concat(POOL_STATS).concat(PERCENT_STATS);
 
   // Shard bonus page-text -> solver stat key (only bonuses in solver scope).
   var SHARD_STAT_MAP = {
@@ -343,7 +392,8 @@
     'Max Health': 'health',
     'Shield Capacity': 'shield',
     'Energy Max': 'energyMax',
-    'Armor': 'armor'
+    'Armor': 'armor',
+    'Parkour Velocity': 'parkourVelocity'   // v1.7.0 (#23): Amber
   };
   // Coalescent Fusion parents (DESIGN.md): 1 normal of each parent colour.
   var FUSED_PARENTS = {
@@ -1403,6 +1453,7 @@
   function achievedFrom(ctx, frame, sums) {
     var out = {};
     ABILITY_STATS.forEach(function (k) { out[k] = 100 + sums[k].percent; });
+    PERCENT_STATS.forEach(function (k) { out[k] = 100 + sums[k].percent; });
     // v1.6.1: a lock effect (Arcane Sculptor) SETS the efficiency
     // outright — before the channel read and the cap below, so
     // the uncapped efficiency the drain formula reads IS the
@@ -1423,7 +1474,7 @@
     }
     out.abilityEfficiency = Math.min(EFFICIENCY_CAP, out.abilityEfficiency);
     POOL_STATS.forEach(function (k) {
-      var baseKey = { health: 'Health', shield: 'Shield', armor: 'Armor', energyMax: 'Energy' }[k];
+      var baseKey = { health: 'Health', shield: 'Shield', armor: 'Armor', energyMax: 'Energy', sprintSpeed: 'Sprint' }[k];
       var base = frame[baseKey] || 0;
       out[k] = base * (1 + sums[k].percent / 100) + sums[k].flat;
     });
@@ -2551,8 +2602,10 @@
     }
     function grossFor(ev, stat) {
       var g = grossPositive(ctx, ev.state, routes, input.supportSetPieces, stat);
-      if (ABILITY_STATS.indexOf(stat) >= 0) return g.percent;
-      var baseKey = { health: 'Health', shield: 'Shield', armor: 'Armor', energyMax: 'Energy' }[stat];
+      // Percent-over-100 stats (ability + v1.7 movement): the gross
+      // percent IS the absolute gain over the 100 base.
+      if (ABILITY_STATS.indexOf(stat) >= 0 || PERCENT_STATS.indexOf(stat) >= 0) return g.percent;
+      var baseKey = { health: 'Health', shield: 'Shield', armor: 'Armor', energyMax: 'Energy', sprintSpeed: 'Sprint' }[stat];
       return (frame[baseKey] || 0) * g.percent / 100 + g.flat;
     }
     function selectBeam(evals) {
