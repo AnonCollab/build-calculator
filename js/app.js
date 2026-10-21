@@ -85,11 +85,14 @@
     { key: 'energyMax', label: 'Energy', pct: false },
     // v1.7.0 (#23): movement targets. Sprint Speed's value is the
     // game's multiplier (base per frame, e.g. 0.95), shown plain;
-    // Parkour Velocity and Aim Glide / Wall Latch are percentages
-    // over a base of 100, like the ability stats.
+    // Parkour Velocity is a percentage over a base of 100, like
+    // the ability stats. v1.8.0: Aim Glide and Wall Latch are
+    // separate targets expressed in SECONDS (bases 3s / 6s from
+    // the shipped movementBases block; Loki's latch base is 60s).
     { key: 'sprintSpeed', label: 'Sprint Speed', pct: false },
     { key: 'parkourVelocity', label: 'Parkour Velocity', pct: true },
-    { key: 'aimGlide', label: 'Aim Glide / Wall Latch', pct: true }
+    { key: 'aimGlide', label: 'Aim Glide', unit: 's' },
+    { key: 'wallLatch', label: 'Wall Latch', unit: 's' }
   ];
   var COMPANION_STATS = FRAME_STATS.filter(function (s) {
     return ['health', 'shield', 'armor', 'energyMax'].indexOf(s.key) >= 0;
@@ -223,6 +226,7 @@
     Object.keys(site.frames.warframes).forEach(function (name) {
       var f = site.frames.warframes[name];
       warframes[name] = {
+        Name: name,
         Health: f.health, Shield: f.shield, Armor: f.armor, Energy: f.energy,
         Sprint: f.sprintSpeed,
         Polarities: f.polarities, AuraPolarity: f.auraPolarity,
@@ -238,6 +242,7 @@
       setBonuses: site.setBonuses,
       helminth: site.helminth,
       linkEffects: site.links,
+      movementBases: site.frames.movementBases,
       warframes: { Warframes: warframes, Necramechs: site.frames.necramechs },
       companions: { Companions: site.frames.companions },
       weapons: site.weapons,
@@ -274,7 +279,10 @@
       // v1.7.0: state v11 — the movement target keys (sprintSpeed,
       // parkourVelocity, aimGlide) join frameTargets; older saves
       // pick up the dontcare defaults via mergeTargets.
-      version: 11,
+      // v1.8.0: state v12 — wallLatch joins frameTargets and the
+      // combined aimGlide target's semantics change from percent
+      // to seconds; v11 saves migrate in mergeState.
+      version: 12,
       category: 'Warframe',
       intent: 'window',
       // v1.4: Hybrid burst allowance (1 | 2). routesFrame.augments
@@ -457,7 +465,7 @@
   function mergeState(base, saved) {
     if (!saved || typeof saved !== 'object') return base;
     try {
-      if (saved.version === 2 || saved.version === 3 || saved.version === 4 || saved.version === 5 || saved.version === 6 || saved.version === 7 || saved.version === 8 || saved.version === 9 || saved.version === 10 || saved.version === 11) {
+      if (saved.version === 2 || saved.version === 3 || saved.version === 4 || saved.version === 5 || saved.version === 6 || saved.version === 7 || saved.version === 8 || saved.version === 9 || saved.version === 10 || saved.version === 11 || saved.version === 12) {
         if (catOf(saved.category).id === saved.category) base.category = saved.category;
         // v1.3: intent arrived in state v5; v2–v4 saves keep the
         // default 'window' (the engines' unset behaviour). v1.4:
@@ -498,6 +506,44 @@
         mergeTargets(base.weaponTargets, saved.weaponTargets);
         mergeTargets(base.dmgTargets, saved.dmgTargets);
         mergeTargets(base.ampTargets, saved.ampTargets);
+        // v1.8.0: a v11 save's combined aimGlide target is a
+        // PERCENTAGE of the unmodified value; v12 expresses
+        // glide/latch in seconds. Convert it here (the same rule
+        // as the share codec's v4 migration): both new targets
+        // keep the mode and priority, and numeric values convert
+        // through the bases of the save's own selected frame
+        // (glide 3s; latch 6s, 60s for Loki / Loki Prime). A
+        // non-numeric value is copied verbatim to both targets.
+        if (saved.version === 11 && saved.frameTargets &&
+            saved.frameTargets.aimGlide) {
+          var lgT = base.frameTargets.aimGlide;
+          if (lgT && lgT.mode && lgT.mode !== 'dontcare') {
+            var lgPct = parseFloat(lgT.value);
+            if (isFinite(lgPct)) {
+              var mb2 = (SITE && SITE.frames &&
+                SITE.frames.movementBases) || null;
+              var gBase2 = mb2 ? mb2.aimGlideSeconds : 3;
+              var lBase2 = mb2 ? mb2.wallLatchSeconds : 6;
+              var sel2 = base.selections.Warframe;
+              if (mb2 && mb2.wallLatchSecondsByFrame &&
+                  typeof mb2.wallLatchSecondsByFrame[sel2] === 'number') {
+                lBase2 = mb2.wallLatchSecondsByFrame[sel2];
+              } else if (sel2 === 'Loki' || sel2 === 'Loki Prime') {
+                lBase2 = 60;
+              }
+              var conv = function (b) {
+                return String(Math.round(b * lgPct / 100 * 10000) / 10000);
+              };
+              base.frameTargets.aimGlide = { mode: lgT.mode,
+                value: conv(gBase2), priority: lgT.priority };
+              base.frameTargets.wallLatch = { mode: lgT.mode,
+                value: conv(lBase2), priority: lgT.priority };
+            } else {
+              base.frameTargets.wallLatch = { mode: lgT.mode,
+                value: lgT.value, priority: lgT.priority };
+            }
+          }
+        }
         mergeLocks(base.locks, saved.locks);
         mergeExcludes(base.excludes, saved.excludes);
         if (saved.helminthMode === 'choose' || saved.helminthMode === 'auto') {
@@ -799,7 +845,7 @@
   function buildTargetRows(tbody, stats, prefix) {
     stats.forEach(function (s) {
       var tr = el('tr');
-      tr.appendChild(el('td', null, s.label + (s.pct ? ' (%)' : '')));
+      tr.appendChild(el('td', null, s.label + (s.pct ? ' (%)' : s.unit ? ' (' + s.unit + ')' : '')));
       var tdMode = el('td');
       var sel = document.createElement('select');
       sel.id = prefix + '-mode-' + s.key;
@@ -2500,9 +2546,10 @@
       var t = store[s.key];
       var tr = el('tr');
       tr.appendChild(el('td', null, s.label));
+      var unit = s.unit || '';
       var targetText = '—';
-      if (t && t.mode === 'atleast') targetText = (s.lowerBetter ? '≤ ' : '≥ ') + t.value;
-      if (t && t.mode === 'closest') targetText = '≈ ' + t.value;
+      if (t && t.mode === 'atleast') targetText = (s.lowerBetter ? '≤ ' : '≥ ') + t.value + unit;
+      if (t && t.mode === 'closest') targetText = '≈ ' + t.value + unit;
       if (t && t.mode === 'maximize') {
         targetText = 'Maximize' + (t.priority !== '' && t.priority != null ? ' (priority ' + t.priority + ')' : '');
       }
@@ -2510,7 +2557,7 @@
       var ach = achieved ? achieved[s.key] : null;
       var achDisp = ach;
       if (fracStats && s.frac && typeof ach === 'number') achDisp = ach * 100;
-      tr.appendChild(el('td', null, ach == null ? '—' : fmt(achDisp)));
+      tr.appendChild(el('td', null, ach == null ? '—' : fmt(achDisp) + unit));
       var status = '—', cls = '';
       if (t && t.mode === 'atleast' && typeof ach === 'number') {
         var met = !unmet[s.key];
@@ -2520,7 +2567,7 @@
         var tv = parseFloat(t.value);
         var av = fracStats && s.frac ? ach * 100 : ach;
         var d = Math.abs(av - tv);
-        status = d < 1e-9 ? 'met' : 'off by ' + fmt(d);
+        status = d < 1e-9 ? 'met' : 'off by ' + fmt(d) + unit;
         cls = d < 1e-9 ? 'status-met' : '';
       }
       tr.appendChild(el('td', cls, status));
@@ -2551,9 +2598,9 @@
           // its value (it IS the starting point).
           var d = (typeof entry.delta === 'number') ? entry.delta : 0;
           var seg = entry.kind === 'base'
-            ? entry.source + ' — ' + fmt(entry.cumulative)
-            : entry.source + ' — ' + (d < 0 ? '-' : '+') + fmt(Math.abs(d)) +
-              ' → ' + fmt(entry.cumulative);
+            ? entry.source + ' — ' + fmt(entry.cumulative) + unit
+            : entry.source + ' — ' + (d < 0 ? '-' : '+') + fmt(Math.abs(d)) + unit +
+              ' → ' + fmt(entry.cumulative) + unit;
           line.appendChild(el('span', null, seg));
           tdB.appendChild(line);
         });
@@ -3086,7 +3133,7 @@
       rows++;
       var tr = el('tr');
       tr.appendChild(el('td', null, s.label));
-      tr.appendChild(el('td', null, fmt(sv) + ' → ' + fmt(cv)));
+      tr.appendChild(el('td', null, fmt(sv) + (s.unit || '') + ' → ' + fmt(cv) + (s.unit || '')));
       var up = cv > sv;
       var cls = '', note = '';
       if (t.mode === 'atleast') {
@@ -3102,7 +3149,7 @@
       } else if (t.mode === 'maximize') {
         cls = up ? 'status-met' : 'status-unmet';
       }
-      var arrow = el('td', cls, (up ? '▲ ' : '▼ ') + fmt(Math.abs(cv - sv)) + note);
+      var arrow = el('td', cls, (up ? '▲ ' : '▼ ') + fmt(Math.abs(cv - sv)) + (s.unit || '') + note);
       arrow.className = (arrow.className ? arrow.className + ' ' : '') + 'delta-arrow';
       tr.appendChild(arrow);
       tb.appendChild(tr);
@@ -3779,7 +3826,7 @@
       if (!t || t.mode === 'dontcare') return;
       var a = achieved[s.key];
       if (typeof a !== 'number') return;
-      pairs.push(s.label + ' ' + fmt(a));
+      pairs.push(s.label + ' ' + fmt(a) + (s.unit || ''));
     });
     return pairs;
   }
