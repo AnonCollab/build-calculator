@@ -300,6 +300,45 @@
  *    dropped with a note, the augment-lock precedent).
  *    evaluateFrame stays intent-free and does not gate.
  *
+ * v1.8.0 (#24 — Aim Glide / Wall Latch split, in seconds):
+ *  - The v1.7.0 combined aimGlide target (a percentage over the
+ *    unmodified value) is TWO targets now, expressed in SECONDS:
+ *    aimGlide (Aim Glide Duration) and wallLatch (Wall Latch
+ *    Duration), the DURATION_STATS group. Model (the pool
+ *    formula): baseSeconds x (1 + sumPercent/100) +
+ *    sumFlatSeconds. Bases are the wiki "Maneuvers" values —
+ *    Aim Glide 3s, Wall Latch 6s — carried as sourced curated
+ *    data (pipeline/extract_movement_bases.py ->
+ *    data.movementBases; the extracted data states no base for
+ *    either maneuver). The two maneuvers SHARE ONE TIMER
+ *    in-game (the same page says so in both sections); the
+ *    targets display and solve separately, no combined-budget
+ *    modelling is implied.
+ *  - LOKI IS MODELLED FOR LATCH (supersedes the v1.7.0 boundary
+ *    text below for this one passive): Loki / Loki Prime get a
+ *    60s latch base — their extracted "hang from walls 10x
+ *    longer" passive applied to the 6s base, a per-frame target
+ *    base like Sprint's. Glide is 3s for every frame (no
+ *    sourced per-frame glide difference exists). The rest of
+ *    the passive boundary stands: Zephyr's airborne changes
+ *    (no number), Chroma's extra jump (a count), Khora's
+ *    Venari-conditional boost are NOT modelled.
+ *  - The 13 structured AVATAR_PARKOUR_GLIDE percent effects
+ *    feed BOTH duration stats (their lines name both
+ *    maneuvers) EXCEPT Tractor Beam, whose line names Aim
+ *    Glide only — the transform stamps scope: 'aimGlide' on it
+ *    and glideEffs() honours the stamp. (Tractor Beam is a
+ *    MOA-type mod: companion pools, never the frame pool.)
+ *  - Aerodynamic (aura) is modelled: its flat +6s Aim Glide /
+ *    +12s Wall Latch (max rank) feed the two stats as flat
+ *    seconds, routed by each segment's statText; the aura
+ *    extractor now pairs the latch segment with the shared
+ *    glide upgrade type. STACKING ASSUMPTION (the wiki states
+ *    no order): percent applies to the base first, flat
+ *    seconds add after — the pool formula's order, used for
+ *    every pool stat. Cross-check at zero percent: Aerodynamic
+ *    alone gives 3 + 6 = 9s glide, the wiki note's own total.
+ *
  * v1.7.0 (#23 — parkour / movement stats as solver targets):
  *  - Three new frame stats, all fed by extracted upgrade types
  *    through UT_TO_STAT: parkourVelocity (AVATAR_PARKOUR_BOOST —
@@ -368,22 +407,59 @@
     AVATAR_POWER_MAX: 'energyMax',   // energy max in the wiki enums
     AVATAR_ENERGY_MAX: 'energyMax',   // defensive: not present in data
     AVATAR_PARKOUR_BOOST: 'parkourVelocity',   // v1.7.0 (#23)
-    AVATAR_PARKOUR_GLIDE: 'aimGlide',          // v1.7.0 (#23)
+    // v1.8.0: AVATAR_PARKOUR_GLIDE no longer maps to ONE stat —
+    // modRecord / lockRecordNormalize expand it into the two
+    // DURATION_STATS (aimGlide + wallLatch), honouring the
+    // transform's `scope` stamp for single-maneuver lines
+    // (Tractor Beam is glide-only). UT_TO_STAT keeps no entry
+    // for it; the generic consumers of this map (set perPiece,
+    // tomes, helminth) carry no glide effects in the data.
     AVATAR_SPRINT_SPEED: 'sprintSpeed'         // v1.7.0 (#23)
   };
   var ABILITY_STATS = ['abilityStrength', 'abilityDuration', 'abilityRange', 'abilityEfficiency'];
   var POOL_STATS = ['health', 'shield', 'armor', 'energyMax', 'sprintSpeed'];
   // v1.7.0 (#23): percent stats over a base of 100, like the ability
-  // stats — Parkour Velocity and Aim Glide / Wall Latch Duration.
-  // The extracted data carries NO per-frame parkour field, so 100
-  // is the unmodified value the extracted percentages modify;
-  // per-frame parkour differences live in passives, which this
-  // stat model does not carry for ANY stat (see the header note:
-  // Loki's wall-latch x10 is the named boundary). The glide data
-  // likewise exists only as +% duration — no base-seconds value
-  // is in the store and none is invented.
-  var PERCENT_STATS = ['parkourVelocity', 'aimGlide'];
-  var ALL_STATS = ABILITY_STATS.concat(POOL_STATS).concat(PERCENT_STATS);
+  // stats — Parkour Velocity. The extracted data carries NO
+  // per-frame parkour field, so 100 is the unmodified value the
+  // extracted percentages modify; per-frame parkour differences
+  // live in passives, which this stat model does not carry for
+  // ANY stat (see the header note).
+  var PERCENT_STATS = ['parkourVelocity'];
+  // v1.8.0: duration stats, in SECONDS — Aim Glide and Wall
+  // Latch, split from v1.7.0's combined percent target. Model
+  // (the pool formula): baseSeconds x (1 + sumPercent/100) +
+  // sumFlatSeconds. Bases are the wiki "Maneuvers" values,
+  // carried as curated data (pipeline/extract_movement_bases.py
+  // -> data.movementBases): glide 3s for every frame; latch 6s,
+  // with a per-frame override map (Loki / Loki Prime 60s — the
+  // x10 latch passive applied to the base; the Sprint
+  // per-frame-base precedent). The FALLBACK_* constants below
+  // are the same values, used only when a bundle carries no
+  // movementBases block; the site-data suite pins the shipped
+  // data equal to them so the two cannot drift silently.
+  var DURATION_STATS = ['aimGlide', 'wallLatch'];
+  var ALL_STATS = ABILITY_STATS.concat(POOL_STATS)
+    .concat(PERCENT_STATS).concat(DURATION_STATS);
+  var FALLBACK_GLIDE_SECONDS = 3;
+  var FALLBACK_LATCH_SECONDS = 6;
+  var FALLBACK_LATCH_BY_FRAME = { 'Loki': 60, 'Loki Prime': 60 };
+
+  // The base duration (seconds) of one DURATION stat for a
+  // frame: the curated per-frame latch override when the frame
+  // has one, else the standard base. Frame identity comes from
+  // the record's Name (raw store records carry it; the site's
+  // bundle re-wrap passes it through).
+  function durationBase(ctx, frame, stat) {
+    var mb = (ctx && ctx.movementBases) || null;
+    if (stat === 'aimGlide') {
+      return mb ? mb.aimGlideSeconds : FALLBACK_GLIDE_SECONDS;
+    }
+    var name = frame && (frame.Name || frame.name);
+    var byFrame = mb ? mb.wallLatchSecondsByFrame
+                     : FALLBACK_LATCH_BY_FRAME;
+    if (name && typeof byFrame[name] === 'number') return byFrame[name];
+    return mb ? mb.wallLatchSeconds : FALLBACK_LATCH_SECONDS;
+  }
 
   // Shard bonus page-text -> solver stat key (only bonuses in solver scope).
   var SHARD_STAT_MAP = {
@@ -433,6 +509,22 @@
   function clone(o) { return JSON.parse(JSON.stringify(o)); }
 
   // ---- data normalisation -------------------------------------------------
+  // v1.8.0: expand one AVATAR_PARKOUR_GLIDE effect into solver
+  // effects for the two duration stats. The transform stamps
+  // `scope` when the source line names ONE maneuver (Tractor
+  // Beam: glide only); an unscoped effect feeds both. Returns
+  // [] for units the duration model cannot carry.
+  function glideEffs(e, valuePerRank) {
+    if (e.unit !== 'percent' && e.unit !== 'flat') return [];
+    var stats = e.scope === 'aimGlide' ? ['aimGlide']
+      : e.scope === 'wallLatch' ? ['wallLatch']
+      : ['aimGlide', 'wallLatch'];
+    return stats.map(function (stat) {
+      return { stat: stat, unit: e.unit, valuePerRank: valuePerRank,
+               condition: e.condition || null };
+    });
+  }
+
   // Convert one derived mod record to a solver pool record, or null when
   // it has no effect that maps to a solver stat. Shared by the Warframe,
   // Necramech and Companion pools (they differ only in which derived
@@ -441,6 +533,13 @@
     if (m.parseStatus !== 'clean' && m.parseStatus !== 'partial') return null;
     var effs = [];
     (m.effects || []).forEach(function (e) {
+      var vpr = (typeof e.valuePerRank === 'number')
+        ? e.valuePerRank
+        : e.value / ((m.maxRank || 0) + 1);
+      if (e.upgradeType === 'AVATAR_PARKOUR_GLIDE') {
+        effs = effs.concat(glideEffs(e, vpr));
+        return;
+      }
       var stat = UT_TO_STAT[e.upgradeType];
       if (!stat) {
         if (e.upgradeType && e.upgradeType.indexOf('AVATAR_') === 0) {
@@ -452,9 +551,7 @@
       effs.push({
         stat: stat,
         unit: e.unit,
-        valuePerRank: (typeof e.valuePerRank === 'number')
-          ? e.valuePerRank
-          : e.value / ((m.maxRank || 0) + 1),
+        valuePerRank: vpr,
         condition: e.condition || null
       });
     });
@@ -638,6 +735,21 @@
     ctx.channelByAbility = (data && data.channels &&
       data.channels.abilities) || {};
 
+    // v1.8.0 maneuver base durations (curated, sourced — see
+    // pipeline/extract_movement_bases.py). Optional bundle key —
+    // absent means durationBase's fallback constants apply.
+    ctx.movementBases = null;
+    if (data && data.movementBases &&
+        typeof data.movementBases.aimGlideSeconds === 'number' &&
+        typeof data.movementBases.wallLatchSeconds === 'number') {
+      ctx.movementBases = {
+        aimGlideSeconds: data.movementBases.aimGlideSeconds,
+        wallLatchSeconds: data.movementBases.wallLatchSeconds,
+        wallLatchSecondsByFrame:
+          data.movementBases.wallLatchSecondsByFrame || {}
+      };
+    }
+
     // v1.5 Focus schools: modelled nodes by school (the only nodes
     // that can be pieces — effects filtered to the solver's stats,
     // same discipline as arcanes), plus per-school status counts for
@@ -776,6 +888,26 @@
       var effs = [];
       (a.effects || []).forEach(function (e) {
         if (e.target && e.target !== 'squad' && e.target !== 'self') return;
+        // v1.8.0: Aerodynamic's glide/latch effects — flat SECONDS
+        // routed by the segment's statText to the named duration
+        // stat (the aura's two segments carry one upgrade type);
+        // a percent glide aura effect would feed both stats.
+        if (e.upgradeType === 'AVATAR_PARKOUR_GLIDE') {
+          if (e.unit === 'seconds') {
+            effs.push({
+              stat: (e.statText || '').toLowerCase() === 'wall latch'
+                ? 'wallLatch' : 'aimGlide',
+              unit: 'flat', value: e.value,
+              conditional: (e.durationSeconds != null)
+            });
+          } else if (e.unit === 'percent') {
+            effs.push({ stat: 'aimGlide', unit: 'percent', value: e.value,
+                        conditional: (e.durationSeconds != null) });
+            effs.push({ stat: 'wallLatch', unit: 'percent', value: e.value,
+                        conditional: (e.durationSeconds != null) });
+          }
+          return;
+        }
         var stat = UT_TO_STAT[e.upgradeType] || AURA_STAT_MAP[e.mappedStat] || null;
         if (!stat || (e.unit !== 'percent' && e.unit !== 'flat')) return;
         effs.push({
@@ -1389,12 +1521,17 @@
     (raw.effects || []).forEach(function (e) {
       if (!e) return;
       if (e.upgradeType) {
+        var vpr2 = (typeof e.valuePerRank === 'number')
+          ? e.valuePerRank : (e.value || 0) / (maxRank + 1);
+        if (e.upgradeType === 'AVATAR_PARKOUR_GLIDE') {
+          effs = effs.concat(glideEffs(e, vpr2)); // v1.8.0 split
+          return;
+        }
         var stat = UT_TO_STAT[e.upgradeType];
         if (!stat || (e.unit !== 'percent' && e.unit !== 'flat')) return;
         effs.push({
           stat: stat, unit: e.unit,
-          valuePerRank: (typeof e.valuePerRank === 'number')
-            ? e.valuePerRank : (e.value || 0) / (maxRank + 1),
+          valuePerRank: vpr2,
           condition: e.condition || null
         });
       } else if (e.stat) {
@@ -1454,6 +1591,13 @@
     var out = {};
     ABILITY_STATS.forEach(function (k) { out[k] = 100 + sums[k].percent; });
     PERCENT_STATS.forEach(function (k) { out[k] = 100 + sums[k].percent; });
+    // v1.8.0 duration stats (seconds): the pool formula over the
+    // maneuver base — percent scales the base, flat seconds add
+    // after (the stacking assumption, see the header note).
+    DURATION_STATS.forEach(function (k) {
+      out[k] = durationBase(ctx, frame, k) * (1 + sums[k].percent / 100) +
+        sums[k].flat;
+    });
     // v1.6.1: a lock effect (Arcane Sculptor) SETS the efficiency
     // outright — before the channel read and the cap below, so
     // the uncapped efficiency the drain formula reads IS the
@@ -2605,6 +2749,11 @@
       // Percent-over-100 stats (ability + v1.7 movement): the gross
       // percent IS the absolute gain over the 100 base.
       if (ABILITY_STATS.indexOf(stat) >= 0 || PERCENT_STATS.indexOf(stat) >= 0) return g.percent;
+      // v1.8.0 duration stats: the gain over the maneuver base,
+      // in seconds (percent of base + flat seconds).
+      if (DURATION_STATS.indexOf(stat) >= 0) {
+        return durationBase(ctx, frame, stat) * g.percent / 100 + g.flat;
+      }
       var baseKey = { health: 'Health', shield: 'Shield', armor: 'Armor', energyMax: 'Energy', sprintSpeed: 'Sprint' }[stat];
       return (frame[baseKey] || 0) * g.percent / 100 + g.flat;
     }
