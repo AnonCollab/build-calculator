@@ -14,7 +14,7 @@
  *    pipeline/build_index_registry.py). An ID never changes and is
  *    never reused, so a code decodes to the same build forever.
  *  - Schema: a 4-bit version field leads the payload. The encoder
- *    writes v4; decoders accept v1, v2, v3 and v4 and refuse
+ *    writes v5; decoders accept v1, v2, v3, v4 and v5 and refuse
  *    anything else loudly. v2 (v1.5.2) widens two v1 layouts: board slots
  *    carry the polarity/forma bits on normal+exilus slots of WEAPON
  *    boards too (v1 wrote them for frame boards only), and weapon
@@ -30,6 +30,15 @@
  *    in old codes still read correctly; since targets are
  *    positional with no count, decoders read the 9-key list for
  *    v≤3 payloads and the 12-key list for v4.
+ *    v5 (v1.8.0) appends one more key (wallLatch) as the combined
+ *    Aim Glide / Wall Latch target splits into two targets in
+ *    seconds. A v4 payload's combined aimGlide target is a
+ *    PERCENTAGE of the unmodified value; on decode it migrates
+ *    to both duration targets (same mode and priority) with the
+ *    value converted through the maneuver bases — glide 3s,
+ *    latch 6s, or 60s when the payload selects Loki / Loki
+ *    Prime (wiki "Maneuvers" bases; Loki's latch lasts 10x
+ *    longer). See migrateV4GlideTargets.
  *  - Checksum: a digit-polynomial over the base62 body
  *    (h = (h*33 + digit) mod 3844 = 62^2), rendered as the final 2
  *    base62 chars and verified BEFORE any field is parsed — a
@@ -44,9 +53,10 @@
  *    otherwise vanish).
  *  - Canonical form: fields at their defaults cost only their flag /
  *    mode bits (dontcare targets, empty wallet colours, absent board,
- *    ...). The decoder re-expands everything to a full v11 state
+ *    ...). The decoder re-expands everything to a full v12 state
  *    (older payloads gain the later defaults: omniAura false,
- *    movement targets dontcare).
+ *    movement targets dontcare; v4 payloads gain the migrated
+ *    glide/latch pair).
  *  - encode() returns null (never throws, never guesses) when a state
  *    carries something the schema cannot name — the app then falls
  *    back to the legacy long link. Documented refusals: names absent
@@ -70,7 +80,7 @@
   'use strict';
 
   var B62 = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
-  var SCHEMA_VERSION = 4;
+  var SCHEMA_VERSION = 5;
 
   // Fixed enums (mirror site/js/app.js — the category order is the
   // app's CATEGORIES order; stat lists are the app's target stores).
@@ -113,8 +123,13 @@
     // old codes still read correctly. Targets are positional with
     // no count, so decoders gate the list on the code's version:
     // v≤3 payloads carry only the first 9 keys.
-    'parkourVelocity', 'aimGlide', 'sprintSpeed'];
+    'parkourVelocity', 'aimGlide', 'sprintSpeed',
+    // v5 (v1.8.0): wallLatch appended as the combined glide/latch
+    // target splits in two; v4 payloads carry the first 12 keys
+    // and migrate (see the header note).
+    'wallLatch'];
   var FRAME_STAT_KEYS_V3 = FRAME_STAT_KEYS.slice(0, 9);
+  var FRAME_STAT_KEYS_V4 = FRAME_STAT_KEYS.slice(0, 12);
   var WEAPON_STAT_KEYS = ['totalDamagePerShot', 'critChance',
     'critMultiplier', 'statusChance', 'fireRate', 'multishot',
     'magazine', 'reload', 'punchThrough'];
@@ -351,6 +366,38 @@
         else out[k] = { mode: MODES[mode], value: r.rNumStr(), priority: r.rNumStr() };
       });
       return out;
+    }
+    // v5 migration (v1.8.0): a v4 payload's combined aimGlide
+    // target is a percentage of the unmodified value (100 =
+    // unmodified). It becomes BOTH duration targets — same mode
+    // and priority — with numeric values converted through the
+    // maneuver bases (wiki "Maneuvers": Aim Glide 3s; Wall
+    // Latch 6s, or 60s when the payload's Warframe selection is
+    // Loki / Loki Prime, whose latch lasts 10x longer). A
+    // non-numeric value (mode set, value blank) is copied
+    // verbatim to both targets instead of converted.
+    function migrateV4GlideTargets(st) {
+      var t = st.frameTargets.aimGlide;
+      if (!t || !t.mode || t.mode === 'dontcare') {
+        st.frameTargets.wallLatch =
+          { mode: 'dontcare', value: '', priority: '' };
+        return;
+      }
+      var sel = st.selections ? st.selections.Warframe : null;
+      var latchBase = (sel === 'Loki' || sel === 'Loki Prime') ? 60 : 6;
+      var pct = parseFloat(t.value);
+      if (isFinite(pct)) {
+        var conv = function (b) {
+          return String(Math.round(b * pct / 100 * 10000) / 10000);
+        };
+        st.frameTargets.aimGlide =
+          { mode: t.mode, value: conv(3), priority: t.priority };
+        st.frameTargets.wallLatch =
+          { mode: t.mode, value: conv(latchBase), priority: t.priority };
+      } else {
+        st.frameTargets.wallLatch =
+          { mode: t.mode, value: t.value, priority: t.priority };
+      }
     }
     function wPieces(w, entry, withRanks) {
       var mods = (entry && entry.mods) || [];
@@ -808,7 +855,7 @@
       if (version < 1 || version > SCHEMA_VERSION) {
         throw CodecError('unsupported share code version ' + version);
       }
-      var st = { version: 11 };
+      var st = { version: 12 };
       st.category = CATEGORIES[r.r(4)];
       var intent = r.r(2);
       st.intent = intent === 1 ? 'upkeep' : intent === 2 ? 'hybrid' : 'window';
@@ -845,8 +892,11 @@
         } else throw CodecError('share code is malformed (attack key mode)');
         st.attackByItem[key] = r.r(5);
       }
-      // v4 gate: v≤3 payloads carry the 9-key target list only.
-      st.frameTargets = rTargets(r, version >= 4 ? FRAME_STAT_KEYS : FRAME_STAT_KEYS_V3);
+      // Version gate: v≤3 payloads carry the 9-key target list,
+      // v4 the 12-key list (plus the glide migration below), v5
+      // the full 13.
+      st.frameTargets = rTargets(r, version >= 5 ? FRAME_STAT_KEYS : version === 4 ? FRAME_STAT_KEYS_V4 : FRAME_STAT_KEYS_V3);
+      if (version === 4) migrateV4GlideTargets(st);
       st.weaponTargets = rTargets(r, WEAPON_STAT_KEYS);
       st.dmgTargets = rTargets(r, DMG_STAT_KEYS);
       st.ampTargets = rTargets(r, AMP_STAT_KEYS);
