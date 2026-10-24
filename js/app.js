@@ -2132,14 +2132,39 @@
     refreshBoardUI();
   }
   // Attach the category's locks (if any) to a solve input.
+  // v1.9.1: a lock naming a piece that no longer exists in the
+  // shipped data (a removed mod — Primed Streamline is the first —
+  // or a stale arcane name in an old save or share code) is dropped
+  // here, at the one point every solve kind routes through, instead
+  // of failing the whole solve with an "unknown locked mod" error:
+  // the solve proceeds without it and the drop is reported in the
+  // results notes (droppedLockNotes, prepended by calculate()).
+  // The saved lock itself is left untouched in the state.
+  var droppedLockNotes = [];
   function applyLocksToInput(input) {
     var lk = locksFor(state.category);
     if (lk.mods.length) {
-      input.lockedMods = lk.mods.map(function (L) { return { name: L.name, rank: L.rank }; });
-      var ex = extraRecordsFor(lk.mods.map(function (L) { return L.name; }));
-      if (ex) input.extraModRecords = ex;
+      var kept = lk.mods.filter(function (L) {
+        if (modpoolRec(L.name)) return true;
+        droppedLockNotes.push('Locked mod "' + L.name +
+          '" is no longer available — the lock was not applied.');
+        return false;
+      });
+      if (kept.length) {
+        input.lockedMods = kept.map(function (L) { return { name: L.name, rank: L.rank }; });
+        var ex = extraRecordsFor(kept.map(function (L) { return L.name; }));
+        if (ex) input.extraModRecords = ex;
+      }
     }
-    if (lk.arcanes.length) input.lockedArcanes = lk.arcanes.slice();
+    if (lk.arcanes.length) {
+      var keptA = lk.arcanes.filter(function (name) {
+        var ok = (SITE.arcanes.arcanes || []).some(function (a) { return a.name === name; });
+        if (!ok) droppedLockNotes.push('Locked arcane "' + name +
+          '" is no longer available — the lock was not applied.');
+        return ok;
+      });
+      if (keptA.length) input.lockedArcanes = keptA.slice();
+    }
   }
   // Attach the category's excludes (if any) to a solve input.
   function applyExcludesToInput(input) {
@@ -4386,6 +4411,7 @@
   function calculate() {
     readUIFromControls();
     refreshCategoryUI();
+    droppedLockNotes = [];
     var req;
     try {
       req = buildSolveRequest();
@@ -4400,6 +4426,9 @@
     btn.textContent = 'Calculating…';
     $('calc-status').textContent = 'Calculating…';
     runSolve(req).then(function (res) {
+      // v1.9.1: locks dropped as no longer available are reported
+      // at the head of the results notes.
+      if (droppedLockNotes.length) res.notes = droppedLockNotes.concat(res.notes || []);
       renderResults(req.kind, res);
       $('calc-status').textContent = '';
       showTab('results');
