@@ -14,7 +14,7 @@
  *    pipeline/build_index_registry.py). An ID never changes and is
  *    never reused, so a code decodes to the same build forever.
  *  - Schema: a 4-bit version field leads the payload. The encoder
- *    writes v5; decoders accept v1, v2, v3, v4 and v5 and refuse
+ *    writes v6; decoders accept v1 through v6 and refuse
  *    anything else loudly. v2 (v1.5.2) widens two v1 layouts: board slots
  *    carry the polarity/forma bits on normal+exilus slots of WEAPON
  *    boards too (v1 wrote them for frame boards only), and weapon
@@ -39,6 +39,14 @@
  *    latch 6s, or 60s when the payload selects Loki / Loki
  *    Prime (wiki "Maneuvers" bases; Loki's latch lasts 10x
  *    longer). See migrateV4GlideTargets.
+ *    v6 (v1.9.0) appends a TRAILING block after the progenitor
+ *    fields (the v5 payload is a strict prefix): the formaConvert
+ *    toggle (1 bit) and the Starting Pools — a count (5 bits) of
+ *    per-item entries, each an item key (the attackByItem key
+ *    modes) + a pool length (4 bits) + that many polarity indices
+ *    (4 bits each, the POLARITIES table). Decoders gate the block
+ *    on version >= 6; v≤5 payloads gain the defaults (toggle off,
+ *    no declared pools — every item seeds from its innate slots).
  *  - Checksum: a digit-polynomial over the base62 body
  *    (h = (h*33 + digit) mod 3844 = 62^2), rendered as the final 2
  *    base62 chars and verified BEFORE any field is parsed — a
@@ -53,19 +61,22 @@
  *    otherwise vanish).
  *  - Canonical form: fields at their defaults cost only their flag /
  *    mode bits (dontcare targets, empty wallet colours, absent board,
- *    ...). The decoder re-expands everything to a full v12 state
+ *    ...). The decoder re-expands everything to a full v13 state
  *    (older payloads gain the later defaults: omniAura false,
  *    movement targets dontcare; v4 payloads gain the migrated
- *    glide/latch pair).
+ *    glide/latch pair; v≤5 payloads gain formaConvert false and no
+ *    declared Starting Pools).
  *  - encode() returns null (never throws, never guesses) when a state
  *    carries something the schema cannot name — the app then falls
  *    back to the legacy long link. Documented refusals: names absent
  *    from the registry, counts past their field caps (locks > 15 per
  *    category, attackByItem > 15 entries, abilityLocks > 31 frames,
- *    wallet counts > 1023, board > 31 slots, focus nodes > 31),
+ *    wallet counts > 1023, board > 31 slots, focus nodes > 31,
+ *    Starting Pools > 31 items or > 15 entries in one pool),
  *    unknown board-extras keys (extras pass through the app's state
  *    merge untouched, so an unmodelled key is real user data), and
- *    values outside the enumerated domains (forma budget, itemKind).
+ *    values outside the enumerated domains (forma budget, itemKind,
+ *    a Starting Pool entry that is not one of the eight polarities).
  *  - One derived field: board extras' companionEntry (the assembled
  *    MOA/Hound entry) is a pure function of state.parts + the shipped
  *    modular data, both of which travel in the code / the site
@@ -80,7 +91,7 @@
   'use strict';
 
   var B62 = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
-  var SCHEMA_VERSION = 5;
+  var SCHEMA_VERSION = 6;
 
   // Fixed enums (mirror site/js/app.js — the category order is the
   // app's CATEGORIES order; stat lists are the app's target stores).
@@ -847,6 +858,44 @@
       if (pei < 0) throw CodecError('progenitor element outside the schema: ' + pg.element);
       w.w(pei, 3);
       w.wNumStr(pg.percent === undefined ? 60 : pg.percent);
+      // v6 (v1.9.0): the trailing block — conversion toggle, then
+      // the Starting Pools. Item keys use the attackByItem modes;
+      // pool entries are POLARITIES indices (1..8 — a pool entry
+      // is always a real polarity, never null).
+      w.wBool(!!state.formaConvert);
+      var pools = state.startingPools || {};
+      var pkeys = Object.keys(pools).filter(function (k) {
+        return Array.isArray(pools[k]);
+      });
+      wCount(w, pkeys.length, 5, 'Starting Pool items');
+      pkeys.forEach(function (key) {
+        var done = false;
+        var fixed = [['frames', 1], ['necramechs', 2], ['companions', 3]];
+        for (var i = 0; i < fixed.length && !done; i++) {
+          if (nsEntry(fixed[i][0]).index.has(key)) {
+            w.w(fixed[i][1], 3); w.wIndex(fixed[i][0], key); done = true;
+          }
+        }
+        if (!done) {
+          var wns = ['weapon:Primary', 'weapon:Secondary', 'weapon:Melee',
+            'weapon:Archgun', 'weapon:Archmelee', 'weapon:Companion Weapon'];
+          for (var j = 0; j < wns.length && !done; j++) {
+            if (nsEntry(wns[j]).index.has(key)) {
+              w.w(4, 3); w.w(j, 3); w.wIndex(wns[j], key); done = true;
+            }
+          }
+        }
+        if (!done) { w.w(0, 3); w.wRawString(key); }
+        var entries = pools[key];
+        wCount(w, entries.length, 4, 'Starting Pool entries');
+        entries.forEach(function (p) {
+          var pi = POLARITIES.indexOf(p);
+          if (pi < 1) {
+            throw CodecError('Starting Pool entry outside the schema: ' + p);
+          }
+          w.w(pi, 4);
+        });
+      });
       return w.acc;
     }
 
@@ -855,7 +904,7 @@
       if (version < 1 || version > SCHEMA_VERSION) {
         throw CodecError('unsupported share code version ' + version);
       }
-      var st = { version: 12 };
+      var st = { version: 13 };
       st.category = CATEGORIES[r.r(4)];
       var intent = r.r(2);
       st.intent = intent === 1 ? 'upkeep' : intent === 2 ? 'hybrid' : 'window';
@@ -952,6 +1001,35 @@
         element: PROGENITOR_ELEMENTS[r.r(3)],
         percent: parseFloat(r.rNumStr())
       };
+      // v6 (v1.9.0): the trailing block; v≤5 payloads end at the
+      // progenitor and gain the defaults.
+      st.formaConvert = false;
+      st.startingPools = {};
+      if (version >= 6) {
+        st.formaConvert = r.rBool();
+        var np = r.r(5);
+        for (i = 0; i < np; i++) {
+          var km2 = r.r(3), pkey;
+          if (km2 === 0) pkey = r.rRawString();
+          else if (km2 === 1) pkey = r.rIndex('frames');
+          else if (km2 === 2) pkey = r.rIndex('necramechs');
+          else if (km2 === 3) pkey = r.rIndex('companions');
+          else if (km2 === 4) {
+            var wns2 = ['weapon:Primary', 'weapon:Secondary', 'weapon:Melee',
+              'weapon:Archgun', 'weapon:Archmelee', 'weapon:Companion Weapon'];
+            pkey = r.rIndex(wns2[r.r(3)]);
+          } else throw CodecError('share code is malformed (pool key mode)');
+          var pn = r.r(4), parr = [];
+          for (var pj = 0; pj < pn; pj++) {
+            var pv = POLARITIES[r.r(4)];
+            if (!pv) {
+              throw CodecError('share code is malformed (pool entry)');
+            }
+            parr.push(pv);
+          }
+          st.startingPools[pkey] = parr;
+        }
+      }
       if (r.remaining() !== 0) {
         throw CodecError('share code is malformed (trailing bits)');
       }
