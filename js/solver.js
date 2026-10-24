@@ -843,6 +843,9 @@
     ctx.arcanes = ((data.arcaneEffects && data.arcaneEffects.arcanes) || []).map(function (a) {
       return {
         name: a.name,
+        // v1.9.2: gear type rides through — the frame solver's
+        // pools may only field arcanes equippable on the item.
+        type: a.type || null,
         conditional: !!a.conditional,
         maxRank: typeof a.maxRank === 'number' ? a.maxRank : null,
         // v1.6.1: ability whitelist for gated arcanes (the wiki's
@@ -1302,11 +1305,11 @@
         if (!name || typeof name !== 'string') return;
         var set = ctx.setOfMod[name];
         if (!set) {
-          notes.push('Cross-gear include ' + name + ' skipped: it belongs to no set.');
+          notes.push('Cross-gear Mods include ' + name + ' skipped: it belongs to no set.');
           return;
         }
         if (excludeSetNames[set] || excludeModNames[name] || o.excludedMods[name]) {
-          notes.push('Cross-gear include ' + name + ' skipped: it is excluded.');
+          notes.push('Cross-gear Mods include ' + name + ' skipped: it is excluded.');
           return;
         }
         if (o.focusNames[name]) return; // already on the focus item
@@ -2717,6 +2720,15 @@
       // forced Helminth choice, the augment-lock precedent — hold
       // no listed ability is dropped with a note, never fielded.
       var gatedEntry = ctx.arcaneByName[name];
+      // v1.9.2: an arcane equippable only on other gear (a Kitgun
+      // arcane locked onto a frame, say) is dropped with a note,
+      // never fielded — the gated-lock treatment, for type.
+      if (gatedEntry && gatedEntry.type && gatedEntry.type !== 'Warframe') {
+        gatedArcaneNotes.push('Locked ' + name + ' is a ' +
+          gatedEntry.type + ' arcane — it cannot be equipped on ' +
+          'this item. The lock was not applied.');
+        return;
+      }
       if (kind === 'warframe' && gatedEntry && gatedEntry.validAbilities &&
           !arcaneEligibleChoice(gatedEntry, eligChoice, frameAbilitiesEarly)) {
         gatedArcaneNotes.push('Locked ' + name + ' is ability-gated: ' +
@@ -2844,7 +2856,8 @@
         });
       }
       var arcanes = routes.arcanes ? ctx.arcanes.filter(function (a) {
-        return !excludedArcaneSet[a.name] && // v1.2 ban
+        return a.type === 'Warframe' && // v1.9.2: equippable here only
+               !excludedArcaneSet[a.name] && // v1.2 ban
                !(pruneBurst && isBurst(a.name)) && // v1.3 upkeep
                a.effects.some(function (e) { return statSet.indexOf(e.stat) >= 0; }) &&
                (!a.conditional || routes.conditional);
