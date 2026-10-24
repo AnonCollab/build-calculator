@@ -1714,7 +1714,115 @@
   // polarized leftover that cannot avoid a polarized seat pays the
   // game's +25% mismatch penalty (drainInSlot). The spend loops
   // therefore run on pricedCost(), recomputed after every spend.
-  function fitCapacity(ctx, frame, state, formaBudget, reactor, umbraForma, auraOpts) {
+  // v1.9.0 (#25): the pool the fit plans against is the STARTING
+  // POOL — the polarities already invested in this item — seeded
+  // from the innate slots when the caller declares none
+  // (poolOpts.pool: array of polarity names; poolOpts.convert: the
+  // conversion toggle). The pool covers the swappable slots:
+  // regular slots + the Exilus slot. The aura slot stays out (its
+  // own selector, constant across an item's configs) and so does
+  // any stance concept (frames have none). Preference order is
+  // structural: (1) free matches against the pool — the exilus mod
+  // now free-matches too, against units left after the normal mods
+  // (its slot joins the rearrangement: Update 38.5.3 made the
+  // Exilus slot swappable), the donor seat recorded for placement;
+  // (2) new forma on unpolarized slots, as before; (3) only with
+  // the toggle on, CONVERSIONS: re-polarize a starting-pool unit
+  // into an unmatched mod's polarity for +1 forma each (charged
+  // against the same budget), only while every seat is already
+  // polarized and the fit is still invalid. The declared pool is
+  // never altered; conversions consume units for this fit only.
+  // Units are consumed excess-first (pool units beyond the seat
+  // count), then the Exilus seat's unit, then normal-seat units —
+  // the order that leaves the most polarized normal seats for the
+  // leftover arrangement pricedCost models.
+  var POOL_VOCAB = {
+    Madurai: 1, Naramon: 1, Vazarin: 1, Zenurik: 1,
+    Penjaga: 1, Unairu: 1, Umbra: 1, Universal: 1
+  };
+  var POOL_VOCAB_ORDER = ['Madurai', 'Naramon', 'Vazarin', 'Zenurik',
+    'Penjaga', 'Unairu', 'Umbra', 'Universal'];
+  function poolCountsOf(poolArr, innateCounts) {
+    var counts = {};
+    if (Array.isArray(poolArr)) {
+      poolArr.forEach(function (p) {
+        if (POOL_VOCAB[p]) counts[p] = (counts[p] || 0) + 1;
+      });
+      return counts;
+    }
+    Object.keys(innateCounts).forEach(function (p) {
+      counts[p] = innateCounts[p];
+    });
+    return counts;
+  }
+  // The item's current arrangement derived from a pool: keep every
+  // innate seat whose polarity the pool still owns, then seat the
+  // remaining units (vocabulary order) on the remaining seats in
+  // ascending order — the Exilus seat, last in the array, fills
+  // last. Seeded pool ⇒ arrangement == innate, exactly.
+  function arrangePool(innateArr, poolCounts) {
+    var left = {};
+    Object.keys(poolCounts).forEach(function (p) { left[p] = poolCounts[p]; });
+    var out = innateArr.map(function (p) {
+      if (p && left[p] > 0) { left[p]--; return p; }
+      return null;
+    });
+    POOL_VOCAB_ORDER.forEach(function (p) {
+      for (var i = 0; i < out.length && left[p] > 0; i++) {
+        if (out[i] === null) { out[i] = p; left[p]--; }
+      }
+    });
+    return out;
+  }
+  // v1.9.0: rearrangement guidance from a fit's derived plan.
+  // Seats whose shown polarity differs from the item's current
+  // arrangement (basePols) without any forma spent there are pure
+  // rearrangement. Exact inverse pairs read as swaps ("X polarity
+  // swapped for Y") or, when one side is unpolarized, as a move;
+  // anything else is listed per seat. Granularity is honest: the
+  // pool is a multiset, so guidance names polarities and seats
+  // only where the derived plan itself pins them.
+  function swapLinesFor(basePols, planPols, formaSeatSet, exilusIndex) {
+    function seatLabel(i) {
+      return i === exilusIndex ? 'the Exilus slot' : 'slot ' + (i + 1);
+    }
+    var diffs = [];
+    for (var i = 0; i < planPols.length; i++) {
+      if (formaSeatSet[i]) continue;
+      var b = basePols[i] || null, p = planPols[i] || null;
+      if (b !== p) diffs.push({ slot: i, from: b, to: p });
+    }
+    var lines = [], used = {};
+    diffs.forEach(function (d) {
+      if (used[d.slot]) return;
+      var pair = null;
+      diffs.forEach(function (e) {
+        if (!pair && e.slot !== d.slot && !used[e.slot] &&
+            e.from === d.to && e.to === d.from) pair = e;
+      });
+      if (!pair) return;
+      used[d.slot] = used[pair.slot] = true;
+      if (d.from && d.to) {
+        lines.push(d.from + ' polarity swapped for ' + d.to +
+          ' — rearrange the polarities you already have; no Forma needed.');
+      } else {
+        var pol = d.from || d.to;
+        var fromSeat = d.from ? d.slot : pair.slot;
+        var toSeat = d.from ? pair.slot : d.slot;
+        lines.push(pol + ' polarity moved from ' + seatLabel(fromSeat) +
+          ' to ' + seatLabel(toSeat) + ' — no Forma needed.');
+      }
+    });
+    diffs.forEach(function (d) {
+      if (used[d.slot]) return;
+      used[d.slot] = true;
+      lines.push('Slot ' + (d.slot + 1) + ' polarity: ' +
+        (d.from || 'none') + ' → ' + (d.to || 'none') +
+        ' (rearrangement of the polarities you already have).');
+    });
+    return lines;
+  }
+  function fitCapacity(ctx, frame, state, formaBudget, reactor, umbraForma, auraOpts, poolOpts) {
     // Necramech/Companion items carry _slotCount/_baseCapacity markers
     // (set in solve): their capacity is rank-cap based, not reactor based.
     var slotCount = frame._slotCount || 8;
@@ -1727,7 +1835,8 @@
     var auraFormaUsed = 0;
     var capacityMax = (typeof frame._baseCapacity === 'number'
       ? frame._baseCapacity : (reactor ? 60 : 30)) + auraBonus;
-    var slotPols = (frame.Polarities || []).slice(0, slotCount);
+    var slotPols = (frame.Polarities || []).slice(0, slotCount)
+      .map(function (p) { return (p && p !== 'None') ? p : null; });
     while (slotPols.length < slotCount) slotPols.push(null);
 
     var chosen = Object.keys(state.mods).map(function (name) {
@@ -1741,6 +1850,65 @@
       if (exMod) exEntry = { name: state.exilusMod.name, mod: exMod, rank: state.exilusMod.rank };
     }
     var all = exEntry ? chosen.concat([exEntry]) : chosen.slice();
+
+    // v1.9.0 (#25): the Starting Pool for this item and the current
+    // arrangement derived from it (see the header note).
+    var seatsTotal = slotCount + (exEntry ? 1 : 0);
+    var innateArr = exEntry ? slotPols.concat([null]) : slotPols.slice();
+    var innateCounts = {};
+    slotPols.forEach(function (p) {
+      if (p) innateCounts[p] = (innateCounts[p] || 0) + 1;
+    });
+    var poolDeclared = !!(poolOpts && Array.isArray(poolOpts.pool));
+    var poolCounts = poolCountsOf(poolDeclared ? poolOpts.pool : null,
+      innateCounts);
+    var poolTotal = 0;
+    Object.keys(poolCounts).forEach(function (p) { poolTotal += poolCounts[p]; });
+    var basePols = arrangePool(innateArr, poolCounts);
+    // Forma already in: declared pool units beyond the innate set.
+    var formaAlreadyIn = 0;
+    Object.keys(poolCounts).forEach(function (p) {
+      formaAlreadyIn += Math.max(0, poolCounts[p] - (innateCounts[p] || 0));
+    });
+    // Unit consumption by matches, tracked by source (excess units
+    // beyond the seat count, the Exilus seat's unit, normal-seat
+    // units) so pricedCost's seat accounting stays exact.
+    var seatedUnits = 0;
+    basePols.forEach(function (p) { if (p) seatedUnits++; });
+    var excessLeft = {}, normalLeft = {};
+    Object.keys(poolCounts).forEach(function (p) {
+      var seated = 0;
+      basePols.forEach(function (q) { if (q === p) seated++; });
+      excessLeft[p] = poolCounts[p] - seated;
+    });
+    for (var bsi = 0; bsi < slotCount; bsi++) {
+      if (basePols[bsi]) {
+        normalLeft[basePols[bsi]] = (normalLeft[basePols[bsi]] || 0) + 1;
+      }
+    }
+    var exilusUnitLeft = exEntry ? basePols[slotCount] : null;
+    function consumeUnit(p) {
+      if ((excessLeft[p] || 0) > 0) { excessLeft[p]--; return 'excess'; }
+      if (exEntry && exilusUnitLeft === p) {
+        exilusUnitLeft = null; return 'exilus';
+      }
+      if ((normalLeft[p] || 0) > 0) { normalLeft[p]--; return 'normal'; }
+      return null;
+    }
+    function normalUnitsLeft() {
+      var n = 0;
+      Object.keys(normalLeft).forEach(function (p) { n += normalLeft[p]; });
+      return n;
+    }
+    function poolUnitsLeft() {
+      var out = {};
+      Object.keys(poolCounts).forEach(function (p) {
+        var n = (excessLeft[p] || 0) + (normalLeft[p] || 0) +
+          ((exEntry && exilusUnitLeft === p) ? 1 : 0);
+        if (n > 0) out[p] = n;
+      });
+      return out;
+    }
 
     function polOf(c) {
       var p = c.mod.polarity;
@@ -1760,6 +1928,12 @@
 
     var matched = {};                       // modName -> true
     var matchedFree = [], matchedForma = [], matchedUmbra = [];
+    // v1.9.0: conversions ({name, from, to, fromSeat}) — fromSeat is
+    // the consumeUnit source the converted unit came from.
+    var matchedConverted = [];
+    // Set when the exilus mod free-matches: the source its unit came
+    // from ('normal' | 'exilus' | 'excess'), for the placement swap.
+    var exFreeSource = null;
 
     // v1.6.0 (#14): the PRICED cost of the current matched sets,
     // applying drainInSlot's rule through seat accounting. Seats
@@ -1777,8 +1951,14 @@
     // leftover mod's polarity — every mod of that polarity was
     // free-matched first — so any polarized seat a polarized
     // leftover takes is a genuine mismatch.)
+    // v1.9.0: seat accounting runs on the pool's derived
+    // arrangement (basePols), not the innate slots: polarizedSeats
+    // = pool units seated on normal seats; polAfter tracks the
+    // normal-seat units still unconsumed after free matches.
     var polarizedSeats = 0;
-    slotPols.forEach(function (p) { if (p && p !== 'None') polarizedSeats++; });
+    for (var psi = 0; psi < slotCount; psi++) {
+      if (basePols[psi]) polarizedSeats++;
+    }
     var nullSeats = slotCount - polarizedSeats;
     function pricedCost() {
       var total = 0, saved = 0;
@@ -1790,8 +1970,19 @@
       matchedForma.concat(matchedUmbra).forEach(function (n) {
         if (!exEntry || n !== exEntry.name) fSeat++;
       });
+      // v1.9.0: a converted normal mod occupies a normal seat
+      // (whatever source its unit came from, that seat is matched
+      // and unavailable to leftovers); a swap that put a unit back
+      // onto a normal seat (exilus free-match donor) likewise keeps
+      // that seat polarized.
+      var convSeat = 0;
+      matchedConverted.forEach(function (cv) {
+        if (!exEntry || cv.name !== exEntry.name) convSeat++;
+      });
+      var swapBack = (exFreeSource === 'normal' && exEntry &&
+        basePols[slotCount]) ? 1 : 0;
       var nullAfter = nullSeats - Math.min(fSeat, nullSeats);
-      var polAfter = polarizedSeats - matchedFree.length -
+      var polAfter = normalUnitsLeft() + swapBack - convSeat -
         Math.max(0, fSeat - nullSeats);
       var lp = [], lz = 0;
       chosen.forEach(function (c) {
@@ -1805,12 +1996,24 @@
       for (var pi = 0; pi < penCount; pi++) {
         extra += Math.ceil(lp[pi] * 1.25) - lp[pi];
       }
+      // v1.9.0 corner: when every seat ends polarized and the
+      // exilus mod matched nothing, its seat must hold some other
+      // polarity — price the +25% mismatch on it. (A unit of its
+      // own polarity cannot remain: it would have free-matched.
+      // Placement can occasionally do better via a swap chain;
+      // the priced figure is the conservative one.)
+      if (exEntry && !matched[exEntry.name] && polOf(exEntry) &&
+          seatedUnits + matchedForma.length + matchedUmbra.length >=
+            seatsTotal) {
+        extra += Math.ceil(drainOf(exEntry) * 1.25) - drainOf(exEntry);
+      }
       return total - saved + extra;
     }
 
-    // (1) Free matches from the innate pool (normal slots only).
-    var pool = {};
-    slotPols.forEach(function (p) { if (p) pool[p] = (pool[p] || 0) + 1; });
+    // (1) Free matches from the Starting Pool: normal mods first,
+    // per polarity biggest-drain-first against the pool counts;
+    // then the exilus mod against the units that remain (v1.9.0 —
+    // its slot is swappable, so a leftover pool unit serves it).
     var byPol = {};
     chosen.forEach(function (c) {
       var p = polOf(c);
@@ -1818,12 +2021,21 @@
     });
     Object.keys(byPol).forEach(function (p) {
       var list = byPol[p].slice().sort(byDrain);
-      var n = Math.min(pool[p] || 0, list.length);
+      var n = Math.min(poolCounts[p] || 0, list.length);
       for (var i = 0; i < n; i++) {
         matched[list[i].name] = true;
         matchedFree.push(list[i].name);
+        consumeUnit(p);
       }
     });
+    if (exEntry && !matched[exEntry.name] && polOf(exEntry)) {
+      var exPol = polOf(exEntry);
+      if ((poolUnitsLeft()[exPol] || 0) > 0) {
+        exFreeSource = consumeUnit(exPol);
+        matched[exEntry.name] = true;
+        matchedFree.push(exEntry.name);
+      }
+    }
 
     // (2) Forma spend, then the Umbra Forma pass (separate budget).
     // v1.5.3: the aura-match purchase rides this same pass as one
@@ -1845,6 +2057,12 @@
     // so mods keep their order among themselves, and the aura
     // candidate (appended last) loses exact ties to mods.
     spend.sort(function (a, b) { return b.gain - a.gain; });
+    // v1.9.0: additive forma needs a blank seat. Once every seat
+    // is polarized, matching another mod means REPLACING a pool
+    // polarity — a conversion, gated by the toggle in the pass
+    // below — never a plain spend. (The aura purchase consumes no
+    // seat and is not capped.)
+    var additiveCap = seatsTotal - seatedUnits;
     for (var fi = 0; fi < spend.length && pricedCost() > capacityMax && regularUsed < budget; fi++) {
       var sp2 = spend[fi];
       if (sp2.aura) {
@@ -1853,6 +2071,7 @@
         auraSlotPolarity = auraRec.polarity;
         auraFormaUsed = 1;
       } else {
+        if (matchedForma.length >= additiveCap) continue;
         matched[sp2.cand.name] = true;
         matchedForma.push(sp2.cand.name);
       }
@@ -1869,10 +2088,52 @@
       umbraUsedCount++;
     }
 
+    // (2b) v1.9.0: CONVERSIONS — the last resort, only with the
+    // toggle on, only while the fit is still invalid, only when
+    // every seat is already polarized (nothing blank left to forma
+    // — the pass order itself guarantees (a)/(b) were exhausted),
+    // and only against the remaining budget: each conversion
+    // re-polarizes one starting-pool unit into an unmatched mod's
+    // polarity for +1 forma. The source unit is the first remaining
+    // pool unit in vocabulary order (deterministic); a unit of the
+    // mod's own polarity can never be the source (it would have
+    // free-matched). Umbra mods stay Umbra-budget-only: a regular
+    // conversion never produces an Umbra slot.
+    var convUsed = 0;
+    if (poolOpts && poolOpts.convert) {
+      var convCands = all.filter(function (c) {
+        return !matched[c.name] && polOf(c) && polOf(c) !== 'Umbra' &&
+          savingOf(c) > 0;
+      }).sort(bySaving);
+      for (var ci = 0; ci < convCands.length; ci++) {
+        if (pricedCost() <= capacityMax) break;
+        if (regularUsed + convUsed >= budget) break;
+        if (seatedUnits + matchedForma.length + matchedUmbra.length <
+            seatsTotal) break;
+        var leftUnits = poolUnitsLeft();
+        var srcPol = null;
+        for (var vi = 0; vi < POOL_VOCAB_ORDER.length; vi++) {
+          if (leftUnits[POOL_VOCAB_ORDER[vi]] > 0) {
+            srcPol = POOL_VOCAB_ORDER[vi]; break;
+          }
+        }
+        if (!srcPol || srcPol === polOf(convCands[ci])) break;
+        var srcSeat = consumeUnit(srcPol);
+        if (!srcSeat) break;
+        matched[convCands[ci].name] = true;
+        matchedConverted.push({
+          name: convCands[ci].name, from: srcPol,
+          to: polOf(convCands[ci]), fromSeat: srcSeat
+        });
+        convUsed++;
+      }
+    }
+
     // (3) Derived placement. Slot indices: 0..slotCount-1 normal, plus
-    // slotCount for the exilus slot when present.
-    var innatePols = exEntry ? slotPols.concat([null]) : slotPols.slice();
-    var pols = innatePols.slice();
+    // slotCount for the exilus slot when present. v1.9.0: placement
+    // derives from basePols (the pool's current arrangement), not
+    // the innate slots.
+    var pols = basePols.slice();
     var assign = {}; // modName -> slotIndex
     var taken = {};
     function freeSlots(filter) {
@@ -1885,24 +2146,72 @@
     if (exEntry) { assign[exEntry.name] = slotCount; taken[slotCount] = true; }
     var byName = {};
     all.forEach(function (c) { byName[c.name] = c; });
-    // Free-matched mods into innate slots of their polarity.
+    // Free-matched mods into slots of their polarity (the exilus
+    // mod is already pinned; its seat's polarity is resolved with
+    // the donor patch below).
     matchedFree.slice().sort(function (a, b) { return byDrain(byName[a], byName[b]); })
       .forEach(function (name) {
+        if (exEntry && name === exEntry.name) return;
         var c = byName[name];
-        var slots = freeSlots(function (i) { return innatePols[i] === polOf(c); });
-        if (slots.length) { assign[name] = slots[0]; taken[slots[0]] = true; }
-      });
-    // Forma'd mods (incl. Umbra) into remaining slots, non-innate first.
-    matchedForma.concat(matchedUmbra).forEach(function (name) {
-      var c = byName[name];
-      if (name === (exEntry && exEntry.name)) { pols[slotCount] = polOf(c); return; }
-      var slots = freeSlots(function (i) { return !innatePols[i]; });
-      if (!slots.length) slots = freeSlots(function () { return true; });
-      if (slots.length) {
+        var slots = freeSlots(function (i) { return basePols[i] === polOf(c); });
+        if (!slots.length) {
+          // v1.9.0 travel case: the matched unit lives on the
+          // Exilus seat or beyond the seat count — the mod takes
+          // any free slot and its polarity travels with it; the
+          // displaced unit swaps onto the Exilus seat when that
+          // seat still shows its pool unit.
+          slots = freeSlots(function () { return true; });
+          if (slots.length) {
+            var displaced = pols[slots[0]];
+            assign[name] = slots[0]; taken[slots[0]] = true;
+            pols[slots[0]] = polOf(c);
+            if (exEntry && displaced &&
+                pols[slotCount] === basePols[slotCount]) {
+              pols[slotCount] = displaced;
+            }
+          }
+          return;
+        }
         assign[name] = slots[0]; taken[slots[0]] = true;
-        pols[slots[0]] = polOf(c);
+      });
+    // v1.9.0: an exilus free match moves its unit onto the exilus
+    // seat; a unit drawn from a normal seat swaps that seat's
+    // polarity with the exilus seat's previous one (the donor
+    // patch). The donor is the first untaken seat still showing the
+    // matched polarity — multiset-exact; which physical seat the
+    // player swaps with is their choice (the result notes name the
+    // polarity swap, not a seat).
+    if (exEntry && exFreeSource) {
+      var exOldPol = basePols[slotCount];
+      pols[slotCount] = polOf(exEntry);
+      if (exFreeSource === 'normal') {
+        var donor = freeSlots(function (i) {
+          return pols[i] === polOf(exEntry);
+        });
+        if (donor.length) pols[donor[0]] = exOldPol;
       }
-    });
+    }
+    // Forma'd mods (incl. Umbra) into remaining slots, non-innate
+    // first; converted mods prefer the seat holding their source
+    // unit's polarity, then non-innate seats.
+    var convertedByName = {};
+    matchedConverted.forEach(function (cv) { convertedByName[cv.name] = cv; });
+    matchedForma.concat(matchedUmbra,
+      matchedConverted.map(function (cv) { return cv.name; }))
+      .forEach(function (name) {
+        var c = byName[name];
+        if (name === (exEntry && exEntry.name)) { pols[slotCount] = polOf(c); return; }
+        var cv = convertedByName[name];
+        var slots = cv
+          ? freeSlots(function (i) { return basePols[i] === cv.from; })
+          : [];
+        if (!slots.length) slots = freeSlots(function (i) { return !basePols[i]; });
+        if (!slots.length) slots = freeSlots(function () { return true; });
+        if (slots.length) {
+          assign[name] = slots[0]; taken[slots[0]] = true;
+          pols[slots[0]] = polOf(c);
+        }
+      });
     // Leftover mods into the remaining slots, arranged to minimise
     // the v1.6.0 mismatch penalty (mirrors pricedCost's accounting):
     // polarity-less leftovers take polarized seats, the biggest
@@ -1916,11 +2225,11 @@
       if (slots.length) { assign[c.name] = slots[0]; taken[slots[0]] = true; }
     }
     leftovers.filter(function (c) { return !polOf(c); }).forEach(function (c) {
-      takeSlot(c, function (i) { return !!innatePols[i]; });
+      takeSlot(c, function (i) { return !!basePols[i]; });
     });
     leftovers.filter(function (c) { return polOf(c); }).sort(byDrain)
       .forEach(function (c) {
-        takeSlot(c, function (i) { return !innatePols[i]; });
+        takeSlot(c, function (i) { return !basePols[i]; });
       });
 
     var formaPlan = [];
@@ -1930,6 +2239,15 @@
     matchedUmbra.forEach(function (name) {
       if (name in assign) formaPlan.push({ slot: assign[name], polarity: 'Umbra', umbra: true });
     });
+    // v1.9.0: conversion plan entries carry where the polarity
+    // came from (the slot must be re-polarized, not newly forma'd
+    // onto a blank slot — same plan mechanics, honest provenance).
+    matchedConverted.forEach(function (cv) {
+      if (cv.name in assign) {
+        formaPlan.push({ slot: assign[cv.name], polarity: cv.to,
+          convertedFrom: cv.from });
+      }
+    });
     // Per-slot outcome (v1.1): the single source of truth the slot
     // list is derived from — which mod sits in which slot, the slot's
     // final polarity, and the mod's effective drain there.
@@ -1937,7 +2255,7 @@
     all.forEach(function (c) { if (c.name in assign) bySlot[assign[c.name]] = c; });
     var planBySlot = {};
     formaPlan.forEach(function (p) { planBySlot[p.slot] = p; });
-    var slotInfo = innatePols.map(function (innate, i) {
+    var slotInfo = innateArr.map(function (innate, i) {
       var c = bySlot[i] || null;
       var planEntry = planBySlot[i] || null;
       return {
@@ -1946,6 +2264,8 @@
         rank: c ? c.rank : null,
         polarity: pols[i],
         innatePolarity: innate,
+        // v1.9.0: the item's current (pool-derived) polarity here.
+        poolPolarity: basePols[i],
         formaApplied: !!planEntry,
         umbraFormaApplied: !!(planEntry && planEntry.umbra),
         effectiveDrain: c ? drainInSlot(drainOf(c), pols[i], polOf(c)) : 0
@@ -1957,14 +2277,24 @@
       capacityMax: capacityMax,
       // +1 when the Omni toggle is on: the Omni Forma itself (see
       // the header note) — counted in the total, not in the budget.
-      formaUsed: regularUsed + (auraOmni ? 1 : 0),
+      // v1.9.0: conversions are forma spends and count here too.
+      formaUsed: regularUsed + convUsed + (auraOmni ? 1 : 0),
       umbraFormaUsed: umbraUsedCount,
       formaPlan: formaPlan,
       valid: finalCost <= capacityMax,
       assign: assign,
       pols: pols,
       slotInfo: slotInfo,
-      matched: { free: matchedFree, forma: matchedForma, umbra: matchedUmbra },
+      matched: { free: matchedFree, forma: matchedForma, umbra: matchedUmbra,
+        converted: matchedConverted.map(function (cv) { return cv.name; }) },
+      // v1.9.0 (#25): the Starting Pool outcome (see header note).
+      poolDeclared: poolDeclared,
+      poolCounts: poolCounts,
+      formaAlreadyIn: formaAlreadyIn,
+      conversions: matchedConverted.map(function (cv) {
+        return { name: cv.name, from: cv.from, to: cv.to };
+      }),
+      basePols: basePols,
       // v1.5.3: the aura slot's outcome (see the header note).
       auraBonus: auraBonus,
       auraSlotPolarity: auraSlotPolarity,
@@ -2601,7 +2931,9 @@
       var achieved = achievedFrom(ctx, frame, sums);
       var fit = fitCapacity(ctx, frame, state, input.formaBudget,
                             input.reactor !== false, input.umbraForma || 0,
-                            input.omniAura ? { omniAura: true } : null);
+                            input.omniAura ? { omniAura: true } : null,
+                            { pool: input.startingPool || null,
+                              convert: !!input.formaConvert });
       var sc = scoreFn(targets, achieved, fit, state, scoreOpts);
       return { state: state, achieved: achieved, fit: fit, score: sc.score,
                shortfall: sc.shortfall, closestDist: sc.closestDist || 0 };
@@ -3348,6 +3680,31 @@
         }
       });
 
+      // v1.9.0 (#25): Starting Pool reporting — conversions first
+      // (they cost forma), then pure-rearrangement guidance, then
+      // the no-new-forma note for a declared pool.
+      (evRes.fit.conversions || []).forEach(function (cv) {
+        rNotes.push('Forma conversion: the ' + cv.from + ' polarity in ' +
+          'your Starting Pool was converted to ' + cv.to + ' for ' +
+          cv.name + ' (+1 Forma — the last-resort pass; every other ' +
+          'slot was already polarized).');
+      });
+      if (evRes.fit.basePols && evRes.fit.pols) {
+        var formaSeats = {};
+        (evRes.fit.formaPlan || []).forEach(function (p) {
+          formaSeats[p.slot] = true;
+        });
+        var exIdx = evRes.fit.basePols.length > (frame._slotCount || 8)
+          ? (frame._slotCount || 8) : -1;
+        swapLinesFor(evRes.fit.basePols, evRes.fit.pols, formaSeats, exIdx)
+          .forEach(function (n) { rNotes.push(n); });
+      }
+      if (evRes.fit.poolDeclared && evRes.fit.formaUsed === 0 &&
+          !(evRes.fit.conversions || []).length) {
+        rNotes.push('No new Forma needed — this plan works with the ' +
+          'polarities in your Starting Pool as declared.');
+      }
+
       // Ranking costs (Fusion page formula, see rankCostFor): every
       // chosen mod entry carries the Endo/Credits cost from rank 0 to
       // its solved rank; the result totals them.
@@ -3495,6 +3852,10 @@
           } : null,
           formaUsed: evRes.fit.formaUsed,
           umbraFormaUsed: evRes.fit.umbraFormaUsed || 0,
+          // v1.9.0 (#25): the Starting Pool split (see fitCapacity).
+          formaAlreadyIn: evRes.fit.formaAlreadyIn || 0,
+          poolDeclared: !!evRes.fit.poolDeclared,
+          conversions: evRes.fit.conversions || [],
           formaPlan: evRes.fit.formaPlan,
           capacityUsed: evRes.fit.capacityUsed,
           capacityMax: evRes.fit.capacityMax
@@ -3751,6 +4112,19 @@
       (frame.Polarities || []).slice(0, gSlotCount).forEach(function (p) {
         if (p) innateCounts[p] = (innateCounts[p] || 0) + 1;
       });
+      // v1.9.0 (#25): a declared Starting Pool replaces the innate
+      // baseline — the pool formula then prices the board against
+      // the polarities the item actually owns (the pool covers the
+      // Exilus slot too; its assigned polarity is counted above).
+      var gAlreadyIn = 0;
+      if (Array.isArray(pieces.startingPool)) {
+        var poolBaseline = poolCountsOf(pieces.startingPool, {});
+        Object.keys(poolBaseline).forEach(function (p) {
+          gAlreadyIn += Math.max(0,
+            poolBaseline[p] - (innateCounts[p] || 0));
+        });
+        innateCounts = poolBaseline;
+      }
       var inter = 0;
       Object.keys(assigned).forEach(function (p) {
         inter += Math.min(assigned[p], innateCounts[p] || 0);
@@ -3797,6 +4171,10 @@
         capacityUsed: gUsed, capacityMax: gMax,
         formaUsed: (polarized - inter) - gUmbra + gAuraForma + gOmniForma,
         umbraFormaUsed: gUmbra,
+        // v1.9.0: given mode performs no conversions; the split
+        // still reports what the declared pool already covers.
+        formaAlreadyIn: gAlreadyIn,
+        conversions: [],
         valid: gUsed <= gMax,
         auraBonus: gAuraBonus,
         auraSlotPolarity: gAuraSlotPol === null
@@ -3808,7 +4186,9 @@
       fit = fitCapacity(ctx, frame, st,
         pieces.formaBudget != null ? pieces.formaBudget : 'any',
         pieces.reactor !== false, pieces.umbraForma || 0,
-        pieces.omniAura ? { omniAura: true } : null);
+        pieces.omniAura ? { omniAura: true } : null,
+        { pool: pieces.startingPool || null,
+          convert: !!pieces.formaConvert });
       plan = fit.matched || null;
     }
     if (!fit.valid) {
@@ -3837,6 +4217,10 @@
       capacityMax: fit.capacityMax,
       formaUsed: fit.formaUsed,
       umbraFormaUsed: fit.umbraFormaUsed || 0,
+      // v1.9.0 (#25): the Starting Pool split for the board line.
+      formaAlreadyIn: fit.formaAlreadyIn || 0,
+      conversions: fit.conversions || [],
+      poolCounts: fit.poolCounts || null,
       valid: fit.valid,
       warnings: warnings,
       plan: plan,
