@@ -391,6 +391,36 @@
         </div>
         <p class="muted">One Omni Forma makes the Aura slot match any Aura polarity (full doubled capacity bonus). A yes/no choice — the slot can also be Forma'd to a specific polarity from the board instead.</p>
       </div>
+      <div id="pool-block">
+        <h3>Starting Pool — <span id="pool-item-name"></span></h3>
+        <p class="muted" id="pool-note"></p>
+        <div id="pool-entries"></div>
+        <label class="field">
+          <span>Add a polarity</span>
+          <select id="pool-add">
+            <option value="">Choose…</option>
+            <option>Madurai</option>
+            <option>Naramon</option>
+            <option>Vazarin</option>
+            <option>Zenurik</option>
+            <option>Penjaga</option>
+            <option>Unairu</option>
+            <option>Umbra</option>
+            <option>Universal</option>
+          </select>
+        </label>
+        <button type="button" id="btn-pool-reset" hidden>Reset to innate</button>
+        <p class="muted">The polarities already invested in this item (its regular slots + Exilus slot). The solver rearranges them for free and only plans new Forma beyond them. The Aura slot (and a melee's Stance slot) keep their own selectors — they are never part of the pool.</p>
+      </div>
+      <div id="convert-block">
+        <div class="checks">
+          <label class="check">
+            <input type="checkbox" id="chk-forma-convert">
+            <span>Allow last-resort polarity conversions (+1 Forma each)</span>
+          </label>
+        </div>
+        <p class="muted">Off by default. When on, the solver may convert a Starting Pool polarity into a different one — only when every other slot is already polarized and the build is otherwise unreachable. Each conversion costs +1 Forma and counts against the Forma budget; free rearrangement and new Forma on blank slots are always preferred.</p>
+      </div>
     </div>
   </section>
 
