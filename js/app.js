@@ -2346,7 +2346,7 @@
       li.appendChild(rm);
       ul.appendChild(li);
     });
-    if (!cg.include.length) ul.appendChild(el('li', 'muted', 'No forced cross-gear includes.'));
+    if (!cg.include.length) ul.appendChild(el('li', 'muted', 'No forced cross-gear mod includes.'));
     var xl = $('cg-excludes');
     xl.innerHTML = '';
     cg.exclude.forEach(function (name, i) {
@@ -2360,7 +2360,7 @@
       li.appendChild(rm);
       xl.appendChild(li);
     });
-    if (!cg.exclude.length) xl.appendChild(el('li', 'muted', 'No cross-gear exclusions.'));
+    if (!cg.exclude.length) xl.appendChild(el('li', 'muted', 'No cross-gear mod exclusions.'));
   }
   function addCrossGearInclude() {
     var name = $('cg-include-search').value.trim();
@@ -2701,7 +2701,7 @@
     return (setBonuses || []).map(function (sb) {
       var parts = [sb.focusPieces + ' on this item'];
       if (sb.supportPieces) parts.push(sb.supportPieces + ' support');
-      if (sb.plannedPieces) parts.push(sb.plannedPieces + ' planned cross-gear');
+      if (sb.plannedPieces) parts.push(sb.plannedPieces + ' planned cross-gear mods');
       var line = sb.set + ' — ' + sb.pieces + ' piece' + (sb.pieces === 1 ? '' : 's') +
         ' (' + parts.join(' + ') + ')';
       if (sb.perPiece && sb.perPiece.length === 1 && typeof sb.perPiece[0].value === 'number') {
@@ -3938,7 +3938,7 @@
             (rec && rec.conditional ? ' (conditional)' : '');
         }));
     }
-    groupInto(box, 'Set bonuses (focus + support + planned cross-gear)', setBonusLines(res.setBonuses));
+    groupInto(box, 'Set bonuses (focus + support + planned cross-gear mods)', setBonusLines(res.setBonuses));
     if (collect) {
       normal.forEach(function (m) { collect.push({ name: m.name, kind: 'Mod' }); });
       exilus.forEach(function (m) { collect.push({ name: m.name, kind: 'Exilus mod' }); });
@@ -3964,7 +3964,7 @@
     groupInto(box, 'Exilus', exilus.map(modLine));
     if (arr.stance) groupInto(box, 'Stance / posture', [arr.stance]);
     if (arr.arcane) groupInto(box, 'Arcane', [arr.arcane]);
-    groupInto(box, 'Set bonuses (focus + support + planned cross-gear)', setBonusLines(res.setBonuses));
+    groupInto(box, 'Set bonuses (focus + support + planned cross-gear mods)', setBonusLines(res.setBonuses));
     if (collect) {
       normal.forEach(function (m) { collect.push({ name: m.name, kind: 'Mod' }); });
       exilus.forEach(function (m) { collect.push({ name: m.name, kind: 'Exilus mod' }); });
@@ -4032,7 +4032,7 @@
       if (!sb.plannedPieces) return;
       body.appendChild(el('p', 'muted',
         sb.set + ': ' + sb.pieces + ' pieces total (' + sb.focusPieces +
-        ' on this item + ' + sb.plannedPieces + ' planned cross-gear' +
+        ' on this item + ' + sb.plannedPieces + ' planned cross-gear mods' +
         (sb.supportPieces ? ' + ' + sb.supportPieces + ' legacy support' : '') + ').'));
     });
   }

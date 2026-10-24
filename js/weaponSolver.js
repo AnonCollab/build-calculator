@@ -1477,11 +1477,11 @@
         if (!name || typeof name !== 'string') return;
         var set = ctx.setOfMod[name];
         if (!set) {
-          notes.push('Cross-gear include ' + name + ' skipped: it belongs to no set.');
+          notes.push('Cross-gear Mods include ' + name + ' skipped: it belongs to no set.');
           return;
         }
         if (excludeSetNames[set] || excludeModNames[name] || o.excludedMods[name]) {
-          notes.push('Cross-gear include ' + name + ' skipped: it is excluded.');
+          notes.push('Cross-gear Mods include ' + name + ' skipped: it is excluded.');
           return;
         }
         if (o.focusNames[name]) return;
