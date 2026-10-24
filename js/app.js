@@ -285,7 +285,9 @@
       // v1.9.0: state v13 — startingPools + formaConvert join;
       // older saves migrate to no declared pools (every item
       // seeds from its innate polarities) and the toggle off.
-      version: 13,
+      // v1.10.0: state v14 — crossGearArcanes joins; older saves
+      // migrate to the toggle off.
+      version: 14,
       category: 'Warframe',
       intent: 'window',
       // v1.4: Hybrid burst allowance (1 | 2). routesFrame.augments
@@ -344,6 +346,11 @@
       // [setOrModName] kept out of it. (The v1.0–v1.1 support
       // set-piece counts are gone; old saves drop them.)
       crossGear: { on: true, include: [], exclude: [] },
+      // v1.10.0 (#28): Cross-gear Arcanes — when on, frame solves
+      // CREDIT ability-stat buffs from arcanes on other gear and
+      // report them as a plan (never as slot occupants). Default
+      // OFF; rides state v14 — older saves/codes merge to off.
+      crossGearArcanes: { on: false },
       board: null,
       routesFrame: routesFrame,
       routesWeapon: routesWeapon,
@@ -477,7 +484,7 @@
   function mergeState(base, saved) {
     if (!saved || typeof saved !== 'object') return base;
     try {
-      if (saved.version === 2 || saved.version === 3 || saved.version === 4 || saved.version === 5 || saved.version === 6 || saved.version === 7 || saved.version === 8 || saved.version === 9 || saved.version === 10 || saved.version === 11 || saved.version === 12 || saved.version === 13) {
+      if (saved.version === 2 || saved.version === 3 || saved.version === 4 || saved.version === 5 || saved.version === 6 || saved.version === 7 || saved.version === 8 || saved.version === 9 || saved.version === 10 || saved.version === 11 || saved.version === 12 || saved.version === 13 || saved.version === 14) {
         if (catOf(saved.category).id === saved.category) base.category = saved.category;
         // v1.3: intent arrived in state v5; v2–v4 saves keep the
         // default 'window' (the engines' unset behaviour). v1.4:
@@ -574,6 +581,12 @@
           base.focusSchool = saved.focusSchool;
         }
         mergeCrossGear(base.crossGear, saved.crossGear);
+        // v1.10.0: the Cross-gear Arcanes toggle (v14 field; older
+        // saves keep the off default).
+        if (saved.crossGearArcanes && typeof saved.crossGearArcanes === 'object' &&
+            typeof saved.crossGearArcanes.on === 'boolean') {
+          base.crossGearArcanes.on = saved.crossGearArcanes.on;
+        }
         base.board = mergeBoard(saved.board);
         mergeRoutes(base.routesFrame, saved.routesFrame);
         mergeRoutes(base.routesWeapon, saved.routesWeapon);
@@ -1323,6 +1336,9 @@
     // through their own buttons and saved at edit time).
     var cgCb = $('chk-crossgear');
     if (cgCb) state.crossGear.on = cgCb.checked;
+    // v1.10.0: Cross-gear Arcanes toggle (same panel).
+    var cgaCb = $('chk-crossgear-arcanes');
+    if (cgaCb) state.crossGearArcanes.on = cgaCb.checked;
     // v1.2 Helminth forced choice controls (built for the frame
     // category; values are read whenever the controls exist).
     var hmChoose = $('helm-mode-choose');
@@ -2328,6 +2344,8 @@
     if (!$('chk-crossgear')) return;
     var cg = state.crossGear;
     $('chk-crossgear').checked = !!cg.on;
+    var cgaCb2 = $('chk-crossgear-arcanes');
+    if (cgaCb2) cgaCb2.checked = !!state.crossGearArcanes.on;
     var names = crossGearCandidateNames();
     fillDatalist($('cg-include-list'), names);
     var exNames = Object.keys(SITE.setBonuses.sets).sort().concat(names);
@@ -2551,6 +2569,8 @@
       var fpool = declaredPoolFor(currentItemKey());
       if (fpool) finput.startingPool = fpool;
       if (state.formaConvert) finput.formaConvert = true;
+      // v1.10.0: Cross-gear Arcanes credit toggle (frame solves).
+      if (state.crossGearArcanes.on) finput.crossGearArcanes = true;
       var hc = currentHelminthChoice();
       if (hc) finput.helminthChoice = hc;
       // v1.5: Focus school route — routes.focus = {school}, the
@@ -2579,6 +2599,9 @@
       var mpool = declaredPoolFor(currentItemKey());
       if (mpool) minput.startingPool = mpool;
       if (state.formaConvert) minput.formaConvert = true;
+      // v1.10.0: Necramechs flow through the frame solver — the
+      // credit toggle applies to them too.
+      if (state.crossGearArcanes.on) minput.crossGearArcanes = true;
       applyLocksToInput(minput);
       applyExcludesToInput(minput);
       return { kind: 'frame', input: minput, bundle: BUNDLE };
@@ -2838,6 +2861,10 @@
         }),
         tome: arr.tome || null, helmet: arr.helmet || null,
         subsume: arr.subsume || null,
+        // v1.10.0 (#28): the solve's credited cross-gear arcanes —
+        // board evaluations re-apply exactly this set, so the
+        // board's stats keep the credit the solve reported.
+        crossGearArcanes: (arr.crossGearArcanes || []).slice(),
         // v1.5: the build's Focus pick (kept nodes, post intent) —
         // board evaluations re-apply exactly this set.
         focus: arr.focus || null,
@@ -2940,6 +2967,9 @@
       return window.Solver.evaluateFrame(evalBundle(), boardItemName, {
         slots: slots,
         arcanes: e.arcanes || [], shards: e.shards || [],
+        // v1.10.0: the board's credited cross-gear arcanes ride
+        // along (never as slot arcanes).
+        crossGearArcanes: e.crossGearArcanes || [],
         tome: e.tome, helmet: e.helmet, subsume: e.subsume,
         focus: e.focus || null,
         conditional: e.conditional,
@@ -3231,6 +3261,10 @@
     var e = boardCur.extras;
     if (boardKind === 'frame') {
       (e.arcanes || []).forEach(function (n) { out.push({ name: n, kind: 'Arcane' }); });
+      (e.crossGearArcanes || []).forEach(function (n) {
+        var rec = (SITE.arcanes.arcanes || []).filter(function (a) { return a.name === n; })[0];
+        out.push({ name: n, kind: 'Arcane — cross-gear plan (' + (rec ? rec.type : 'other gear') + ')' });
+      });
       (e.shards || []).forEach(function (sh) {
         out.push({ name: sh.colour + ' Archon Shard', kind: 'Archon Shard (' + sh.tier + ', ' + (FRAME_LABEL[sh.stat] || sh.stat) + ')' });
       });
@@ -3852,6 +3886,7 @@
     $('cheapest-panel').hidden = true;
     $('helminth-card').hidden = true;
     $('crossgear-panel').hidden = true;
+    $('crossgear-arcanes-panel').hidden = true;
     $('peak-line').hidden = true;
     $('sustained-line').hidden = true;
     lastKind = b.kind;
@@ -3938,12 +3973,32 @@
             (rec && rec.conditional ? ' (conditional)' : '');
         }));
     }
+    // v1.10.0 (#28): the credited cross-gear arcanes, in their own
+    // group — visually and textually separate from the Arcanes
+    // group above (those are this item's slot occupants; these are
+    // a plan for OTHER gear, already counted in the stats).
+    var cgaPlan = res.crossGearArcanesPlan || [];
+    if (cgaPlan.length) {
+      groupInto(box, 'Cross-gear Arcanes plan — credited from other gear (NOT in this item\'s arcane slots)',
+        cgaPlan.map(function (p) {
+          var eff = (p.effects || []).map(function (e) {
+            return '+' + fmt(e.value) + (e.unit === 'flat' ? '' : '%') +
+              ' ' + (FRAME_LABEL[e.stat] || e.stat);
+          }).join(', ');
+          return p.arcane + ' → equip on your ' + p.gear +
+            (eff ? ' — ' + eff : '') +
+            (p.conditional ? ' (' + (p.condition || 'conditional') + ')' : '');
+        }));
+    }
     groupInto(box, 'Set bonuses (focus + support + planned cross-gear mods)', setBonusLines(res.setBonuses));
     if (collect) {
       normal.forEach(function (m) { collect.push({ name: m.name, kind: 'Mod' }); });
       exilus.forEach(function (m) { collect.push({ name: m.name, kind: 'Exilus mod' }); });
       if (arr.aura) collect.push({ name: arr.aura, kind: 'Aura' });
       (arr.arcanes || []).forEach(function (n) { collect.push({ name: n, kind: 'Arcane' }); });
+      cgaPlan.forEach(function (p) {
+        collect.push({ name: p.arcane, kind: 'Arcane — cross-gear plan (equip on your ' + p.gear + ')' });
+      });
       (arr.shards || []).forEach(function (s) {
         collect.push({ name: s.colour + ' Archon Shard', kind: 'Archon Shard (' + s.tier + ', ' + (FRAME_LABEL[s.stat] || s.stat) + ')' });
       });
@@ -4037,6 +4092,40 @@
     });
   }
 
+  // v1.10.0 (#28): the Cross-gear Arcanes plan panel — the credited
+  // arcanes and the gear each belongs on. Separate panel, separate
+  // wording: these arcanes are NOT in the solved item's arcane
+  // slots; their buffs are already counted in the stats above.
+  function renderCrossGearArcanesResults(kind, res) {
+    var panel = $('crossgear-arcanes-panel');
+    if (!panel) return;
+    var on = !!lastInput && !!lastInput.crossGearArcanes;
+    if (kind !== 'frame' || !on) { panel.hidden = true; return; }
+    panel.hidden = false;
+    var body = $('crossgear-arcanes-body');
+    body.innerHTML = '';
+    var plan = res.crossGearArcanesPlan || [];
+    if (!plan.length) {
+      body.appendChild(el('p', 'muted',
+        'No cross-gear arcane credits in this solve — the build meets its targets from its own gear alone.'));
+      return;
+    }
+    var ul = el('ul', 'plain');
+    plan.forEach(function (p) {
+      var eff = (p.effects || []).map(function (e) {
+        return '+' + fmt(e.value) + (e.unit === 'flat' ? '' : '%') +
+          ' ' + (FRAME_LABEL[e.stat] || e.stat);
+      }).join(', ');
+      ul.appendChild(el('li', null,
+        p.arcane + ' → equip on your ' + p.gear +
+        (eff ? ' (' + eff + ')' : '') +
+        (p.conditional ? ' — ' + (p.condition || 'conditional') : '')));
+    });
+    body.appendChild(ul);
+    body.appendChild(el('p', 'muted',
+      'These buffs are already counted in the stats above. The arcanes stay on their own gear — they do not use this item\'s arcane slots, capacity or Forma.'));
+  }
+
   // ---- v1.3 sustained floor ------------------------------------------
   // Peak is the achieved table as before; when the solve carries a
   // sustained floor (intent set + conditional route on), the targeted
@@ -4123,6 +4212,9 @@
     var e = boardCur.extras || {};
     if (boardKind === 'frame') {
       (e.arcanes || []).forEach(push);
+      // v1.10.0: credited cross-gear arcanes are part of the build's
+      // real rotation — their conditions belong in the guide.
+      (e.crossGearArcanes || []).forEach(push);
       if (e.tome) push(e.tome);
       if (e.subsume) push(e.subsume.ability);
       if (e.focus && e.focus.nodes) e.focus.nodes.forEach(push);
@@ -4251,6 +4343,7 @@
     renderNotes(res);
     renderHelminthCard(kind, res);
     renderCrossGearResults(kind, res);
+    renderCrossGearArcanesResults(kind, res);
     renderSustained(kind, res);
     var box = $('arrangement');
     box.innerHTML = '';

@@ -340,6 +340,10 @@
         <input type="checkbox" id="chk-crossgear">
         <span>Plan cross-gear mod set pieces — the solver names specific mods on specific support gear to complete reachable set bonuses, and planned pieces count in the set totals immediately (support gear is treated as already built).</span>
       </label>
+      <label class="check">
+        <input type="checkbox" id="chk-crossgear-arcanes">
+        <span>Credit cross-gear arcanes — frame solves may count ability-stat buffs from arcanes equipped on your OTHER gear (for example a Kitgun arcane), reported as a plan naming the arcane and its gear. Credited arcanes never occupy this item's arcane slots and cost no capacity or Forma. Off by default.</span>
+      </label>
       <div id="crossgear-controls">
         <label class="field">
           <span>Force-include a cross-gear mod (gear shown from its type)</span>
@@ -509,6 +513,11 @@
         <h2>Cross-gear Mods plan</h2>
         <p class="muted">Specific mods to build on your support gear so this build's set bonuses complete. Planned pieces already count in the set totals above.</p>
         <div id="crossgear-body"></div>
+      </div>
+      <div class="panel" id="crossgear-arcanes-panel" hidden>
+        <h2>Cross-gear Arcanes plan</h2>
+        <p class="muted">Arcanes on your other gear whose buffs this build is counting on. They are credited in the stats above but stay on their own gear — not in this item's arcane slots.</p>
+        <div id="crossgear-arcanes-body"></div>
       </div>
       <div class="panel" id="cheapest-panel" hidden>
         <h2>Cheapest variant</h2>

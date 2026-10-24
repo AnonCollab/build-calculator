@@ -47,6 +47,14 @@
  *    (4 bits each, the POLARITIES table). Decoders gate the block
  *    on version >= 6; v≤5 payloads gain the defaults (toggle off,
  *    no declared pools — every item seeds from its innate slots).
+ *    v7 (v1.10.0) appends one more bit after the v6 block (the v6
+ *    payload stays a strict prefix): the Cross-gear Arcanes toggle.
+ *    Frame board extras also gain a trailing field at v7 — the
+ *    credited cross-gear arcane names (count + arcane indices,
+ *    gated on version >= 7 inside the board reader, exactly like
+ *    the v2 weapon over-rank field); v≤6 boards gain the empty
+ *    default. Decoders emit the v14 state; v≤6 payloads gain
+ *    crossGearArcanes off and no credited board arcanes.
  *  - Checksum: a digit-polynomial over the base62 body
  *    (h = (h*33 + digit) mod 3844 = 62^2), rendered as the final 2
  *    base62 chars and verified BEFORE any field is parsed — a
@@ -61,11 +69,12 @@
  *    otherwise vanish).
  *  - Canonical form: fields at their defaults cost only their flag /
  *    mode bits (dontcare targets, empty wallet colours, absent board,
- *    ...). The decoder re-expands everything to a full v13 state
+ *    ...). The decoder re-expands everything to a full v14 state
  *    (older payloads gain the later defaults: omniAura false,
  *    movement targets dontcare; v4 payloads gain the migrated
  *    glide/latch pair; v≤5 payloads gain formaConvert false and no
- *    declared Starting Pools).
+ *    declared Starting Pools; v≤6 payloads gain the Cross-gear
+ *    Arcanes toggle off).
  *  - encode() returns null (never throws, never guesses) when a state
  *    carries something the schema cannot name — the app then falls
  *    back to the legacy long link. Documented refusals: names absent
@@ -76,7 +85,8 @@
  *    unknown board-extras keys (extras pass through the app's state
  *    merge untouched, so an unmodelled key is real user data), and
  *    values outside the enumerated domains (forma budget, itemKind,
- *    a Starting Pool entry that is not one of the eight polarities).
+ *    a Starting Pool entry that is not one of the eight polarities,
+ *    board cross-gear arcanes > 7).
  *  - One derived field: board extras' companionEntry (the assembled
  *    MOA/Hound entry) is a pure function of state.parts + the shipped
  *    modular data, both of which travel in the code / the site
@@ -91,7 +101,7 @@
   'use strict';
 
   var B62 = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
-  var SCHEMA_VERSION = 6;
+  var SCHEMA_VERSION = 7;
 
   // Fixed enums (mirror site/js/app.js — the category order is the
   // app's CATEGORIES order; stat lists are the app's target stores).
@@ -163,7 +173,9 @@
   var NUMCHARS = '0123456789.-+eE ';
   var FRAME_EXTRAS_KEYS = ['arcanes', 'shards', 'tome', 'helmet',
     'subsume', 'focus', 'conditional', 'formaBudget', 'umbraForma',
-    'itemKind', 'companionEntry', 'ownerStats', 'supportSetPieces'];
+    'itemKind', 'companionEntry', 'ownerStats', 'supportSetPieces',
+    // v7 (v1.10.0): credited cross-gear arcane names on frame boards.
+    'crossGearArcanes'];
   var WEAPON_EXTRAS_KEYS = ['arcane', 'conditional', 'formaBudget',
     'umbraForma', 'stance', 'progenitor', 'attackIndex', 'weaponName',
     'overRankForma'];
@@ -515,8 +527,15 @@
           w.w(c, 4);
         });
       }
+      // v7 (v1.10.0): trailing field — the board's credited
+      // cross-gear arcane names. The encoder always writes v7, so
+      // this always lands; the reader gates it on the payload
+      // version (v≤6 boards end at supportSetPieces).
+      var cga = x.crossGearArcanes || [];
+      wCount(w, cga.length, 3, 'board cross-gear arcanes');
+      cga.forEach(function (n) { w.wIndex('arcanes', n); });
     }
-    function rFrameExtras(r) {
+    function rFrameExtras(r, version) {
       var x = {}, i, n = r.r(3);
       x.arcanes = [];
       for (i = 0; i < n; i++) x.arcanes.push(r.rIndex('arcanes'));
@@ -555,6 +574,13 @@
         x.supportSetPieces = {};
         for (i = 0; i < sc; i++) x.supportSetPieces[r.rIndex('sets')] = r.r(4);
       } else x.supportSetPieces = null;
+      // v7 (v1.10.0): trailing credited cross-gear arcane names;
+      // v≤6 payloads gain the empty default.
+      x.crossGearArcanes = [];
+      if (version >= 7) {
+        var nc = r.r(3);
+        for (i = 0; i < nc; i++) x.crossGearArcanes.push(r.rIndex('arcanes'));
+      }
       return x;
     }
     function wWeaponExtras(w, x, catId, selections, parts) {
@@ -701,7 +727,7 @@
         }
         slots.push(slot);
       }
-      var extras = kind === 'frame' ? rFrameExtras(r) :
+      var extras = kind === 'frame' ? rFrameExtras(r, version) :
         rWeaponExtras(r, catId, selections, parts, version);
       return { kind: kind, catId: catId, itemKey: itemKey, slots: slots, extras: extras };
     }
@@ -896,6 +922,9 @@
           w.w(pi, 4);
         });
       });
+      // v7 (v1.10.0): the Cross-gear Arcanes toggle — one trailing
+      // bit after the v6 block (the v6 payload stays a prefix).
+      w.wBool(!!(state.crossGearArcanes && state.crossGearArcanes.on));
       return w.acc;
     }
 
@@ -904,7 +933,7 @@
       if (version < 1 || version > SCHEMA_VERSION) {
         throw CodecError('unsupported share code version ' + version);
       }
-      var st = { version: 13 };
+      var st = { version: 14 };
       st.category = CATEGORIES[r.r(4)];
       var intent = r.r(2);
       st.intent = intent === 1 ? 'upkeep' : intent === 2 ? 'hybrid' : 'window';
@@ -1030,6 +1059,9 @@
           st.startingPools[pkey] = parr;
         }
       }
+      // v7 (v1.10.0): the Cross-gear Arcanes toggle; v≤6 payloads
+      // end at the v6 block and gain the off default.
+      st.crossGearArcanes = { on: version >= 7 ? r.rBool() : false };
       if (r.remaining() !== 0) {
         throw CodecError('share code is malformed (trailing bits)');
       }
