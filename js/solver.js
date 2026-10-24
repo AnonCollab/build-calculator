@@ -637,6 +637,24 @@
     return !!(r && r.class === 'burst');
   }
 
+  // v1.10.0 (#28): the gear an arcane type is equipped on, in plain
+  // words — used by the cross-gear arcanes plan ("equip on your …").
+  function arcaneGearLabel(type) {
+    switch (type) {
+      case 'Kitgun': return 'Kitgun secondary';
+      case 'Zaw': return 'Zaw melee';
+      case 'Amp': return 'Amp';
+      case 'Operator': return 'Operator';
+      case 'Melee': return 'Melee weapon';
+      case 'Primary': return 'Primary weapon';
+      case 'Secondary': return 'Secondary weapon';
+      case 'Bow': return 'Bow (primary)';
+      case 'Shotgun': return 'Shotgun (primary)';
+      case 'Tektolyst Artifacts': return 'Tektolyst Artifact';
+      default: return type || 'other gear';
+    }
+  }
+
   // ---- v1.4: restricted pieces + ability augments -------------------
   function baseFrameName(n) { return String(n || '').replace(/ Prime$/, ''); }
 
@@ -847,6 +865,9 @@
         // pools may only field arcanes equippable on the item.
         type: a.type || null,
         conditional: !!a.conditional,
+        // v1.10.0: the condition text rides through for the
+        // cross-gear arcanes plan report.
+        condition: a.condition || null,
         maxRank: typeof a.maxRank === 'number' ? a.maxRank : null,
         // v1.6.1: ability whitelist for gated arcanes (the wiki's
         // Valid Objects list for Arcane Sculptor); null = ungated.
@@ -1054,6 +1075,8 @@
       exilusMod: null, // {name, rank} in the exilus slot, or null
       aura: null,      // aura name
       arcanes: [],     // arcane names (max 2)
+      planArcanes: [], // v1.10.0 (#28): cross-gear arcanes CREDITED from
+                       // other gear (plan only — never slot occupants)
       shards: [],      // {colour, tier, stat, value, unit}
       tome: null,      // tome name
       helmet: null,    // legacy helmet name
@@ -1071,7 +1094,10 @@
     }).join(',');
     return [mods, ex, s.aura || '', s.arcanes.slice().sort().join(','), shards,
             s.tome || '', s.helmet || '', s.subsume ? s.subsume.ability : '',
-            wal].join('|');
+            wal,
+            // v1.10.0: credited plan arcanes are part of a state's
+            // identity (two states differing only by a credit differ).
+            (s.planArcanes || []).slice().sort().join(',')].join('|');
   }
   // Total mods placed (normal slots + exilus slot).
   function modCount(s) {
@@ -1159,6 +1185,22 @@
         // v1.6.1: a lock effect SETS its stat (achievedFrom reads
         // sums[stat].lock) — it never adds to the percent sum.
         if (e.kind === 'lock') { sums[e.stat].lock = e.value; return; }
+        add(e.stat, e.unit, e.value);
+      });
+    });
+    // v1.10.0 (#28): credited cross-gear arcanes. These arcanes sit on
+    // OTHER gear; only their ability-stat effects are credited (an
+    // ability stat exists only on the Warframe, so an arcane granting
+    // one is buffing the frame from its own gear). Generic stats are
+    // never credited — for Operator arcanes they belong to the
+    // Operator. Lock-kind effects never apply from another item.
+    (state.planArcanes || []).forEach(function (name) {
+      var pa = ctx.arcaneByName[name];
+      if (!pa) return;
+      if (pa.conditional && !routes.conditional) return;
+      pa.effects.forEach(function (e) {
+        if (e.kind === 'lock') return;
+        if (ABILITY_STATS.indexOf(e.stat) < 0) return;
         add(e.stat, e.unit, e.value);
       });
     });
@@ -1412,6 +1454,17 @@
     (state.arcanes || []).forEach(function (n) {
       steps.push({ source: n, kind: 'arcane',
         apply: function (p) { p.arcanes.push(n); } });
+    });
+    // v1.10.0 (#28): credited cross-gear arcanes attribute as their
+    // own step kind, right after the item's own arcanes — the chain
+    // shows the credit doing its work without ever reading as a
+    // slot occupant.
+    (state.planArcanes || []).forEach(function (n) {
+      var rec = ctx.arcaneByName[n];
+      steps.push({ source: n + ' — cross-gear plan (' +
+          arcaneGearLabel(rec ? rec.type : null) + ')',
+        kind: 'plan',
+        apply: function (p) { p.planArcanes.push(n); } });
     });
     var groups = [], gidx = {};
     (state.shards || []).forEach(function (sh) {
@@ -2445,6 +2498,12 @@
     // locks override pruning outright, so they sit outside it).
     var hybrid = intent === 'hybrid';
     var burstAllowance = hybrid ? burstAllowanceOf(input) : 0;
+    // v1.10.0 (#28): the Cross-gear Arcanes toggle. Frame solves only
+    // (Warframe + Necramech flow through here; companions solve with
+    // kind 'companion' and are not credited — their own gear is the
+    // build). Absent/false = the pre-feature behaviour exactly.
+    var planCreditOn = !!input.crossGearArcanes &&
+      (kind === 'warframe' || kind === 'necramech');
     // v1.1: Maximize targets split off — the beam solves the hard
     // targets (atleast/closest) exactly as before; Maximize stats are
     // raised afterwards by the fill phase (see fillPhase below).
@@ -2862,6 +2921,26 @@
                a.effects.some(function (e) { return statSet.indexOf(e.stat) >= 0; }) &&
                (!a.conditional || routes.conditional);
       }) : [];
+      // v1.10.0 (#28): the cross-gear arcane CREDIT pool — arcanes
+      // that live on OTHER gear whose modelled effects grant ability
+      // stats (credited as a plan, never slotted). Admission mirrors
+      // the own-arcane discipline exactly: the v1.2 ban list, the
+      // v1.3 Upkeep burst prune and the Conditional route all apply;
+      // the one deliberate difference is that the item's own arcanes
+      // ROUTE does not gate the plan (a Necramech has no arcane
+      // slots, but its pilot's other gear still buffs it the same
+      // way). Generic-stat effects never admit a piece — the credit
+      // itself is ability-stats-only (see walkContributions).
+      var planArcanes = planCreditOn ? ctx.arcanes.filter(function (a) {
+        return a.type && a.type !== 'Warframe' &&
+               !excludedArcaneSet[a.name] && // v1.2 ban
+               !(pruneBurst && isBurst(a.name)) && // v1.3 upkeep
+               a.effects.some(function (e) {
+                 return ABILITY_STATS.indexOf(e.stat) >= 0 &&
+                        statSet.indexOf(e.stat) >= 0;
+               }) &&
+               (!a.conditional || routes.conditional);
+      }) : [];
       // Helminth subsume candidates (S3): dataset entries with
       // modelled effects touching the stat set, donor excluded by
       // base-name family (a frame — or its Prime — can never receive
@@ -2895,7 +2974,8 @@
           });
       var byName = {};
       mods.forEach(function (c) { byName[c.mod.name] = c; });
-      return { mods: mods, arcanes: arcanes, subsumes: subsumes, tomes: tomes,
+      return { mods: mods, arcanes: arcanes, planArcanes: planArcanes,
+               subsumes: subsumes, tomes: tomes,
                auras: auras, shardPicks: shardPicks, helmets: helmets, byName: byName };
     }
     // v1.5: a channelDrain target admits the pieces that FEED the
@@ -2935,6 +3015,12 @@
           !(forcedChoice && st.subsume.ability === forcedChoice.donor)) {
         out.push(st.subsume.ability);
       }
+      // v1.10.0: credited plan arcanes are always solver-chosen (no
+      // lock path exists for them), so a burst-class one spends the
+      // Hybrid allowance exactly like an own piece.
+      (st.planArcanes || []).forEach(function (n) {
+        if (isBurst(n)) out.push(n);
+      });
       return out;
     }
     function solverBurstCount(st) { return solverBurstNames(st).length; }
@@ -2997,6 +3083,25 @@
           // include one of its listed abilities.
           if (!arcaneEligibleOn(a, effectiveAbilities(frameAbilities, state.subsume))) return;
           var ns = clone(state); ns.arcanes.push(a.name); out.push(ns);
+        });
+      }
+      // v1.10.0 (#28): cross-gear arcane credits — at most ONE
+      // credited arcane per gear type (an item fields one arcane),
+      // and a credit costs no slot, capacity or Forma, so it is a
+      // pure state addition. The Hybrid allowance filter below sees
+      // these moves too (solverBurstNames counts plan pieces).
+      if (cand.planArcanes && cand.planArcanes.length) {
+        var creditedTypes = {};
+        (state.planArcanes || []).forEach(function (n) {
+          var rec = ctx.arcaneByName[n];
+          if (rec) creditedTypes[rec.type] = true;
+        });
+        cand.planArcanes.forEach(function (a) {
+          if ((state.planArcanes || []).indexOf(a.name) >= 0) return;
+          if (creditedTypes[a.type]) return;
+          var ns = clone(state);
+          ns.planArcanes = (ns.planArcanes || []).concat([a.name]);
+          out.push(ns);
         });
       }
       // Tome (single pick)
@@ -3532,6 +3637,9 @@
         slots.push({ kind: 'exilus', mod: st.exilusMod.name, rank: st.exilusMod.rank });
       }
       var keptArcanes = st.arcanes.filter(keep);
+      // v1.10.0: credited plan arcanes strip the same way (a burst
+      // plan piece drops out of the floor; a kept one stays credited).
+      var keptPlanArcanes = (st.planArcanes || []).filter(keep);
       var keptTome = (st.tome && keep(st.tome)) ? st.tome : null;
       var keptSubsume = st.subsume || null;
       if (keptSubsume && !keep(keptSubsume.ability)) keptSubsume = null;
@@ -3548,6 +3656,7 @@
       if (!hasBurst) return null;
       var ev = evaluateFrame(data, input.frameName, {
         slots: slots, arcanes: keptArcanes,
+        crossGearArcanes: keptPlanArcanes,
         shards: st.shards.map(function (s) {
           return { colour: s.colour, tier: s.tier, stat: s.stat };
         }),
@@ -3829,6 +3938,33 @@
           (hybridBurst.length ? ' — ' + hybridBurst.join(', ') : '') + '.');
       }
 
+      // v1.10.0 (#28): the cross-gear arcanes plan for this build —
+      // the credited arcanes and the gear each must be equipped on.
+      // Presentation data only; the credit itself already lives in
+      // `achieved` via walkContributions. The plan NEVER feeds the
+      // arrangement's own arcane slots.
+      var planReport = (st.planArcanes || []).map(function (n) {
+        var rec = ctx.arcaneByName[n];
+        return {
+          arcane: n,
+          gear: arcaneGearLabel(rec ? rec.type : null),
+          type: rec ? rec.type : null,
+          effects: rec ? rec.effects.filter(function (e) {
+            return ABILITY_STATS.indexOf(e.stat) >= 0 && e.kind !== 'lock';
+          }).map(function (e) {
+            return { stat: e.stat, value: e.value, unit: e.unit };
+          }) : [],
+          conditional: !!(rec && rec.conditional),
+          condition: rec ? (rec.condition || null) : null
+        };
+      });
+      if (planReport.length) {
+        rNotes.push('Cross-gear Arcanes plan: ' + planReport.map(function (p) {
+          return p.arcane + ' (equip on your ' + p.gear + ')';
+        }).join(', ') + ' — credited toward this build\'s stats from ' +
+          'your other gear; not in this item\'s arcane slots.');
+      }
+
       return {
         achieved: achieved,
         // v1.5: the tracked channel this build's drain belongs to
@@ -3843,12 +3979,17 @@
         sustained: sustainedFor(st),
         hybridBurst: hybridBurst,
         crossGearPlan: cg.plan,
+        crossGearArcanesPlan: planReport,
         arrangement: {
           mods: costedMods,
           slots: slots,
           origins: org || null,
           aura: st.aura || null,
           arcanes: st.arcanes.slice(),
+          // v1.10.0 (#28): credited cross-gear arcane NAMES (the
+          // board carries these so its re-scores keep the credit;
+          // they are not, and never render as, slot arcanes).
+          crossGearArcanes: (st.planArcanes || []).slice(),
           shards: st.shards.map(function (s, i) {
             return { colour: s.colour, tier: s.tier, stat: s.stat,
                      origin: org ? org.shards[i] : 'target' };
@@ -3943,6 +4084,13 @@
       if (origins.subsume === 'fill' && chosenEv.state.subsume) {
         result.fillPieces.push({ kind: 'subsume', name: chosenEv.state.subsume.ability });
       }
+      // v1.10.0: plan credits the fill phase added (origins does not
+      // track them; the anchor diff names them exactly).
+      (chosenEv.state.planArcanes || []).forEach(function (n) {
+        if ((anchorEv.state.planArcanes || []).indexOf(n) < 0) {
+          result.fillPieces.push({ kind: 'planArcane', name: n });
+        }
+      });
       result.notes.push('Fill phase (Maximize: ' +
         maximizeList.map(function (m) { return m.stat; }).join(', ') +
         ') spent leftover slots/capacity/Forma on ' + result.fillPieces.length +
@@ -3960,6 +4108,7 @@
         setBonuses: ch.setBonuses, unmetTargets: ch.unmetTargets,
         totalRankCost: ch.totalRankCost,
         breakdown: ch.breakdown, crossGearPlan: ch.crossGearPlan,
+        crossGearArcanesPlan: ch.crossGearArcanesPlan,
         sustained: ch.sustained,
         hybridBurst: ch.hybridBurst,
         channel: ch.channel
@@ -4067,6 +4216,25 @@
       if (!ctx.arcanes.some(function (a) { return a.name === n; })) {
         warnings.push('Arcane "' + n + '" has no modelled effects; it occupies a slot only.');
       }
+    });
+    // v1.10.0 (#28): cross-gear arcane credits handed to the
+    // evaluator (the board's credited set, or a solve's sustained
+    // floor). Names only — the walk credits their ability-stat
+    // effects. A Warframe-type name is not a cross-gear credit and
+    // an unknown name credits nothing; both warn, never silently
+    // apply.
+    st.planArcanes = [];
+    (pieces.crossGearArcanes || []).forEach(function (n) {
+      var rec = ctx.arcaneByName[n];
+      if (rec && rec.type && rec.type !== 'Warframe') {
+        if (st.planArcanes.indexOf(n) < 0) st.planArcanes.push(n);
+        return;
+      }
+      var known = ((data.arcaneEffects && data.arcaneEffects.arcanes) || [])
+        .some(function (a) { return a.name === n; });
+      warnings.push(known
+        ? 'Cross-gear arcane "' + n + '" is not an other-gear arcane with modelled ability effects; it is not credited.'
+        : 'Cross-gear arcane "' + n + '" is not a known arcane; it credits nothing.');
     });
     (pieces.shards || []).forEach(function (sh) {
       var pick = null;
