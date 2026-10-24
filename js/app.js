@@ -282,7 +282,10 @@
       // v1.8.0: state v12 — wallLatch joins frameTargets and the
       // combined aimGlide target's semantics change from percent
       // to seconds; v11 saves migrate in mergeState.
-      version: 12,
+      // v1.9.0: state v13 — startingPools + formaConvert join;
+      // older saves migrate to no declared pools (every item
+      // seeds from its innate polarities) and the toggle off.
+      version: 13,
       category: 'Warframe',
       intent: 'window',
       // v1.4: Hybrid burst allowance (1 | 2). routesFrame.augments
@@ -346,6 +349,15 @@
       routesWeapon: routesWeapon,
       ampConditional: true,
       abilityLocks: {},
+      // v1.9.0: per-item Starting Pools {itemKey: [polarity, …]} —
+      // the polarities already invested in that item. Absent key =
+      // undeclared (the item seeds from its innate polarities).
+      startingPools: {},
+      // v1.9.0: the last-resort polarity-conversion toggle
+      // (solvers may convert a Starting Pool polarity at +1 Forma
+      // each, only when every other slot is polarized and the
+      // build is otherwise unreachable). Default off.
+      formaConvert: false,
       wallet: wallet,
       canFuseCoalescent: false,
       forma: 'any',
@@ -465,7 +477,7 @@
   function mergeState(base, saved) {
     if (!saved || typeof saved !== 'object') return base;
     try {
-      if (saved.version === 2 || saved.version === 3 || saved.version === 4 || saved.version === 5 || saved.version === 6 || saved.version === 7 || saved.version === 8 || saved.version === 9 || saved.version === 10 || saved.version === 11 || saved.version === 12) {
+      if (saved.version === 2 || saved.version === 3 || saved.version === 4 || saved.version === 5 || saved.version === 6 || saved.version === 7 || saved.version === 8 || saved.version === 9 || saved.version === 10 || saved.version === 11 || saved.version === 12 || saved.version === 13) {
         if (catOf(saved.category).id === saved.category) base.category = saved.category;
         // v1.3: intent arrived in state v5; v2–v4 saves keep the
         // default 'window' (the engines' unset behaviour). v1.4:
@@ -571,6 +583,23 @@
             var a = saved.abilityLocks[f];
             if (Array.isArray(a)) base.abilityLocks[f] = a.map(function (x) { return !!x; });
           });
+        }
+        // v1.9.0: Starting Pools — shape-checked entry by entry
+        // (arrays of known polarity names, capped at the largest
+        // seat count); anything malformed is dropped. The
+        // conversion toggle is a plain boolean.
+        if (saved.startingPools && typeof saved.startingPools === 'object') {
+          Object.keys(saved.startingPools).forEach(function (k) {
+            var a = saved.startingPools[k];
+            if (!Array.isArray(a)) return;
+            var clean = a.filter(function (p) {
+              return POOL_POLARITIES.indexOf(p) >= 0;
+            }).slice(0, 12);
+            base.startingPools[k] = clean;
+          });
+        }
+        if (typeof saved.formaConvert === 'boolean') {
+          base.formaConvert = saved.formaConvert;
         }
         // v1.0–v1.1 support set-piece counts are deliberately NOT
         // migrated: v1.2 replaces declared counts with the solver's
@@ -830,6 +859,113 @@
     return state.selections[cat.id] || cat.id;
   }
 
+  // ---- v1.9.0: Starting Pools -------------------------------------------------
+  // The polarity vocabulary for pool entries (the codec's
+  // POLARITIES minus null): what a slot can be polarized to.
+  var POOL_POLARITIES = ['Madurai', 'Naramon', 'Vazarin', 'Zenurik',
+    'Penjaga', 'Unairu', 'Umbra', 'Universal'];
+  // Swappable seats per category kind (regular slots + the Exilus
+  // slot; the aura and stance seats are never in the pool).
+  function poolSeatCap(cat) {
+    if (!cat) return 0;
+    if (cat.kind === 'frame') return 9;
+    if (cat.kind === 'necramech') return 12;
+    if (cat.kind === 'companion') return 10;
+    if (isWeaponKind(cat.kind)) return 9;
+    return 0;
+  }
+  // The seeded pool: the current item's innate polarities over its
+  // swappable slots, as the solvers see them ('None' is no
+  // polarity; a 'Universal' slot value is not something an item is
+  // born owning in this model — Universal comes only from forma).
+  function innatePoolFor(cat, key) {
+    var out = [];
+    function take(list, n) {
+      (list || []).slice(0, n).forEach(function (p) {
+        if (p && p !== 'None' && p !== 'Universal') out.push(p);
+      });
+    }
+    if (!cat || !key) return out;
+    if (cat.kind === 'frame') {
+      var f = SITE.frames.warframes[key];
+      if (f) take(f.polarities, 8); // frames.json: lowercase field
+    } else if (cat.kind === 'necramech') {
+      var m = SITE.frames.necramechs[key];
+      if (m) take(m.Polarities, 12);
+    } else if (cat.kind === 'companion') {
+      var comp = currentCompanion();
+      if (comp && comp.companionEntry) take(comp.companionEntry.Polarities, 10);
+      else if (comp) {
+        var ce = SITE.frames.companions[comp.frameName];
+        if (ce) take(ce.Polarities, 10);
+      }
+    } else if (isWeaponKind(cat.kind)) {
+      var w = currentWeapon();
+      if (w && w.entry) {
+        // The raw store's Polarities is an array, an empty object,
+        // or absent — only the array form carries slot polarities.
+        take(Array.isArray(w.entry.Polarities) ? w.entry.Polarities : [], 8);
+        var xp = w.entry.ExilusPolarity;
+        if (xp && xp !== 'None' && xp !== 'Universal') out.push(xp);
+      }
+    }
+    return out;
+  }
+  function declaredPoolFor(key) {
+    var p = state.startingPools && state.startingPools[key];
+    return Array.isArray(p) ? p.slice() : null;
+  }
+  function boardItemKey() {
+    return (state.board && state.board.itemKey) || currentItemKey();
+  }
+  function renderPoolEditor() {
+    var box = $('pool-entries');
+    if (!box) return;
+    var cat = currentCat();
+    var key = currentItemKey();
+    var declared = declaredPoolFor(key);
+    var pool = declared || innatePoolFor(cat, key);
+    $('pool-item-name').textContent = key || '';
+    $('pool-note').textContent = declared
+      ? 'Custom Starting Pool for this item — the solver plans against these polarities as already invested.'
+      : 'Seeded from this item\u2019s innate polarities \u2014 edit any entry to declare what is actually invested.';
+    $('btn-pool-reset').hidden = !declared;
+    box.innerHTML = '';
+    pool.forEach(function (p, i) {
+      var row = el('div', 'pool-row');
+      var sel = el('select', 'pool-sel');
+      POOL_POLARITIES.forEach(function (name) {
+        var o = el('option', null, name);
+        o.value = name;
+        sel.appendChild(o);
+      });
+      sel.value = p;
+      sel.setAttribute('data-pool-idx', String(i));
+      row.appendChild(sel);
+      var rm = el('button', 'pool-rm', '\u2715');
+      rm.type = 'button';
+      rm.title = 'Remove this polarity from the pool';
+      rm.setAttribute('data-pool-rm', String(i));
+      row.appendChild(rm);
+      box.appendChild(row);
+    });
+    if (!pool.length) {
+      box.appendChild(el('p', 'muted', 'No polarities in the pool \u2014 this item is planned as unpolarized.'));
+    }
+    var add = $('pool-add');
+    add.value = '';
+    add.disabled = pool.length >= poolSeatCap(cat);
+  }
+  function editPool(mutator) {
+    var cat = currentCat();
+    var key = currentItemKey();
+    var pool = (declaredPoolFor(key) || innatePoolFor(cat, key)).slice();
+    mutator(pool);
+    state.startingPools[key] = pool;
+    saveState();
+    renderPoolEditor();
+  }
+
   // ---- control construction -----------------------------------------------------
   function fillSelect(sel, names, value) {
     sel.innerHTML = '';
@@ -1071,8 +1207,10 @@
     $('chk-coalescent').checked = !!state.canFuseCoalescent;
     $('chk-spare-shards').checked = !!state.spareShards;
     $('chk-omni-aura').checked = !!state.omniAura;
+    $('chk-forma-convert').checked = !!state.formaConvert;
     $('sel-forma').value = state.forma === 'any' ? 'any' : String(state.forma);
     $('inp-umbra').value = state.umbraForma;
+    renderPoolEditor();
     $('inp-owner-health').value = state.ownerStats.health;
     $('inp-owner-shield').value = state.ownerStats.shield;
     $('inp-owner-armor').value = state.ownerStats.armor;
@@ -1175,6 +1313,9 @@
     state.spareShards = $('chk-spare-shards').checked;
     // v1.5.3: Omni Forma aura toggle (Forma panel).
     state.omniAura = $('chk-omni-aura').checked;
+    // v1.9.0: conversion toggle (Forma panel). Starting Pools are
+    // edited through their own controls and saved at edit time.
+    state.formaConvert = $('chk-forma-convert').checked;
     var fv = $('sel-forma').value;
     state.forma = fv === 'any' ? 'any' : parseInt(fv, 10);
     state.umbraForma = Math.max(0, parseInt($('inp-umbra').value, 10) || 0);
@@ -1574,6 +1715,7 @@
     refreshTargets();
     refreshRoutes();
     renderViewer();
+    renderPoolEditor(); // v1.9.0: the pool is per-item — follow the item
     // The board hides itself when it belongs to another category/item.
     if (boardCur) refreshBoardUI();
   }
@@ -2379,6 +2521,11 @@
       // v1.5.3: Omni Forma on the aura slot (frame category only —
       // the other kinds have no aura slot).
       if (state.omniAura) finput.omniAura = true;
+      // v1.9.0: the item's declared Starting Pool + the conversion
+      // toggle (no declared pool = the solver seeds from innate).
+      var fpool = declaredPoolFor(currentItemKey());
+      if (fpool) finput.startingPool = fpool;
+      if (state.formaConvert) finput.formaConvert = true;
       var hc = currentHelminthChoice();
       if (hc) finput.helminthChoice = hc;
       // v1.5: Focus school route — routes.focus = {school}, the
@@ -2404,6 +2551,9 @@
         intent: state.intent,
         hybridAllowance: state.hybridAllowance
       };
+      var mpool = declaredPoolFor(currentItemKey());
+      if (mpool) minput.startingPool = mpool;
+      if (state.formaConvert) minput.formaConvert = true;
       applyLocksToInput(minput);
       applyExcludesToInput(minput);
       return { kind: 'frame', input: minput, bundle: BUNDLE };
@@ -2427,6 +2577,9 @@
         intent: state.intent,
         hybridAllowance: state.hybridAllowance
       };
+      var cpool = declaredPoolFor(currentItemKey());
+      if (cpool) cinput.startingPool = cpool;
+      if (state.formaConvert) cinput.formaConvert = true;
       if (comp.companionEntry) cinput.companionEntry = comp.companionEntry;
       if (owner) cinput.ownerStats = owner;
       applyLocksToInput(cinput);
@@ -2449,6 +2602,9 @@
         intent: state.intent,
         hybridAllowance: state.hybridAllowance
       };
+      var wpool = declaredPoolFor(currentItemKey());
+      if (wpool) winput.startingPool = wpool;
+      if (state.formaConvert) winput.formaConvert = true;
       if (w.entry.IsLichWeapon) {
         var pct = Math.min(60, Math.max(25, state.progenitor.percent || 60));
         winput.progenitor = { element: state.progenitor.element, percent: pct };
@@ -2766,6 +2922,11 @@
         // aura slot too (universal match; the Omni Forma itself
         // counts in the board's Forma total).
         omniAura: !!state.omniAura,
+        // v1.9.0: the board's item pool prices its forma (given
+        // mode baseline / pool-fit mode alike), from state — the
+        // pool is per-item state, not board extras.
+        startingPool: declaredPoolFor(boardItemKey()),
+        formaConvert: state.formaConvert,
         formaBudget: e.formaBudget, umbraForma: e.umbraForma || 0,
         reactor: true, itemKind: e.itemKind,
         companionEntry: e.companionEntry, ownerStats: e.ownerStats,
@@ -2778,6 +2939,9 @@
       we.attackIndex || 0, {
         slots: slots, arcane: we.arcane,
         conditional: we.conditional,
+        // v1.9.0: the board's item pool, as on frame boards.
+        startingPool: declaredPoolFor(boardItemKey()),
+        formaConvert: state.formaConvert,
         formaBudget: we.formaBudget, umbraForma: we.umbraForma || 0,
         stance: we.stance !== false,
         // v1.5.2: the board's exilus cell joins the given-mode pool;
@@ -3200,6 +3364,8 @@
         ' · Forma: ' + ev.formaUsed +
         (ev.umbraFormaUsed ? ' · Umbra Forma: ' + ev.umbraFormaUsed : '') +
         (boardKind === 'weapon' && ev.overRankForma ? ' (incl. ' + ev.overRankForma + ' over-rank)' : '') +
+        // v1.9.0: the board's forma split against the declared pool.
+        (ev.formaAlreadyIn ? ' · already in (Starting Pool): ' + ev.formaAlreadyIn : '') +
         rankCapNote +
         (ev.valid ? '' : ' — OVER CAPACITY');
     }
@@ -3388,33 +3554,48 @@
   // cells in board order; an unmatched exilus cell clears to None on
   // frame boards (no innate there) and takes a leftover unit on
   // weapon boards (its innate polarity is part of the weapon pool).
-  function applyFormaPlan(plan, weaponPool) {
-    var free = {}, forma = {}, umbra = {};
+  function applyFormaPlan(plan, weaponPool, poolCounts) {
+    var free = {}, forma = {}, umbra = {}, converted = {};
     plan.free.forEach(function (n) { free[n] = 1; });
     plan.forma.forEach(function (n) { forma[n] = 1; });
     plan.umbra.forEach(function (n) { umbra[n] = 1; });
+    // v1.9.0: converted mods stamp like forma mods (their slot is
+    // re-polarized at +1 Forma — the plan's cost is the same).
+    (plan.converted || []).forEach(function (n) { converted[n] = 1; });
     function modPol(s) {
       var rec = s.mod ? (modRecord(s.mod) || modpoolRec(s.mod)) : null;
       return (rec && rec.polarity && rec.polarity !== 'None') ? rec.polarity : null;
     }
-    // Innate multiset left over after the free matches take theirs.
+    // Pool multiset left over after the free matches take theirs.
+    // v1.9.0: when the fit reports its pool counts (a declared or
+    // seeded Starting Pool), those are the rest; otherwise the
+    // legacy innate-multiset derivation below.
     // v1.6.0: the weapon Exilus seat's innate unit is part of the
     // pool only when an Exilus mod is actually fit (fitWeapon's
     // rule) — counting it for an empty Exilus cell let a phantom
     // unit migrate onto a leftover mod and price it as a mismatch.
     var rest = {};
-    boardCur.slots.forEach(function (s) {
-      if (s.kind === 'normal' && s.innatePolarity) {
-        rest[s.innatePolarity] = (rest[s.innatePolarity] || 0) + 1;
-      }
-      if (weaponPool && s.kind === 'exilus' && s.mod && s.innatePolarity) {
-        rest[s.innatePolarity] = (rest[s.innatePolarity] || 0) + 1;
-      }
-    });
+    if (poolCounts) {
+      Object.keys(poolCounts).forEach(function (p) {
+        rest[p] = poolCounts[p];
+      });
+    } else {
+      boardCur.slots.forEach(function (s) {
+        if (s.kind === 'normal' && s.innatePolarity) {
+          rest[s.innatePolarity] = (rest[s.innatePolarity] || 0) + 1;
+        }
+        if (weaponPool && s.kind === 'exilus' && s.mod && s.innatePolarity) {
+          rest[s.innatePolarity] = (rest[s.innatePolarity] || 0) + 1;
+        }
+      });
+    }
     boardCur.slots.forEach(function (s) {
       // A free-matched exilus mod consumes a pool unit too (weapon
-      // pool only — frame exilus matches are covered by its own flag).
-      if ((s.kind === 'normal' || (weaponPool && s.kind === 'exilus')) &&
+      // pool only — frame exilus matches are covered by its own
+      // flag; under a reported Starting Pool, frame exilus free
+      // matches consume from the pool as well).
+      if ((s.kind === 'normal' || (weaponPool && s.kind === 'exilus') ||
+           (poolCounts && s.kind === 'exilus')) &&
           s.mod && free[s.mod]) {
         var p = modPol(s);
         if (p && rest[p] > 0) rest[p]--;
@@ -3431,6 +3612,7 @@
       s.umbraFormaApplied = false;
       if (s.mod && umbra[s.mod]) { s.slotPolarity = 'Umbra'; s.umbraFormaApplied = true; }
       else if (s.mod && forma[s.mod]) { s.slotPolarity = modPol(s); s.formaApplied = true; }
+      else if (s.mod && converted[s.mod]) { s.slotPolarity = modPol(s); s.formaApplied = true; }
       else if (s.mod && free[s.mod]) { s.slotPolarity = modPol(s); }
       else if (s.kind === 'normal' || (weaponPool && s.kind === 'exilus')) { open.push(s); }
       else { s.slotPolarity = null; }
@@ -3471,11 +3653,14 @@
         e.attackIndex || 0, {
           slots: slots,
           arcane: e.arcane, conditional: e.conditional,
+          // v1.9.0: Re-Forma plans against the item's pool too.
+          startingPool: declaredPoolFor(boardItemKey()),
+          formaConvert: state.formaConvert,
           formaBudget: 'any', umbraForma: 99, stance: e.stance !== false,
           extraModRecords: extraRecordsFor(names)
         }, e.progenitor || null);
       if (!resW || !resW.plan) return false;
-      applyFormaPlan(resW.plan, true);
+      applyFormaPlan(resW.plan, true, resW.poolCounts);
       // The fit's capacity rides on its own over-rank level — keep
       // it on the board so the given-mode line prices the same.
       boardCur.extras.overRankForma = resW.overRankForma || 0;
@@ -3491,6 +3676,9 @@
       // v1.5.3: the fit prices the aura slot under the build's
       // toggle; a purchase it makes is stamped below.
       omniAura: !!state.omniAura,
+      // v1.9.0: Re-Forma plans against the item's pool too.
+      startingPool: declaredPoolFor(boardItemKey()),
+      formaConvert: state.formaConvert,
       formaBudget: 'any', umbraForma: 99,
       reactor: true, itemKind: e.itemKind,
       companionEntry: e.companionEntry, ownerStats: e.ownerStats,
@@ -3498,7 +3686,7 @@
       extraModRecords: extraRecordsFor(names)
     });
     if (!res || !res.plan) return false;
-    applyFormaPlan(res.plan, false);
+    applyFormaPlan(res.plan, false, res.poolCounts);
     // v1.5.3: stamp the fit's aura outcome on the aura cell (the
     // pool plan above never touches it). A purchase stamps its
     // polarity + flag; no purchase leaves the cell at innate.
@@ -3764,8 +3952,18 @@
     if (!arr.formaPlan || !arr.formaPlan.length) return '';
     return 'Forma plan: ' + arr.formaPlan.map(function (f) {
       var slot = weaponKind && f.slot >= 8 ? 'exilus slot' : 'slot ' + (f.slot + 1);
-      return slot + ' → ' + f.polarity + (f.umbra ? ' (Umbra Forma)' : '');
+      return slot + ' → ' + f.polarity +
+        (f.convertedFrom ? ' (converted from ' + f.convertedFrom + ')'
+          : f.umbra ? ' (Umbra Forma)' : '');
     }).join('; ');
+  }
+
+  // v1.9.0 (#25): the forma split for a result arrangement — what
+  // the plan still needs vs what the item's Starting Pool already
+  // covers. Empty unless a pool was declared for the item.
+  function formaSplitText(arr) {
+    if (!arr || !arr.poolDeclared || !(arr.formaAlreadyIn > 0)) return '';
+    return ' · Forma already in (Starting Pool): ' + arr.formaAlreadyIn;
   }
 
   // v1.2: a forced NON-modelled Helminth donor rides as a build
@@ -4043,7 +4241,8 @@
       $('capacity-line').textContent =
         'Mod capacity: ' + arr.capacityUsed + ' / ' + arr.capacityMax +
         ' · Forma used: ' + arr.formaUsed +
-        (arr.umbraFormaUsed ? ' · Umbra Forma used: ' + arr.umbraFormaUsed : '');
+        (arr.umbraFormaUsed ? ' · Umbra Forma used: ' + arr.umbraFormaUsed : '') +
+        formaSplitText(arr);
       $('cost-line').textContent = res.totalRankCost
         ? 'Ranking cost to the solved ranks: ' + fmtInt(res.totalRankCost.endo) + ' Endo / ' +
           fmtInt(res.totalRankCost.credits) + ' Credits'
@@ -4082,7 +4281,8 @@
         'Mod capacity: ' + arr.capacityUsed + ' / ' + arr.capacityMax +
         ' · Forma used: ' + arr.formaUsed +
         (arr.overRankForma ? ' (incl. ' + arr.overRankForma + ' over-rank)' : '') +
-        (arr.umbraFormaUsed ? ' · Umbra Forma used: ' + arr.umbraFormaUsed : '');
+        (arr.umbraFormaUsed ? ' · Umbra Forma used: ' + arr.umbraFormaUsed : '') +
+        formaSplitText(arr);
       $('cost-line').textContent = res.totalRankCost
         ? 'Ranking cost to the solved ranks: ' + fmtInt(res.totalRankCost.endo) + ' Endo / ' +
           fmtInt(res.totalRankCost.credits) + ' Credits'
@@ -4122,7 +4322,8 @@
       var line = 'Capacity: ' + ca.capacityUsed + ' / ' + ca.capacityMax +
         ' · Forma used: ' + ca.formaUsed +
         (ca.overRankForma ? ' (incl. ' + ca.overRankForma + ' over-rank)' : '') +
-        (ca.umbraFormaUsed ? ' · Umbra Forma used: ' + ca.umbraFormaUsed : '');
+        (ca.umbraFormaUsed ? ' · Umbra Forma used: ' + ca.umbraFormaUsed : '') +
+        formaSplitText(ca);
       if (res.cheapest.totalRankCost) {
         line += ' · Ranking cost: ' + fmtInt(res.cheapest.totalRankCost.endo) + ' Endo / ' +
           fmtInt(res.cheapest.totalRankCost.credits) + ' Credits';
@@ -4279,6 +4480,37 @@
         state.omniAura = $('chk-omni-aura').checked;
         saveState();
         if (boardCur && boardKind === 'frame') refreshBoardUI();
+      });
+      // v1.9.0: conversion toggle + Starting Pool editor controls.
+      $('chk-forma-convert').addEventListener('change', function () {
+        state.formaConvert = $('chk-forma-convert').checked;
+        saveState();
+      });
+      $('pool-entries').addEventListener('change', function (e) {
+        var idx = e.target.getAttribute('data-pool-idx');
+        if (idx === null) return;
+        var i = parseInt(idx, 10);
+        var val = e.target.value;
+        if (POOL_POLARITIES.indexOf(val) < 0) return;
+        editPool(function (pool) { pool[i] = val; });
+      });
+      $('pool-entries').addEventListener('click', function (e) {
+        var idx = e.target.getAttribute('data-pool-rm');
+        if (idx === null) return;
+        var i = parseInt(idx, 10);
+        editPool(function (pool) { pool.splice(i, 1); });
+      });
+      $('pool-add').addEventListener('change', function () {
+        var val = $('pool-add').value;
+        if (!val) return;
+        editPool(function (pool) {
+          if (pool.length < poolSeatCap(currentCat())) pool.push(val);
+        });
+      });
+      $('btn-pool-reset').addEventListener('click', function () {
+        delete state.startingPools[currentItemKey()];
+        saveState();
+        renderPoolEditor();
       });
       $('btn-board-reset').addEventListener('click', boardReset);
       $('btn-share').addEventListener('click', function () {
