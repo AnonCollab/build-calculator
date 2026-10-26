@@ -2899,6 +2899,21 @@
           if (e.valuePerRank * (r + 1) >= total / 2) { set[r] = true; break; }
         }
       });
+      // v1.11.0 (#35): densification, FILL ONLY — a mod carrying a
+      // negative effect on a hard-target stat is offered at ALL
+      // ranks, so the fill can pick the exact rank whose penalty a
+      // met floor can absorb (the rank-pruning blind spot: the
+      // bracketing ranks are computed against the gaps of stats the
+      // mod HELPS, never against the floor its negative effect must
+      // respect). The beam's candidateRanks are untouched.
+      var hurtsFloor = mod.effects.some(function (e) {
+        return targetedStats.indexOf(e.stat) >= 0 &&
+               !(e.condition && !routes.conditional) &&
+               e.valuePerRank < 0;
+      });
+      if (hurtsFloor) {
+        for (var r2 = 0; r2 <= mod.maxRank; r2++) set[r2] = true;
+      }
       return Object.keys(set).map(Number).sort(function (a, b) { return a - b; });
     }
     function buildCandidates(statSet, ranksFn, unfilteredHelmets) {
@@ -3471,25 +3486,308 @@
       }
       return out;
     }
+    // ---- v1.11.0 (#35): compensated packages ----------------------
+    // When a fill move would improve the Maximize vector but is
+    // rejected ONLY because it breaches an at-least floor the anchor
+    // holds, the move may be paired with enabler pieces and the
+    // package judged as a whole: the final state must hold every
+    // floor (guardOk vs the anchor) and strictly improve the vector.
+    // Enablers are on-item pieces drawn from the HARD candidate
+    // pools — mods (either slot kind), the aura, the item's own
+    // arcanes — that contribute toward a breached stat, under the
+    // pools' existing discipline (routes, bans, Conditional route,
+    // Upkeep burst pruning; the Hybrid allowance is re-checked on
+    // the finished package). Cross-gear pieces are never enablers,
+    // and neither are tomes, helmets or subsumes. Shards join only
+    // behind input.shardEnablers: every shard spent on one deficit
+    // forms ONE bundle counting as ONE enabler, and a package with
+    // a bundle may carry 3 enablers instead of 2. Packages trigger
+    // only on blocked moves — no speculative surplus-building.
+    // shortcut: enabler mods are offered at max rank only —
+    // compensation wants the full effect; a capacity-tight package
+    // that would need a deranked enabler is out of reach until a
+    // real case demands it.
+    var shardEnablersOn = kind === 'warframe' && !!input.shardEnablers;
+    var PKG_EVAL_BUDGET = 6000; // package evaluateWith calls per solve
+    var PKG_MOVES_PER_ITER = 4; // blocked moves packaged per iteration
+
+    // The at-least floors a candidate state breaches vs the anchor,
+    // or null when the guard fails for any OTHER reason (a closest
+    // distance grows, an anchor-unmet floor gets worse) — the
+    // distinction between "blocked only by floors" and the rest.
+    function breachedFloors(evNew, anchor) {
+      var out = [];
+      for (var i = 0; i < targetedStats.length; i++) {
+        var stat = targetedStats[i], t = targets[stat];
+        if (t.mode === 'atleast' && lowerBetter(stat)) {
+          if (anchor.achieved[stat] <= t.value + 1e-9) {
+            if (evNew.achieved[stat] > t.value + 1e-9) out.push(stat);
+          } else if (evNew.achieved[stat] > anchor.achieved[stat] + 1e-9) return null;
+        } else if (t.mode === 'atleast') {
+          if (anchor.achieved[stat] >= t.value - 1e-9) {
+            if (evNew.achieved[stat] < t.value - 1e-9) out.push(stat);
+          } else if (evNew.achieved[stat] < anchor.achieved[stat] - 1e-9) return null;
+        } else if (t.mode === 'closest') {
+          if (Math.abs(evNew.achieved[stat] - t.value) >
+              Math.abs(anchor.achieved[stat] - t.value) + 1e-9) return null;
+        }
+      }
+      return out;
+    }
+
+    // Enabler moves applicable to a state, best gain first. Each
+    // move: {kind, name, gain, apply(state) -> state | null}.
+    function enablerMoves(state, breached) {
+      var out = [];
+      function dirOf(stat) { return lowerBetter(stat) ? -1 : 1; }
+      function gainOf(effs, perRank) {
+        var g = 0;
+        effs.forEach(function (e) {
+          if (breached.indexOf(e.stat) < 0) return;
+          var v = perRank ? e.valuePerRank : e.value;
+          if (typeof v === 'number' && v * dirOf(e.stat) > 0) {
+            g += Math.abs(v) * (perRank ? 1 : 1);
+          }
+        });
+        return g;
+      }
+      HARD.mods.forEach(function (c) {
+        var g = gainOf(c.mod.effects, true);
+        if (!(g > 0)) return;
+        var maxR = c.mod.maxRank;
+        var full = gainOf(c.mod.effects.map(function (e) {
+          return { stat: e.stat, value: e.valuePerRank * (maxR + 1) };
+        }), false);
+        if (Object.keys(state.mods).length < slotLimit && canPlace(state, c.mod)) {
+          out.push({ kind: 'mod', name: c.mod.name, gain: full,
+            apply: function (st) {
+              if (Object.keys(st.mods).length >= slotLimit) return null;
+              if (!canPlace(st, c.mod)) return null;
+              var ns = clone(st); ns.mods[c.mod.name] = maxR; return ns;
+            } });
+        }
+        if (routes.exilus && c.mod.exilus && !state.exilusMod && canPlace(state, c.mod)) {
+          out.push({ kind: 'exilus', name: c.mod.name, gain: full,
+            apply: function (st) {
+              if (st.exilusMod) return null;
+              if (!canPlace(st, c.mod)) return null;
+              var ns = clone(st);
+              ns.exilusMod = { name: c.mod.name, rank: maxR };
+              return ns;
+            } });
+        }
+      });
+      if (!state.aura) {
+        HARD.auras.forEach(function (a) {
+          var g = gainOf(a.effects, false);
+          if (!(g > 0)) return;
+          out.push({ kind: 'aura', name: a.name, gain: g,
+            apply: function (st) {
+              if (st.aura) return null;
+              var ns = clone(st); ns.aura = a.name; return ns;
+            } });
+        });
+      }
+      if (state.arcanes.length < 2) {
+        HARD.arcanes.forEach(function (a) {
+          var g = gainOf(a.effects, false);
+          if (!(g > 0)) return;
+          out.push({ kind: 'arcane', name: a.name, gain: g,
+            apply: function (st) {
+              if (st.arcanes.length >= 2) return null;
+              if (st.arcanes.indexOf(a.name) >= 0) return null;
+              if (!arcaneEligibleOn(a, effectiveAbilities(frameAbilities, st.subsume))) return null;
+              var ns = clone(st); ns.arcanes.push(a.name); return ns;
+            } });
+        });
+      }
+      out.sort(function (x, y) { return y.gain - x.gain; });
+      return out;
+    }
+
+    // Shard bundle moves (toggle-gated): one move per (pick, tier,
+    // count) — the whole run of shards spent on one deficit is the
+    // bundle, and the bundle is ONE enabler however long the run.
+    function shardBundleMoves(state, breached) {
+      var out = [];
+      if (!shardEnablersOn || !routes.shards) return out;
+      var room = 5 - state.shards.length;
+      if (room <= 0) return out;
+      HARD.shardPicks.forEach(function (p) {
+        if (breached.indexOf(p.stat) < 0 || lowerBetter(p.stat)) return;
+        ['normal', 'tauforged'].forEach(function (tier) {
+          var per = tier === 'tauforged' ? p.tauforged : p.normal;
+          if (!(per > 0)) return;
+          for (var k = 1; k <= room; k++) {
+            (function (count) {
+              out.push({ kind: 'shards', name: p.colour + ' Archon Shard',
+                gain: per * count, count: count,
+                pick: { colour: p.colour, tier: tier, stat: p.stat },
+                apply: function (st) {
+                  var ns = clone(st);
+                  for (var j = 0; j < count; j++) {
+                    var fusion = spendShard(ns.wallet, input.shardWallet, p.colour, tier);
+                    if (fusion === false) return null;
+                    if (fusion) ns.fusions.push(fusion);
+                    ns.shards.push({ colour: p.colour, tier: tier,
+                      stat: p.stat, unit: p.unit, value: per });
+                  }
+                  return ns;
+                } });
+            })(k);
+          }
+        });
+      });
+      out.sort(function (x, y) { return y.gain - x.gain; });
+      return out;
+    }
+
+    // Try to fund one blocked move. Returns the cheapest working
+    // package {ev, record} or null. Tiers ascend by the package cost
+    // key (enabler count — a bundle counts once — then shards-last,
+    // with Spare-the-shards making a bundle cost like an extra
+    // enabler, then fewest added pieces, then lowest added drain);
+    // the first tier holding a success ends the search.
+    function tryPackage(blockedState, breached, cur, budget) {
+      var singles = enablerMoves(blockedState, breached);
+      var bundles = shardBundleMoves(blockedState, breached);
+      var topSingles = singles.slice(0, 16);
+      function judge(ns, enablers, bundle) {
+        if (!ns) return null;
+        if (budget.left-- <= 0) return null;
+        if (hybrid && solverBurstCount(ns) > burstAllowance) return null;
+        var ev = evaluateWith(ns, scoreState);
+        if (!ev.fit.valid) return null;
+        if (!guardOk(ev, anchorEv)) return null;
+        if (!vecGreater(maximizeVector(ev.achieved), maximizeVector(cur.achieved))) return null;
+        var added = 0;
+        Object.keys(ns.mods).forEach(function (n) {
+          if (!(n in blockedState.mods)) added++;
+        });
+        if (ns.aura && !blockedState.aura) added++;
+        added += ns.arcanes.length - blockedState.arcanes.length;
+        if (ns.exilusMod && !blockedState.exilusMod) added++;
+        added += ns.shards.length - blockedState.shards.length;
+        return { ev: ev, enablers: enablers, bundle: bundle,
+          count: enablers.length + (bundle ? 1 : 0),
+          shardTier: bundle ? (spareShards ? 2 : 1) : 0,
+          effCount: enablers.length + (bundle ? 1 : 0) +
+                    (bundle && spareShards ? 1 : 0),
+          addedPieces: added,
+          drainDelta: ev.fit.capacityUsed - cur.fit.capacityUsed };
+      }
+      function bestOf(cands) {
+        var best = null;
+        cands.forEach(function (cd) {
+          var got = judge(cd.state, cd.enablers, cd.bundle);
+          if (!got) return;
+          if (!best || got.effCount < best.effCount ||
+              (got.effCount === best.effCount && got.shardTier < best.shardTier) ||
+              (got.effCount === best.effCount && got.shardTier === best.shardTier &&
+               got.addedPieces < best.addedPieces) ||
+              (got.effCount === best.effCount && got.shardTier === best.shardTier &&
+               got.addedPieces === best.addedPieces &&
+               got.drainDelta < best.drainDelta - 1e-9)) {
+            best = got;
+          }
+        });
+        return best;
+      }
+      function applyAll(base, list) {
+        var st = base;
+        for (var i = 0; i < list.length; i++) {
+          st = list[i].apply(st);
+          if (!st) return null;
+        }
+        return st;
+      }
+      // Tier 1: one enabler, or one bundle alone.
+      var t1 = [];
+      singles.forEach(function (m) {
+        t1.push({ state: m.apply(blockedState), enablers: [m], bundle: null });
+      });
+      bundles.forEach(function (b) {
+        t1.push({ state: b.apply(blockedState), enablers: [], bundle: b });
+      });
+      var got = bestOf(t1);
+      if (got) return got;
+      // Tier 2: two enablers, or a bundle + one enabler.
+      var t2 = [];
+      for (var i = 0; i < topSingles.length; i++) {
+        for (var j = i + 1; j < topSingles.length; j++) {
+          t2.push({ state: applyAll(blockedState, [topSingles[i], topSingles[j]]),
+            enablers: [topSingles[i], topSingles[j]], bundle: null });
+        }
+      }
+      bundles.forEach(function (b) {
+        topSingles.forEach(function (m) {
+          t2.push({ state: applyAll(blockedState, [b, m]),
+            enablers: [m], bundle: b });
+        });
+      });
+      got = bestOf(t2);
+      if (got) return got;
+      // Tier 3 (bundle packages only, per the cap ruling): a bundle
+      // + two enablers.
+      if (bundles.length) {
+        var t3 = [];
+        var topFew = singles.slice(0, 8);
+        bundles.forEach(function (b) {
+          for (var i2 = 0; i2 < topFew.length; i2++) {
+            for (var j2 = i2 + 1; j2 < topFew.length; j2++) {
+              t3.push({ state: applyAll(blockedState, [b, topFew[i2], topFew[j2]]),
+                enablers: [topFew[i2], topFew[j2]], bundle: b });
+            }
+          }
+        });
+        got = bestOf(t3);
+        if (got) return got;
+      }
+      return null;
+    }
+
+    // The pieces a state adds over a base state, for package
+    // records (what the blocked move itself brought).
+    function addedPieces(base, ns) {
+      var out = [];
+      Object.keys(ns.mods).forEach(function (n) {
+        if (!(n in base.mods)) out.push({ kind: 'mod', name: n, rank: ns.mods[n] });
+        else if (base.mods[n] !== ns.mods[n]) {
+          out.push({ kind: 'mod', name: n, rank: ns.mods[n], rankFrom: base.mods[n] });
+        }
+      });
+      if (ns.exilusMod && (!base.exilusMod || base.exilusMod.name !== ns.exilusMod.name)) {
+        out.push({ kind: 'exilus', name: ns.exilusMod.name, rank: ns.exilusMod.rank });
+      }
+      if (ns.aura && !base.aura) out.push({ kind: 'aura', name: ns.aura });
+      ns.arcanes.forEach(function (n) {
+        if (base.arcanes.indexOf(n) < 0) out.push({ kind: 'arcane', name: n });
+      });
+      if (ns.tome && !base.tome) out.push({ kind: 'tome', name: ns.tome });
+      if (ns.helmet && !base.helmet) out.push({ kind: 'helmet', name: ns.helmet });
+      if (ns.subsume && !base.subsume) {
+        out.push({ kind: 'subsume', name: ns.subsume.ability });
+      }
+      (ns.planArcanes || []).forEach(function (n) {
+        if ((base.planArcanes || []).indexOf(n) < 0) {
+          out.push({ kind: 'planArcane', name: n });
+        }
+      });
+      var shardDelta = ns.shards.length - base.shards.length;
+      if (shardDelta > 0) out.push({ kind: 'shards', name: 'Archon Shards', count: shardDelta });
+      return out;
+    }
+
     function fillPhase(anchorEv) {
       var cur = anchorEv;
       var changed = false;
+      var packages = [];
+      var budget = { left: PKG_EVAL_BUDGET };
       for (var iter = 0; iter < 40; iter++) {
         var moves = expand(cur.state, FILL).concat(fillExtraMoves(cur.state));
         var best = null;
-        moves.forEach(function (ns) {
-          // v1.4 hybrid: fillExtraMoves bypass expand(), so the
-          // burst allowance is re-checked here for every move.
-          if (hybrid && solverBurstCount(ns) > burstAllowance) return;
-          var ev = evaluateWith(ns, scoreState);
-          if (!ev.fit.valid) return;
-          if (!guardOk(ev, anchorEv)) return;
-          if (!vecGreater(maximizeVector(ev.achieved), maximizeVector(cur.achieved))) return;
-          var cand = {
-            ev: ev,
-            slotsDelta: modCount(ns) - modCount(cur.state),
-            drainDelta: ev.fit.capacityUsed - cur.fit.capacityUsed
-          };
+        var blocked = [];
+        function consider(cand) {
           if (!best) { best = cand; return; }
           var va = maximizeVector(cand.ev.achieved), vb = maximizeVector(best.ev.achieved);
           var cmp = 0;
@@ -3498,24 +3796,79 @@
             if (va[i] < vb[i] - 1e-9) { cmp = -1; break; }
           }
           if (cmp > 0 ||
-              (cmp === 0 && (cand.slotsDelta < best.slotsDelta ||
-                (cand.slotsDelta === best.slotsDelta &&
-                 cand.drainDelta < best.drainDelta - 1e-9)))) {
+              (cmp === 0 && ((cand.pkg ? 1 : 0) < (best.pkg ? 1 : 0) ||
+                ((cand.pkg ? 1 : 0) === (best.pkg ? 1 : 0) &&
+                 (cand.slotsDelta < best.slotsDelta ||
+                  (cand.slotsDelta === best.slotsDelta &&
+                   cand.drainDelta < best.drainDelta - 1e-9)))))) {
             best = cand;
           }
+        }
+        moves.forEach(function (ns) {
+          // v1.4 hybrid: fillExtraMoves bypass expand(), so the
+          // burst allowance is re-checked here for every move.
+          if (hybrid && solverBurstCount(ns) > burstAllowance) return;
+          var ev = evaluateWith(ns, scoreState);
+          if (!ev.fit.valid) return;
+          if (!vecGreater(maximizeVector(ev.achieved), maximizeVector(cur.achieved))) return;
+          if (guardOk(ev, anchorEv)) {
+            consider({ ev: ev, pkg: null,
+              slotsDelta: modCount(ns) - modCount(cur.state),
+              drainDelta: ev.fit.capacityUsed - cur.fit.capacityUsed });
+            return;
+          }
+          // v1.11.0: rejected — a package candidate only when the
+          // floor guard is the SOLE reason (breachedFloors non-null
+          // and non-empty).
+          var br = breachedFloors(ev, anchorEv);
+          if (br && br.length) {
+            blocked.push({ state: ns, ev: ev, breached: br });
+          }
+        });
+        // Package the strongest blocked moves (vector order), each
+        // contributing its cheapest working package as a candidate.
+        blocked.sort(function (a, b) {
+          var va = maximizeVector(a.ev.achieved), vb = maximizeVector(b.ev.achieved);
+          for (var i = 0; i < va.length; i++) {
+            if (va[i] > vb[i] + 1e-9) return -1;
+            if (va[i] < vb[i] - 1e-9) return 1;
+          }
+          return 0;
+        });
+        blocked.slice(0, PKG_MOVES_PER_ITER).forEach(function (bl) {
+          if (budget.left <= 0) return;
+          var got = tryPackage(bl.state, bl.breached, cur, budget);
+          if (!got) return;
+          var record = {
+            move: addedPieces(cur.state, bl.state),
+            enablers: got.enablers.map(function (m) {
+              return { kind: m.kind, name: m.name };
+            }),
+            shardBundle: got.bundle ? {
+              colour: got.bundle.pick.colour, tier: got.bundle.pick.tier,
+              stat: got.bundle.pick.stat, count: got.bundle.count
+            } : null,
+            floors: bl.breached.slice()
+          };
+          consider({ ev: got.ev, pkg: record,
+            slotsDelta: modCount(got.ev.state) - modCount(cur.state),
+            drainDelta: got.ev.fit.capacityUsed - cur.fit.capacityUsed });
         });
         if (!best) break;
+        if (best.pkg) packages.push(best.pkg);
         cur = best.ev;
         changed = true;
       }
-      return { ev: cur, changed: changed };
+      return { ev: cur, changed: changed, packages: packages };
     }
 
     var anchorEv = chosenEv;
     var filledEv = chosenEv, fillChanged = false;
+    var fillPackages = [];
     if (maximizeList.length && FILL && anchorEv.fit.valid) {
       var fillRes = fillPhase(anchorEv);
       filledEv = fillRes.ev;
+      fillPackages = fillRes.packages || [];
       fillChanged = fillRes.changed &&
         stateSignature(filledEv.state) !== stateSignature(anchorEv.state);
     }
@@ -4022,6 +4375,144 @@
     }
 
     var result = buildResult(chosenEv, origins);
+    // v1.11.0 (#35): compensated packages are labelled — what was
+    // paired with what, and which floor the pairing holds. Shard
+    // spend inside a package is spelled out (which shards, what
+    // they unlocked).
+    result.fillPackages = fillPackages;
+    fillPackages.forEach(function (p) {
+      function pieceLabel(x) {
+        return x.name + (typeof x.rank === 'number' ? ' (rank ' + x.rank + ')' : '');
+      }
+      var moveText = p.move.map(pieceLabel).join(', ');
+      var floorText = p.floors.map(function (s) {
+        return s + ' at-least ' + targets[s].value;
+      }).join(', ');
+      if (p.shardBundle) {
+        var b = p.shardBundle;
+        var bundleText = (b.tier === 'tauforged' ? 'Tauforged ' : '') +
+          b.colour + ' Archon Shard (' + b.stat + ') x' + b.count;
+        result.notes.push('Shard enablers: ' + bundleText +
+          ' spent to hold ' + floorText + ' while ' + moveText +
+          ' raised the Maximize stats' +
+          (p.enablers.length ? ' (paired with ' +
+            p.enablers.map(function (e) { return e.name; }).join(', ') + ')' : '') +
+          '.');
+      } else {
+        result.notes.push('Compensated package: ' + moveText +
+          ' was paired with ' +
+          p.enablers.map(function (e) { return e.name; }).join(', ') +
+          ' to hold ' + floorText + '.');
+      }
+    });
+    // v1.11.0 (#35): floor-dependence — when a met at-least floor
+    // holds ONLY because conditional pieces are active, the results
+    // say so and name the pieces. Display only: the paper-value
+    // math is untouched. (Conditional = the piece carries a
+    // condition on an effect, or appears in the conditional-class
+    // table the intent discipline already uses.)
+    if (routes.conditional) {
+      (function () {
+        var fst = chosenEv.state;
+        function pieceConditional(name, rec) {
+          if (!name) return false;
+          if (ctx.condClasses[name]) return true;
+          return !!(rec && (rec.effects || []).some(function (e) { return !!e.condition; }));
+        }
+        var stripped = clone(fst);
+        var cond = { mods: [], arcanes: [], planArcanes: [], aura: null,
+                     tome: null, exilus: null, subsume: null, helmet: null };
+        Object.keys(stripped.mods).forEach(function (n) {
+          if (pieceConditional(n, ctx.modByName[n])) {
+            delete stripped.mods[n]; cond.mods.push(n);
+          }
+        });
+        if (stripped.exilusMod &&
+            pieceConditional(stripped.exilusMod.name, ctx.modByName[stripped.exilusMod.name])) {
+          cond.exilus = stripped.exilusMod.name; stripped.exilusMod = null;
+        }
+        stripped.arcanes = stripped.arcanes.filter(function (n) {
+          var c = pieceConditional(n, ctx.arcaneByName[n]);
+          if (c) cond.arcanes.push(n);
+          return !c;
+        });
+        stripped.planArcanes = (stripped.planArcanes || []).filter(function (n) {
+          var c = pieceConditional(n, ctx.arcaneByName[n]);
+          if (c) cond.planArcanes.push(n);
+          return !c;
+        });
+        if (stripped.aura &&
+            pieceConditional(stripped.aura, ctx.auraByName[stripped.aura])) {
+          cond.aura = stripped.aura; stripped.aura = null;
+        }
+        if (stripped.tome) {
+          var tomeRec = ctx.tomes.filter(function (t) { return t.name === stripped.tome; })[0];
+          if (pieceConditional(stripped.tome, tomeRec)) {
+            cond.tome = stripped.tome; stripped.tome = null;
+          }
+        }
+        if (stripped.subsume &&
+            pieceConditional(stripped.subsume.ability, null)) {
+          cond.subsume = stripped.subsume.ability; stripped.subsume = null;
+        }
+        if (stripped.helmet) {
+          var helmList = ctx.legacyHelmets[input.frameName] || [];
+          var helmRec = null;
+          helmList.forEach(function (h) { if (h.helmetName === stripped.helmet) helmRec = h; });
+          if (pieceConditional(stripped.helmet, helmRec)) {
+            cond.helmet = stripped.helmet; stripped.helmet = null;
+          }
+        }
+        var anyCond = cond.mods.length || cond.arcanes.length ||
+          cond.planArcanes.length || cond.aura || cond.tome ||
+          cond.exilus || cond.subsume || cond.helmet;
+        if (!anyCond) return;
+        var strippedAch = achievedFrom(ctx, frame,
+          contributions(ctx, stripped, routes, input.supportSetPieces));
+        targetedStats.forEach(function (stat) {
+          var t = targets[stat];
+          if (!t || t.mode !== 'atleast') return;
+          var met = lowerBetter(stat)
+            ? chosenEv.achieved[stat] <= t.value + 1e-9
+            : chosenEv.achieved[stat] >= t.value - 1e-9;
+          if (!met) return;
+          var broken = lowerBetter(stat)
+            ? strippedAch[stat] > t.value + 1e-9
+            : strippedAch[stat] < t.value - 1e-9;
+          if (!broken) return;
+          var names = [];
+          function contributes(name, rec, perRank) {
+            if (!rec) return;
+            var hit = (rec.effects || []).some(function (e) {
+              if (e.stat !== stat) return false;
+              var v = perRank ? e.valuePerRank : e.value;
+              if (typeof v !== 'number') v = e.value;
+              if (typeof v !== 'number') return false;
+              return lowerBetter(stat) ? v < 0 : v > 0;
+            });
+            if (hit) names.push(name);
+          }
+          cond.mods.forEach(function (n) { contributes(n, ctx.modByName[n], true); });
+          if (cond.exilus) contributes(cond.exilus, ctx.modByName[cond.exilus], true);
+          cond.arcanes.forEach(function (n) { contributes(n, ctx.arcaneByName[n], false); });
+          cond.planArcanes.forEach(function (n) { contributes(n, ctx.arcaneByName[n], false); });
+          if (cond.aura) contributes(cond.aura, ctx.auraByName[cond.aura], false);
+          if (cond.tome) {
+            var tr = ctx.tomes.filter(function (x) { return x.name === cond.tome; })[0];
+            if (tr && tr.stat === stat && !lowerBetter(stat)) names.push(tr.name);
+          }
+          if (cond.subsume) names.push(cond.subsume);
+          if (cond.helmet) names.push(cond.helmet);
+          if (!names.length) {
+            names = cond.mods.concat(cond.arcanes, cond.planArcanes,
+              cond.aura ? [cond.aura] : [], cond.tome ? [cond.tome] : []);
+          }
+          result.notes.push(stat + ' at-least ' + t.value +
+            ' holds only while conditional pieces are active: ' +
+            names.join(', ') + '.');
+        });
+      })();
+    }
     if (mainRun.fellBack) {
       result.notes.unshift('No arrangement within the Forma budget fits the mod capacity; showing the best-scoring arrangement, which exceeds capacity.');
     }
