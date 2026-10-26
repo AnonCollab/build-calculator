@@ -238,6 +238,7 @@
       arcaneEffects: site.arcanes,
       tomeEffects: site.tomes,
       auraEffects: site.auras,
+      auraFallback: site.auraFallback,
       shardEffects: site.shards,
       setBonuses: site.setBonuses,
       helminth: site.helminth,
@@ -1158,8 +1159,12 @@
       mode.value = store[k].mode;
       val.value = store[k].value;
       // A target value only matters for Closest / At least; Maximize
-      // uses the priority column instead.
+      // uses the priority column instead. v1.12.0: while Maximize is
+      // chosen the value box is hidden outright — a visible stale
+      // number reads as a cap the solver does not honour. The typed
+      // value stays in state and reappears on switching back.
       val.disabled = store[k].mode === 'dontcare' || store[k].mode === 'maximize';
+      val.style.visibility = store[k].mode === 'maximize' ? 'hidden' : '';
       if (prio) {
         prio.value = store[k].priority == null ? '' : store[k].priority;
         prio.disabled = store[k].mode !== 'maximize';
@@ -1175,6 +1180,7 @@
       store[k].value = val.value;
       if (prio) store[k].priority = prio.value;
       val.disabled = store[k].mode === 'dontcare' || store[k].mode === 'maximize';
+      val.style.visibility = store[k].mode === 'maximize' ? 'hidden' : '';
       if (prio) prio.disabled = store[k].mode !== 'maximize';
     });
   }
@@ -4570,7 +4576,8 @@
       fetchJSON('data/set_bonuses.json'), fetchJSON('data/links.json'),
       fetchJSON('data/acquisition.json'), fetchJSON('data/modpool.json'),
       fetchJSON('data/conditional_classes.json'), fetchJSON('data/channels.json'),
-      fetchJSON('data/focus.json'), fetchJSON('data/registry.json')
+      fetchJSON('data/focus.json'), fetchJSON('data/registry.json'),
+      fetchJSON('data/aura_fallback.json')
     ]).then(function (parts) {
       SITE = {
         frames: parts[0], weapons: parts[1], mods: parts[2], arcanes: parts[3],
@@ -4578,7 +4585,7 @@
         modular: parts[8], helminth: parts[9], setBonuses: parts[10],
         links: parts[11], acquisition: parts[12], modpool: parts[13],
         conditionalClasses: parts[14], channels: parts[15],
-        focus: parts[16], registry: parts[17]
+        focus: parts[16], registry: parts[17], auraFallback: parts[18]
       };
       SITE.modpoolByName = {};
       (SITE.modpool.mods || []).forEach(function (m) { SITE.modpoolByName[m.name] = m; });
