@@ -55,6 +55,10 @@
  *    the v2 weapon over-rank field); v≤6 boards gain the empty
  *    default. Decoders emit the v14 state; v≤6 payloads gain
  *    crossGearArcanes off and no credited board arcanes.
+ *    v8 (v1.11.0) appends one more bit after the v7 bit (the v7
+ *    payload stays a strict prefix): the "Use shards as enablers"
+ *    toggle (a top-level boolean, like spareShards). Decoders emit
+ *    the v15 state; v≤7 payloads gain shardEnablers false.
  *  - Checksum: a digit-polynomial over the base62 body
  *    (h = (h*33 + digit) mod 3844 = 62^2), rendered as the final 2
  *    base62 chars and verified BEFORE any field is parsed — a
@@ -69,12 +73,12 @@
  *    otherwise vanish).
  *  - Canonical form: fields at their defaults cost only their flag /
  *    mode bits (dontcare targets, empty wallet colours, absent board,
- *    ...). The decoder re-expands everything to a full v14 state
+ *    ...). The decoder re-expands everything to a full v15 state
  *    (older payloads gain the later defaults: omniAura false,
  *    movement targets dontcare; v4 payloads gain the migrated
  *    glide/latch pair; v≤5 payloads gain formaConvert false and no
  *    declared Starting Pools; v≤6 payloads gain the Cross-gear
- *    Arcanes toggle off).
+ *    Arcanes toggle off; v≤7 payloads gain shardEnablers false).
  *  - encode() returns null (never throws, never guesses) when a state
  *    carries something the schema cannot name — the app then falls
  *    back to the legacy long link. Documented refusals: names absent
@@ -101,7 +105,7 @@
   'use strict';
 
   var B62 = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
-  var SCHEMA_VERSION = 7;
+  var SCHEMA_VERSION = 8;
 
   // Fixed enums (mirror site/js/app.js — the category order is the
   // app's CATEGORIES order; stat lists are the app's target stores).
@@ -925,6 +929,9 @@
       // v7 (v1.10.0): the Cross-gear Arcanes toggle — one trailing
       // bit after the v6 block (the v6 payload stays a prefix).
       w.wBool(!!(state.crossGearArcanes && state.crossGearArcanes.on));
+      // v8 (v1.11.0): the shard-enablers toggle — one trailing bit
+      // after the v7 bit (the v7 payload stays a prefix).
+      w.wBool(!!state.shardEnablers);
       return w.acc;
     }
 
@@ -933,7 +940,7 @@
       if (version < 1 || version > SCHEMA_VERSION) {
         throw CodecError('unsupported share code version ' + version);
       }
-      var st = { version: 14 };
+      var st = { version: 15 };
       st.category = CATEGORIES[r.r(4)];
       var intent = r.r(2);
       st.intent = intent === 1 ? 'upkeep' : intent === 2 ? 'hybrid' : 'window';
@@ -1062,6 +1069,9 @@
       // v7 (v1.10.0): the Cross-gear Arcanes toggle; v≤6 payloads
       // end at the v6 block and gain the off default.
       st.crossGearArcanes = { on: version >= 7 ? r.rBool() : false };
+      // v8 (v1.11.0): the shard-enablers toggle; v≤7 payloads end
+      // at the v7 bit and gain the off default.
+      st.shardEnablers = version >= 8 ? r.rBool() : false;
       if (r.remaining() !== 0) {
         throw CodecError('share code is malformed (trailing bits)');
       }
