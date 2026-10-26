@@ -950,6 +950,42 @@
     ctx.auraByName = {};
     ctx.auras.forEach(function (a) { ctx.auraByName[a.name] = a; });
 
+    // v1.12.0 (#36): raw-record harm / usefulness for the aura
+    // completion policy. The stat walk above only keeps effects
+    // that map into solver stats; the RAW record also carries
+    // unmodelled effects, and some of those HURT the user
+    // (Combat Discipline's health loss on kill, Empowered
+    // Blades' shield loss per hit, Melee Guidance's combo
+    // duration cut, Power Donation's Ability Strength cut). An
+    // aura with any negative effect on the user or squad is
+    // never slotted automatically; usefulness is judged from
+    // the same record (ally / companion gains, enemy debuffs).
+    ctx.auraRawByName = {};
+    ((data.auraEffects && data.auraEffects.mods) || []).forEach(function (a) {
+      var harm = false, useful = false;
+      (a.effects || []).forEach(function (e) {
+        if (typeof e.value !== 'number') return;
+        var ally = e.target === 'self' || e.target === 'squad' ||
+                   e.target === 'squadmates' || e.target === 'companions';
+        if (ally) {
+          if (e.value < 0) harm = true;
+          else if (e.value > 0) useful = true;
+        } else if (e.target === 'enemy') {
+          if (e.value < 0) useful = true;
+          else if (e.value > 0) harm = true;
+        }
+      });
+      ctx.auraRawByName[a.name] = { harm: harm, useful: useful };
+    });
+    // v1.12.0 (#36): the fallback preference list as shipped
+    // data (absent in older bundles — completion then simply has
+    // no fallback tier).
+    var fbData = data.auraFallback || {};
+    ctx.auraFallback = {
+      byPolarity: fbData.byPolarity || {},
+      universal: fbData.universal || []
+    };
+
     // Shards: only bonuses that map into solver scope become picks.
     ctx.shardPicks = []; // {colour, stat, unit, normal, tauforged}
     var colours = (data.shardEffects && data.shardEffects.colours) || {};
@@ -3486,6 +3522,119 @@
       }
       return out;
     }
+    // ---- v1.12.0 (#36): aura completion ---------------------------
+    // The auras the completion policy may slot: the aura pool's
+    // discipline (route on, bans, Upkeep burst pruning) minus the
+    // stat-touch admission, plus the raw-record harm filter — an
+    // aura that hurts the user or squad is never slotted
+    // automatically.
+    function auraCompletionPool() {
+      if (!routes.aura) return [];
+      return ctx.auras.filter(function (a) {
+        if (excludedModSet[a.name]) return false;
+        if (pruneBurst && isBurst(a.name)) return false;
+        var raw = ctx.auraRawByName[a.name];
+        return !!raw && !raw.harm;
+      });
+    }
+    // Preference order of an aura for tie-breaks: its place in
+    // the fallback list for the frame's aura polarity, then the
+    // universal entries, then everything else by name.
+    function auraFallbackIndex(name) {
+      var pol = frame.AuraPolarity || null;
+      var list = (pol && ctx.auraFallback.byPolarity[pol]) || [];
+      var i = list.indexOf(name);
+      if (i >= 0) return i;
+      var u = ctx.auraFallback.universal.indexOf(name);
+      return u >= 0 ? 100 + u : 1000;
+    }
+    function auraSlotBonus(name) {
+      return auraCapacityBonus(ctx, frame, name,
+        input.omniAura ? 'Omni' : undefined);
+    }
+    // Runs on a finished solve whose aura slot is still blank:
+    // the beam, the fill and the packages have already had their
+    // say, so an aura present in the state is never replaced.
+    // What remains, in order: an aura that pays for itself in
+    // capacity (fewer Forma for the same build, or a fit where
+    // there was none), then the reviewed fallback for the slot's
+    // polarity, then any useful harmless aura matching the slot.
+    // Every candidate is judged on the finished build: fit
+    // valid, at-least floors and closest distances no worse than
+    // the pre-completion finish (guardOk against it).
+    function completeAura(ev0) {
+      var none = { ev: ev0, reason: null };
+      if (kind !== 'warframe' || !routes.aura || ev0.state.aura) return none;
+      var pool = auraCompletionPool();
+      if (!pool.length) return none;
+      function judged(name) {
+        var ns = clone(ev0.state); ns.aura = name;
+        if (hybrid && solverBurstCount(ns) > burstAllowance) return null;
+        var ev = evaluateWith(ns, scoreState);
+        if (!ev.fit.valid) return null;
+        if (!guardOk(ev, ev0)) return null;
+        return ev;
+      }
+      function better(cand, best) {
+        return !best || cand.forma < best.forma ||
+          (cand.forma === best.forma && cand.bonus > best.bonus) ||
+          (cand.forma === best.forma && cand.bonus === best.bonus &&
+           (cand.fb < best.fb ||
+            (cand.fb === best.fb && cand.name < best.name)));
+      }
+      // (c) capacity / Forma.
+      var best = null;
+      pool.forEach(function (a) {
+        var ev = judged(a.name);
+        if (!ev) return;
+        if (ev0.fit.valid && ev.fit.formaUsed >= ev0.fit.formaUsed) return;
+        var cand = { ev: ev, name: a.name, forma: ev.fit.formaUsed,
+                     bonus: auraSlotBonus(a.name),
+                     fb: auraFallbackIndex(a.name) };
+        if (better(cand, best)) best = cand;
+      });
+      if (best) {
+        return { ev: best.ev, reason: { name: best.name, kind: 'capacity',
+          formaSaved: ev0.fit.valid
+            ? ev0.fit.formaUsed - best.ev.fit.formaUsed : 0 } };
+      }
+      // (d) the reviewed fallback for the slot's polarity, then
+      // the universal entries.
+      var pol = frame.AuraPolarity || null;
+      var fbList = ((pol && ctx.auraFallback.byPolarity[pol]) || [])
+        .concat(ctx.auraFallback.universal);
+      for (var i = 0; i < fbList.length; i++) {
+        var nm = fbList[i];
+        if (!pool.some(function (a) { return a.name === nm; })) continue;
+        var ev2 = judged(nm);
+        if (ev2) return { ev: ev2, reason: { name: nm, kind: 'fallback' } };
+      }
+      // (e) any useful, harmless aura matching the slot's
+      // current polarity ('Any' matches everywhere; an Omni slot
+      // and an unpolarized slot match everything).
+      var slotPol = input.omniAura ? 'Omni' : (frame.AuraPolarity || null);
+      var rest = pool.filter(function (a) {
+        var raw = ctx.auraRawByName[a.name];
+        if (!raw || !raw.useful) return false;
+        if (slotPol === 'Omni' || !slotPol || slotPol === 'None') return true;
+        return a.polarity === slotPol || a.polarity === 'Any';
+      });
+      rest.sort(function (x, y) {
+        var fx = auraFallbackIndex(x.name), fy = auraFallbackIndex(y.name);
+        if (fx !== fy) return fx - fy;
+        var bx = auraSlotBonus(x.name), by = auraSlotBonus(y.name);
+        if (bx !== by) return by - bx;
+        return x.name < y.name ? -1 : 1;
+      });
+      for (var j = 0; j < rest.length; j++) {
+        var ev3 = judged(rest[j].name);
+        if (ev3) {
+          return { ev: ev3, reason: { name: rest[j].name, kind: 'fallback' } };
+        }
+      }
+      return none;
+    }
+
     // ---- v1.11.0 (#35): compensated packages ----------------------
     // When a fill move would improve the Maximize vector but is
     // rejected ONLY because it breaches an at-least floor the anchor
@@ -3778,6 +3927,38 @@
       return out;
     }
 
+    // v1.12.0 (#36): a capacity package — a move blocked ONLY by
+    // fit (capacity / Forma) paired with a single aura enabler
+    // whose capacity bonus makes it fit. v1.11.0's package judge
+    // governs the combination: the paired state must fit, hold
+    // the guard and strictly improve the maximize vector. Best
+    // aura: fewest Forma, then most bonus, then fallback order,
+    // then name.
+    function tryCapacityPackage(blockedState, cur, budget) {
+      var best = null;
+      auraCompletionPool().forEach(function (a) {
+        if (budget.left-- <= 0) return;
+        var ns = clone(blockedState); ns.aura = a.name;
+        if (hybrid && solverBurstCount(ns) > burstAllowance) return;
+        var ev = evaluateWith(ns, scoreState);
+        if (!ev.fit.valid) return;
+        if (!guardOk(ev, anchorEv)) return;
+        if (!vecGreater(maximizeVector(ev.achieved),
+                        maximizeVector(cur.achieved))) return;
+        var cand = { ev: ev, auraName: a.name, forma: ev.fit.formaUsed,
+                     bonus: auraSlotBonus(a.name),
+                     fb: auraFallbackIndex(a.name) };
+        if (!best || cand.forma < best.forma ||
+            (cand.forma === best.forma && cand.bonus > best.bonus) ||
+            (cand.forma === best.forma && cand.bonus === best.bonus &&
+             (cand.fb < best.fb ||
+              (cand.fb === best.fb && cand.auraName < best.auraName)))) {
+          best = cand;
+        }
+      });
+      return best;
+    }
+
     function fillPhase(anchorEv) {
       var cur = anchorEv;
       var changed = false;
@@ -3787,6 +3968,7 @@
         var moves = expand(cur.state, FILL).concat(fillExtraMoves(cur.state));
         var best = null;
         var blocked = [];
+        var blockedFit = [];
         function consider(cand) {
           if (!best) { best = cand; return; }
           var va = maximizeVector(cand.ev.achieved), vb = maximizeVector(best.ev.achieved);
@@ -3809,7 +3991,17 @@
           // burst allowance is re-checked here for every move.
           if (hybrid && solverBurstCount(ns) > burstAllowance) return;
           var ev = evaluateWith(ns, scoreState);
-          if (!ev.fit.valid) return;
+          if (!ev.fit.valid) {
+            // v1.12.0 (#36): a move blocked ONLY by fit is a
+            // capacity-package candidate, when it would improve
+            // the maximize vector and holds the guard on paper.
+            if (vecGreater(maximizeVector(ev.achieved),
+                           maximizeVector(cur.achieved)) &&
+                guardOk(ev, anchorEv)) {
+              blockedFit.push({ state: ns, ev: ev });
+            }
+            return;
+          }
           if (!vecGreater(maximizeVector(ev.achieved), maximizeVector(cur.achieved))) return;
           if (guardOk(ev, anchorEv)) {
             consider({ ev: ev, pkg: null,
@@ -3849,6 +4041,29 @@
               stat: got.bundle.pick.stat, count: got.bundle.count
             } : null,
             floors: bl.breached.slice()
+          };
+          consider({ ev: got.ev, pkg: record,
+            slotsDelta: modCount(got.ev.state) - modCount(cur.state),
+            drainDelta: got.ev.fit.capacityUsed - cur.fit.capacityUsed });
+        });
+        // v1.12.0 (#36): capacity packages for fit-blocked moves,
+        // same vector ordering.
+        blockedFit.sort(function (a, b) {
+          var va = maximizeVector(a.ev.achieved), vb = maximizeVector(b.ev.achieved);
+          for (var i = 0; i < va.length; i++) {
+            if (va[i] > vb[i] + 1e-9) return -1;
+            if (va[i] < vb[i] - 1e-9) return 1;
+          }
+          return 0;
+        });
+        blockedFit.slice(0, PKG_MOVES_PER_ITER).forEach(function (bl) {
+          if (budget.left <= 0) return;
+          var got = tryCapacityPackage(bl.state, cur, budget);
+          if (!got) return;
+          var record = {
+            move: addedPieces(cur.state, bl.state),
+            enablers: [{ kind: 'aura', name: got.auraName }],
+            shardBundle: null, floors: [], capacity: true
           };
           consider({ ev: got.ev, pkg: record,
             slotsDelta: modCount(got.ev.state) - modCount(cur.state),
@@ -3922,6 +4137,12 @@
       };
     }
     var origins = fillChanged ? computeOrigins(anchorEv.state, chosenEv.state) : null;
+
+    // v1.12.0 (#36): aura completion on the finished build (and
+    // on the cheapest variant below) — see completeAura. Runs
+    // after origins so fill narration keeps describing the fill.
+    var auraCompletion = completeAura(chosenEv);
+    chosenEv = auraCompletion.ev;
 
     // Set-bonus report for a finished state: pieces counted across the
     // focus item and cross-gear support pieces. Parsed bonuses that map
@@ -4388,7 +4609,14 @@
       var floorText = p.floors.map(function (s) {
         return s + ' at-least ' + targets[s].value;
       }).join(', ');
-      if (p.shardBundle) {
+      if (p.capacity) {
+        // v1.12.0 (#36): a capacity package — the pairing buys
+        // room, not floor headroom.
+        result.notes.push('Compensated package: ' + moveText +
+          ' was paired with ' +
+          p.enablers.map(function (e) { return e.name; }).join(', ') +
+          ' for capacity — the aura bonus makes room for it.');
+      } else if (p.shardBundle) {
         var b = p.shardBundle;
         var bundleText = (b.tier === 'tauforged' ? 'Tauforged ' : '') +
           b.colour + ' Archon Shard (' + b.stat + ') x' + b.count;
@@ -4405,6 +4633,40 @@
           ' to hold ' + floorText + '.');
       }
     });
+    // v1.12.0 (#36): why the aura on the finished build is there.
+    // 'target' = the beam, the fill or a lock put it there for the
+    // stats; 'enabler' = it holds a compensated package together;
+    // 'capacity' / 'fallback' come from the completion policy and
+    // get a note in the same plain style.
+    result.auraReason = null;
+    if (chosenEv.state.aura) {
+      var auraName = chosenEv.state.aura;
+      if (auraCompletion.reason && auraCompletion.reason.name === auraName) {
+        result.auraReason = auraCompletion.reason;
+      } else if (fillPackages.some(function (p) {
+        return p.enablers.some(function (e) {
+          return e.kind === 'aura' && e.name === auraName;
+        }) || p.move.some(function (m) {
+          return m.kind === 'aura' && m.name === auraName;
+        });
+      })) {
+        result.auraReason = { name: auraName, kind: 'enabler' };
+      } else {
+        result.auraReason = { name: auraName, kind: 'target' };
+      }
+      if (result.auraReason.kind === 'capacity') {
+        result.notes.push(result.auraReason.formaSaved > 0
+          ? 'Aura: ' + auraName + ' was slotted for capacity — its ' +
+            'bonus covers the build\'s drain and saves ' +
+            result.auraReason.formaSaved + ' Forma.'
+          : 'Aura: ' + auraName + ' was slotted for capacity — its ' +
+            'bonus makes the build fit.');
+      } else if (result.auraReason.kind === 'fallback') {
+        result.notes.push('Aura: ' + auraName + ' fills the aura slot ' +
+          'as a general squad fallback (no aura was needed by the ' +
+          'targets).');
+      }
+    }
     // v1.11.0 (#35): floor-dependence — when a met at-least floor
     // holds ONLY because conditional pieces are active, the results
     // say so and name the pieces. Display only: the paper-value
@@ -4593,7 +4855,7 @@
     // This supersedes the v1.0 cost-dominant re-run semantic.
     result.cheapest = null;
     if (fillChanged) {
-      var ch = buildResult(anchorEv, null);
+      var ch = buildResult(completeAura(anchorEv).ev, null);
       result.cheapest = {
         achieved: ch.achieved, arrangement: ch.arrangement,
         setBonuses: ch.setBonuses, unmetTargets: ch.unmetTargets,
