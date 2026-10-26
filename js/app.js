@@ -287,7 +287,9 @@
       // seeds from its innate polarities) and the toggle off.
       // v1.10.0: state v14 — crossGearArcanes joins; older saves
       // migrate to the toggle off.
-      version: 14,
+      // v1.11.0: state v15 — shardEnablers joins; older saves
+      // migrate to the toggle off.
+      version: 15,
       category: 'Warframe',
       intent: 'window',
       // v1.4: Hybrid burst allowance (1 | 2). routesFrame.augments
@@ -351,6 +353,14 @@
       // report them as a plan (never as slot occupants). Default
       // OFF; rides state v14 — older saves/codes merge to off.
       crossGearArcanes: { on: false },
+      // v1.11.0 (#35): Use shards as enablers — when on, the
+      // Maximize fill may recruit Archon Shards purely as floor
+      // compensation inside a compensated package (all shards spent
+      // on one deficit count as a single enabler). Default OFF,
+      // independent of spareShards; rides state v15 — older
+      // saves/codes merge to off. The solver input flag is
+      // input.shardEnablers (frame category only).
+      shardEnablers: false,
       board: null,
       routesFrame: routesFrame,
       routesWeapon: routesWeapon,
@@ -484,7 +494,7 @@
   function mergeState(base, saved) {
     if (!saved || typeof saved !== 'object') return base;
     try {
-      if (saved.version === 2 || saved.version === 3 || saved.version === 4 || saved.version === 5 || saved.version === 6 || saved.version === 7 || saved.version === 8 || saved.version === 9 || saved.version === 10 || saved.version === 11 || saved.version === 12 || saved.version === 13 || saved.version === 14) {
+      if (saved.version === 2 || saved.version === 3 || saved.version === 4 || saved.version === 5 || saved.version === 6 || saved.version === 7 || saved.version === 8 || saved.version === 9 || saved.version === 10 || saved.version === 11 || saved.version === 12 || saved.version === 13 || saved.version === 14 || saved.version === 15) {
         if (catOf(saved.category).id === saved.category) base.category = saved.category;
         // v1.3: intent arrived in state v5; v2–v4 saves keep the
         // default 'window' (the engines' unset behaviour). v1.4:
@@ -587,6 +597,9 @@
             typeof saved.crossGearArcanes.on === 'boolean') {
           base.crossGearArcanes.on = saved.crossGearArcanes.on;
         }
+        // v1.11.0: the shard-enablers toggle (v15 field; older
+        // saves keep the off default).
+        if (typeof saved.shardEnablers === 'boolean') base.shardEnablers = saved.shardEnablers;
         base.board = mergeBoard(saved.board);
         mergeRoutes(base.routesFrame, saved.routesFrame);
         mergeRoutes(base.routesWeapon, saved.routesWeapon);
@@ -1219,6 +1232,7 @@
     });
     $('chk-coalescent').checked = !!state.canFuseCoalescent;
     $('chk-spare-shards').checked = !!state.spareShards;
+    $('chk-shard-enablers').checked = !!state.shardEnablers;
     $('chk-omni-aura').checked = !!state.omniAura;
     $('chk-forma-convert').checked = !!state.formaConvert;
     $('sel-forma').value = state.forma === 'any' ? 'any' : String(state.forma);
@@ -1324,6 +1338,8 @@
     state.canFuseCoalescent = $('chk-coalescent').checked;
     // v1.5.1: spare-the-shards toggle (frame routes panel).
     state.spareShards = $('chk-spare-shards').checked;
+    // v1.11.0: shard-enablers toggle (frame routes panel).
+    state.shardEnablers = $('chk-shard-enablers').checked;
     // v1.5.3: Omni Forma aura toggle (Forma panel).
     state.omniAura = $('chk-omni-aura').checked;
     // v1.9.0: conversion toggle (Forma panel). Starting Pools are
@@ -2571,6 +2587,9 @@
       if (state.formaConvert) finput.formaConvert = true;
       // v1.10.0: Cross-gear Arcanes credit toggle (frame solves).
       if (state.crossGearArcanes.on) finput.crossGearArcanes = true;
+      // v1.11.0: shard-enablers toggle (frame solves; the solver
+      // flag is inert for non-warframe kinds anyway).
+      if (state.shardEnablers) finput.shardEnablers = true;
       var hc = currentHelminthChoice();
       if (hc) finput.helminthChoice = hc;
       // v1.5: Focus school route — routes.focus = {school}, the
