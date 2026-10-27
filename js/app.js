@@ -1911,7 +1911,7 @@
   // v1.4.1: the lock-arcane caption — the picker list IS a filtered
   // universe (the arcanes equippable on this category of gear), and
   // until it said so, a correct 64-name Warframe list read as
-  // "not a full list" (Tacusin's report).
+  // "not a full list" (the owner's report).
   function arcaneUniverseCaption() {
     var cat = currentCat();
     if (cat.kind === 'amp') {
@@ -1986,7 +1986,7 @@
     names.forEach(function (n) {
       var o = document.createElement('option');
       o.value = n;
-      // v1.4.1 (Tacusin's call, superseding the v1.3 picker tags AND
+      // v1.4.1 (the owner's call, superseding the v1.3 picker tags AND
       // the first v1.4.1 fix): dropdown rows are the piece NAME ONLY —
       // no class/augment tags in pickers. v1.3 had set the label to the
       // tag alone, which rendered nameless "· maintainable 9s" rows
@@ -4204,7 +4204,7 @@
   // the same pieces the breakdown scores) joined to the shipped
   // conditional-class rows. No per-piece prose is invented; the one
   // exception is the Growing Power proc note, cited inline below.
-  // Tacusin-confirmed in-game 2026-10-18: Growing Power procs come
+  // Confirmed in-game 2026-10-18: Growing Power procs come
   // from your weapons' status effects (companion weapons and Hunter
   // Munitions included); allies' status, ability status and
   // Syndicate radials do not trigger it.
