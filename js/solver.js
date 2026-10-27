@@ -241,7 +241,7 @@
  *    modelled set) for board parity.
  *
  * v1.5.1 Stage B (spare the shards, warframe kind only):
- *  - input.spareShards (bool, default false): Tacusin's preference —
+ *  - input.spareShards (bool, default false): the owner's preference —
  *    when a stat target can be covered either by Archon Shards or by
  *    mods paid for with Forma (within the build's Forma budget),
  *    spend the Forma first and keep the shards free. (He previously
@@ -264,9 +264,9 @@
  *  - input.omniAura (bool, default false): the build uses an Omni
  *    Forma on the aura slot — the slot becomes a universal match
  *    (capacity bonus x2 for any aura). A toggle, not a pool
- *    (Tacusin's design: one forma on one slot). The Omni Forma
+ *    (the owner's design: one forma on one slot). The Omni Forma
  *    counts as 1 in the build's total formaUsed (it IS a Forma —
- *    Tacusin's correction), but as a user declaration it is NOT
+ *    the owner's correction), but as a user declaration it is NOT
  *    charged against the Forma budget: discretionary purchases
  *    still respect the budget, so a total can read budget-spend + 1.
  *    fitCapacity / evaluateFrame price it identically;
@@ -670,7 +670,7 @@
       !!(rec.augmentsAbility || rec.restrictedTo);
   }
 
-  // Tacusin's rule: eligibility follows the ABILITY, not the frame.
+  // the owner's rule: eligibility follows the ABILITY, not the frame.
   // A linked augment (augmentsAbility set) is eligible iff that
   // ability is in the frame's EFFECTIVE ability set: the native
   // list (frameAbilities), minus the ability the Helminth choice
@@ -1729,7 +1729,7 @@
   // build's Omni Forma toggle is on ('Universal' — the polarity
   // picker's name for the same thing — is treated identically).
   // Pre-v1.5.3 the mismatch branch HALVED the bonus (floor(mag/2)) —
-  // an invented rule, never wiki-checked; it made Tacusin's Follie +
+  // an invented rule, never wiki-checked; it made the owner's Follie +
   // Growing Power build read capacity 63 where the game reads 65.
   function auraCapacityBonus(ctx, frame, auraName, slotPol) {
     if (!auraName) return 0;
@@ -1768,7 +1768,7 @@
   }
 
   // Fit chosen mods to the frame's capacity under the POLARITY POOL
-  // model (v1.5.1, Tacusin's mechanic): once a slot is forma'd its
+  // model (v1.5.1, the owner's mechanic): once a slot is forma'd its
   // polarity is freely swappable among the non-aura slots, so a build
   // owns a pool = the frame's innate polarities + one polarity per
   // forma spent. The fit is therefore counted from the pool, not from a
@@ -1789,7 +1789,7 @@
   // its polarity is spendable state of its own. auraOpts.omniAura (the
   // build's Omni Forma toggle) makes the slot a universal match —
   // bonus x2 for any aura — and the Omni Forma counts as 1 in the
-  // returned formaUsed total (Tacusin's correction: an Omni Forma is
+  // returned formaUsed total (the owner's correction: an Omni Forma is
   // still a Forma), though it is never charged against formaBudget
   // (the toggle is a user declaration, like a lock). Otherwise the fit may BUY
   // the match with 1 regular Forma: the purchase is a capacity-side
@@ -2505,7 +2505,7 @@
       exilus: !!routesIn.exilus,               // extra exilus-only slot (see header)
       tome: routesIn.tome !== false,
       conditional: !!routesIn.conditional,
-      legacyHelmets: !!routesIn.legacyHelmets, // DEFAULT OFF (Tacusin, 2026-10-18)
+      legacyHelmets: !!routesIn.legacyHelmets, // DEFAULT OFF (2026-10-18)
       helminth: !!routesIn.helminth,          // DEFAULT OFF, same caution
       augments: !!routesIn.augments           // v1.4: DEFAULT OFF — gates augment locks only (see header)
     };
@@ -4159,7 +4159,7 @@
         var planned = (plannedBySet && plannedBySet[set]) || 0;
         var sb = ctx.setBonuses[set];
         // v1.2: planned cross-gear pieces count in the totals
-        // immediately (Tacusin's decision — support gear is treated
+        // immediately (the owner's decision — support gear is treated
         // as already built); supportPieces keeps the legacy
         // supportSetPieces counts only.
         var pieces = c.focus + c.support + planned;
@@ -5013,7 +5013,7 @@
     // drain halves where the slot polarity matches the mod, and a
     // slot of a different polarity costs +25% (v1.6.0, drainInSlot;
     // a 'Universal' slot matches everything EXCEPT Umbra — v1.5.3,
-    // Tacusin's ruling: only an Umbra Forma slot halves an Umbra mod;
+    // the owner's ruling: only an Umbra Forma slot halves an Umbra mod;
     // the weapon evaluator has priced it this way since v1.5.2), and
     // the forma count comes from the pool formula — polarized
     // non-aura slots minus the multiset intersection of assigned vs
@@ -5080,7 +5080,7 @@
       // Omni state — pieces.omniAura (the app's toggle), or a
       // stamped polarity of 'Universal' reached by hand — is a
       // universal match, and the Omni Forma counts 1 in formaUsed
-      // (Tacusin's correction: it is still a Forma), though never
+      // (the owner's correction: it is still a Forma), though never
       // against a budget (given mode has none). Any other stamped
       // polarity that differs from innate is a regular Forma
       // purchase and counts 1 via gAuraForma.
