@@ -4,7 +4,7 @@
  * The legacy share hash is base64'd JSON state (~7,000 chars for a
  * full build — too long to paste into Discord even with Nitro). This
  * codec packs the SAME v9 state into a bit stream, renders it in
- * base62, and appends a 2-char checksum: Tacusin's own 6,958-char
+ * base62, and appends a 2-char checksum: the owner's own 6,958-char
  * link packs to ~150 chars.
  *
  * Design commitments:
